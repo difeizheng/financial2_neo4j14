@@ -710,7 +710,7 @@ if st.button("导出 Word 报告", type="primary"):
             task_id=task.id,
             output_dir=task.output_dir,
             project_name=task.filename,
-            sensitivity_params=params,
+            sensitivity_params=None,  # skip sensitivity — too slow (full recalc per scenario)
         )
 
     with open(report_path, "rb") as f:
@@ -720,4 +720,6 @@ if st.button("导出 Word 报告", type="primary"):
             file_name=f"{task.filename.rsplit('.', 1)[0]}_财务效益分析报告.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         )
+
+    st.caption("注：敏感性分析需在「快照对比 → 敏感性分析」tab手动运行后添加到报告中。")
 
