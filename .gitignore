@@ -1,0 +1,16 @@
+.env
+*.pyc
+__pycache__/
+.pytest_cache/
+.venv/
+env/
+venv/
+tasks.db
+*.tmp
+~$*
+.claude/
+output/*.json
+output/*.xlsx
+snapshots/*.json
+*.xlsx
+*.pptx

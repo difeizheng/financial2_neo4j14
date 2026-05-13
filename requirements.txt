@@ -1,0 +1,9 @@
+streamlit>=1.30
+openpyxl>=3.1
+networkx>=3.0
+neo4j>=5.0
+openai>=1.0
+python-dotenv>=1.0
+formulas>=1.2
+pyvis>=0.3
+numpy>=1.20
