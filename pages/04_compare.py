@@ -179,11 +179,12 @@ if diff is None or st.session_state.get("diff_task_id") != task.id:
     st.stop()
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_summary, tab_heatmap, tab_cells, tab_prop, tab_export = st.tabs([
+tab_summary, tab_heatmap, tab_cells, tab_prop, tab_sensitivity, tab_export = st.tabs([
     "汇总分析",
     "热力图",
     "变化明细",
     "传播图",
+    "敏感性分析",
     "导出",
 ])
 
@@ -348,7 +349,133 @@ with tab_prop:
         components.html(st.session_state["prop_html"], height=780, scrolling=False)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Tab 5: 导出
+# Tab 5: 敏感性分析
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_sensitivity:
+    from financial_kg.engine.sensitivity import run_sensitivity, _build_spider_table
+    from financial_kg.engine.derived_metrics import DerivedMetrics
+
+    st.caption("选择关键参数，分析±5%/±10%扰动对IRR/NPV/DSCR等指标的影响。")
+
+    # Collect candidate parameter cells (numeric, non-formula, likely input params)
+    param_keywords = [
+        "电价", "售电电价", "上网电价",
+        "电量", "售电电量", "发电量",
+        "贷款利率", "利率",
+        "还款期", "贷款期限",
+        "成本", "购电成本",
+        "投资", "总投资", "静态投资",
+        "宽限期",
+        "所得税率", "税率",
+        "折现率", "基准收益率",
+    ]
+
+    param_options: dict[str, str] = {}  # display -> cell_id
+    for cid, cell in graph.cells.items():
+        if cell.formula_raw:
+            continue
+        if not isinstance(cell.value, (int, float)) or cell.value == 0:
+            continue
+        if cell.indicator_id:
+            ind = graph.indicators.get(cell.indicator_id)
+            if ind and any(kw in (ind.name or "") for kw in param_keywords):
+                label = f"{ind.name} ({cid})"
+                param_options[label] = cid
+
+    col_p1, col_p2 = st.columns(2)
+    with col_p1:
+        selected_params = st.multiselect(
+            "选择分析参数",
+            list(param_options.keys()),
+            default=list(param_options.keys())[:6],  # default first 6
+        )
+    with col_p2:
+        perturb_pct = st.multiselect(
+            "扰动幅度",
+            ["-10%", "-5%", "+5%", "+10%"],
+            default=["-10%", "-5%", "+5%", "+10%"],
+        )
+
+    perturb_map = {"-10%": -0.1, "-5%": -0.05, "+5%": 0.05, "+10%": 0.1}
+    perturbations = [perturb_map[p] for p in perturb_pct if p in perturb_map]
+
+    param_cells = [(param_options[p], p.split(" (")[0]) for p in selected_params if p in param_options]
+
+    if st.button("运行敏感性分析", type="primary"):
+        if not param_cells:
+            st.warning("请先选择分析参数")
+        elif not perturbations:
+            st.warning("请先选择扰动幅度")
+        else:
+            with st.spinner("敏感性分析计算中..."):
+                sen_result = run_sensitivity(
+                    graph=graph,
+                    param_cells=param_cells,
+                    perturbations=perturbations,
+                    task_id=task.id,
+                    output_dir=task.output_dir,
+                )
+
+            st.session_state["sensitivity_result"] = sen_result
+
+    sen_result = st.session_state.get("sensitivity_result")
+    if sen_result:
+        # ── Base metrics summary ──────────────────────────────────────
+        st.subheader("基准情景")
+        base = sen_result.base_metrics
+        c1, c2, c3, c4, c5 = st.columns(5)
+        if base.irr_after_tax is not None:
+            c1.metric("税后IRR", f"{base.irr_after_tax * 100:.2f}%")
+        if base.npv_after_tax is not None:
+            c2.metric("财务净现值", f"{base.npv_after_tax:,.0f}")
+        if base.payback_period is not None:
+            c3.metric("投资回收期", f"{base.payback_period:.2f}年")
+        if base.dscr_avg is not None:
+            c4.metric("DSCR均值", f"{base.dscr_avg:.2f}")
+        if base.dscr_min is not None:
+            c5.metric("DSCR最低值", f"{base.dscr_min:.2f}")
+
+        st.divider()
+        st.subheader("敏感性分析表（IRR）")
+
+        spider = _build_spider_table(base, sen_result.scenarios, "irr_after_tax")
+        if spider:
+            st.dataframe(spider, use_container_width=True)
+
+            # IRR sensitivity chart
+            chart_rows = []
+            for row in spider:
+                for pct_label in ["-10%", "-5%", "+5%", "+10%"]:
+                    if pct_label in row and row[pct_label] is not None:
+                        chart_rows.append({
+                            "参数": row["参数"],
+                            "扰动": pct_label,
+                            "IRR": row[pct_label],
+                        })
+            if chart_rows:
+                st.bar_chart(chart_rows, x="参数", y="IRR", horizontal=True)
+
+        st.divider()
+        st.subheader("各情景详细指标")
+
+        scenario_rows = []
+        for s in sen_result.scenarios:
+            row_data = {"情景": s.name}
+            if s.metrics.irr_after_tax is not None:
+                row_data["IRR"] = round(s.metrics.irr_after_tax * 100, 2)
+            if s.metrics.npv_after_tax is not None:
+                row_data["NPV"] = round(s.metrics.npv_after_tax, 2)
+            if s.metrics.dscr_avg is not None:
+                row_data["DSCR均值"] = round(s.metrics.dscr_avg, 2)
+            if s.metrics.dscr_min is not None:
+                row_data["DSCR最低值"] = round(s.metrics.dscr_min, 2)
+            scenario_rows.append(row_data)
+
+        if scenario_rows:
+            st.dataframe(scenario_rows, use_container_width=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Tab 6: 导出
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_export:
     # ── 文件来源 ─────────────────────────────────────────────────────

@@ -57,7 +57,10 @@ financial_kg/
 │   ├── recalculator.py  # Incremental recalc with Indicator sync
 │   ├── snapshot.py      # Create / save / load / diff snapshots
 │   ├── workspace.py     # Parameter workspace (scenario management)
-│   └── excel_export.py  # Export recalculated results back to Excel
+│   ├── excel_export.py  # Export recalculated results back to Excel
+│   ├── derived_metrics.py # Pre-computed IRR, NPV, DSCR, payback period
+│   ├── sensitivity.py   # Parameter perturbation → recalc → sensitivity table
+│   └── report_export.py # Word report export (财务效益分析报告)
 ├── storage/             # Persistence
 │   ├── json_store.py    # 3-layer JSON serialization
 │   ├── task_db.py       # SQLite task/snapshot/QA history registry

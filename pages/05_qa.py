@@ -10,6 +10,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from financial_kg.storage.json_store import load_graph
 from financial_kg.storage.task_db import TaskDB
 from financial_kg.llm import QAEngine
+from financial_kg.models.graph import FinancialGraph
+from financial_kg.engine.derived_metrics import compute_derived_metrics, serialize_metrics, deserialize_metrics
 from financial_kg.config import (
     LLM_BASE_URL, LLM_API_KEY, LLM_MODEL,
     NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD,
@@ -98,33 +100,39 @@ engine = _get_engine(task.id, graph, neo4j_store, base_url, api_key, model)
 
 # ── Quick Question Templates ──────────────────────────────────────────────────
 _QUICK_QUESTIONS = {
-    "投资总额": [
-        "动态总投资是多少？",
+    "基础参数": [
         "静态总投资是多少？",
-        "建设投资是多少？",
-        "建设期利息是多少？",
+        "动态总投资是多少？",
+        "EPC合同额是多少？",
+        "资本金比例是多少？",
     ],
-    "收入利润": [
+    "盈利能力": [
+        "税后全投资内部收益率是多少？",
+        "财务净现值是多少？",
+        "投资回收期是多少年？",
+        "年均净现金流是多少？",
+    ],
+    "偿债能力": [
+        "偿债备付率DSCR均值是多少？",
+        "DSCR最低值是多少？",
+        "利息备付率是多少？",
+        "借款偿还期是多长？",
+    ],
+    "收入成本": [
         "全期营业收入是多少？",
+        "综合购电成本是多少？",
         "利润总额是多少？",
         "净利润是多少？",
-        "毛利率是多少？",
-    ],
-    "现金流": [
-        "全期净现金流是多少？",
-        "经营活动现金流入是多少？",
-        "投资活动现金流出是多少？",
-        "资本金内部收益率是多少？",
     ],
     "税费": [
         "增值税是多少？",
         "所得税总额是多少？",
         "税金及附加是多少？",
     ],
-    "偿债": [
-        "偿债备付率是多少？",
-        "利息备付率是多少？",
-        "借款偿还期是多少？",
+    "现金流": [
+        "全期净现金流是多少？",
+        "经营活动现金流入是多少？",
+        "投资活动现金流出是多少？",
     ],
     "自定义": [],
 }
@@ -165,6 +173,47 @@ for tab, cat in zip(cat_tabs, _CATEGORIES):
 
 st.divider()
 
+# ── Derived Metrics Summary Panel ────────────────────────────────────────────
+@st.cache_resource(show_spinner="加载派生指标...")
+def _load_derived_metrics(_graph):
+    return serialize_metrics(compute_derived_metrics(_graph))
+
+dm_data = _load_derived_metrics(graph)
+
+if any(v is not None for v in dm_data.values()):
+    dm = deserialize_metrics(dm_data)
+    st.subheader("核心财务指标")
+    r1, r2, r3, r4, r5, r6 = st.columns(6)
+    if dm.irr_after_tax is not None:
+        r1.metric("税后IRR", f"{dm.irr_after_tax * 100:.2f}%")
+    if dm.npv_after_tax is not None:
+        r2.metric("财务净现值", f"{dm.npv_after_tax:,.0f}")
+    if dm.payback_period is not None:
+        r3.metric("投资回收期", f"{dm.payback_period:.2f}年")
+    if dm.dscr_avg is not None:
+        r4.metric("DSCR均值", f"{dm.dscr_avg:.2f}")
+    if dm.dscr_min is not None:
+        r5.metric("DSCR最低值", f"{dm.dscr_min:.2f}")
+    if dm.total_investment_dynamic is not None:
+        r6.metric("动态总投资", f"{dm.total_investment_dynamic:,.0f}")
+
+    # Second row
+    r7, r8, r9 = st.columns(3)
+    if dm.total_investment_static is not None:
+        r7.metric("静态总投资", f"{dm.total_investment_static:,.0f}")
+    if dm.annual_net_cashflow is not None:
+        r8.metric("年均净现金流", f"{dm.annual_net_cashflow:,.0f}")
+    if dm.total_revenue is not None:
+        r9.metric("全期营业收入", f"{dm.total_revenue:,.0f}")
+
+    # DSCR series chart
+    if dm.dscr_series:
+        with st.expander("DSCR 年度分布", expanded=False):
+            dscr_rows = [{"年份": k, "DSCR": round(v, 3)} for k, v in sorted(dm.dscr_series.items())]
+            st.bar_chart(dscr_rows, x="年份", y="DSCR", horizontal=False)
+
+    st.divider()
+
 # ── Chat Input ────────────────────────────────────────────────────────────────
 question = st.chat_input("或输入自定义财务问题...")
 
@@ -173,6 +222,183 @@ if "qa_auto_question" in st.session_state:
     question = st.session_state.pop("qa_auto_question")
 
 # ── Helper Functions ──────────────────────────────────────────────────────────
+
+# Derived metrics question patterns — detect questions requiring multi-indicator aggregation
+_DERIVED_PATTERNS = [
+    (["税后.*内部收益率", "全投资.*内部收益率", "IRR.*税后", "税后.*IRR"], "irr_after_tax", "税后全投资内部收益率", "%"),
+    (["税前.*内部收益率", "IRR.*税前", "税前.*IRR"], "irr_before_tax", "税前全投资内部收益率", "%"),
+    (["财务.*净现值", "净现值.*税后", "NPV.*税后"], "npv_after_tax", "财务净现值", ""),
+    (["净现值.*税前", "NPV.*税前"], "npv_before_tax", "税前财务净现值", ""),
+    (["投资回收期", "回收期"], "payback_period", "投资回收期", "年"),
+    (["DSCR.*均值", "偿债备付率.*均值", "偿债备付率.*平均"], "dscr_avg", "DSCR均值", ""),
+    (["DSCR.*最低", "DSCR.*最小", "偿债备付率.*最低"], "dscr_min", "DSCR最低值", ""),
+    (["静态总投资"], "total_investment_static", "静态总投资", ""),
+    (["动态总投资", "总投资"], "total_investment_dynamic", "动态总投资", ""),
+    (["年均.*净现金流", "平均.*净现金流"], "annual_net_cashflow", "年均净现金流", ""),
+    (["营业收入", "总收入", "售电收入"], "total_revenue", "全期营业收入", ""),
+    (["总成本", "经营成本", "购电成本"], "total_cost", "全期总成本", ""),
+    (["所得税.*总额?", "税金.*总额?", "税费.*总额?"], "total_tax", "全期税费", ""),
+    (["借款偿还期", "贷款偿还期", "还款期.*多长"], "loan_repayment_period", "借款偿还期", "年"),
+]
+
+import re as _re
+
+
+def _try_derived_metrics_answer(
+    question: str,
+    dm_data: dict,
+    graph: FinancialGraph,
+) -> dict | None:
+    """Try to answer from pre-computed derived metrics. Returns structured answer dict or None."""
+    if not any(v is not None for v in dm_data.values()):
+        return None
+
+    q = question
+    from financial_kg.engine.derived_metrics import deserialize_metrics, _DSCR_KEYWORDS
+    dm = deserialize_metrics(dm_data)
+
+    for patterns, key, display_name, unit in _DERIVED_PATTERNS:
+        if any(_re.search(p, q) for p in patterns):
+            val = getattr(dm, key, None)
+            if val is None:
+                return None
+
+            # Format value
+            if unit == "%":
+                formatted = f"{val * 100:.2f}%"
+            elif unit == "年":
+                formatted = f"{val:.2f}年"
+            elif isinstance(val, float) and abs(val) >= 1000:
+                formatted = f"{val:,.2f}"
+            else:
+                formatted = f"{val:.2f}"
+
+            return {
+                "text": f"**{display_name}** 为 **{formatted}**{' ' + unit if unit else ''}",
+                "metrics": [{"name": display_name, "value": formatted, "unit": unit, "match_reason": "derived_metrics"}],
+                "chart_data": [],
+                "confidence": 90,
+                "sources": [],
+            }
+
+    # DSCR series question
+    if any(p in q for p in ["DSCR.*分布", "DSCR.*年度", "偿债备付率.*分布", "DSCR.*各年"]):
+        if dm.dscr_series:
+            annual = sorted(dm.dscr_series.items())
+            import streamlit.components.v1 as components
+            from financial_kg.viz.qa_chart import render_time_series_html
+
+            chart_data = [{
+                "name": "DSCR",
+                "values": {str(k): round(v, 3) for k, v in annual},
+            }]
+            return {
+                "text": f"**DSCR年度分布**（共 {len(annual)} 年）：均值 **{dm.dscr_avg:.2f}**，最低 **{dm.dscr_min:.2f}**",
+                "metrics": [
+                    {"name": "DSCR均值", "value": f"{dm.dscr_avg:.2f}", "unit": "", "match_reason": "derived_metrics"},
+                    {"name": "DSCR最低值", "value": f"{dm.dscr_min:.2f}", "unit": "", "match_reason": "derived_metrics"},
+                ],
+                "chart_data": chart_data,
+                "confidence": 90,
+                "sources": [],
+            }
+
+    # Multi-metric summary question (e.g. "核心财务指标", "效益概况")
+    if any(p in q for p in ["核心.*指标", "效益.*概况", "财务.*概况", "总体.*情况"]):
+        metrics_list = []
+        if dm.irr_after_tax is not None:
+            metrics_list.append({"name": "税后IRR", "value": f"{dm.irr_after_tax * 100:.2f}%", "unit": "", "match_reason": "derived_metrics"})
+        if dm.npv_after_tax is not None:
+            metrics_list.append({"name": "财务净现值", "value": f"{dm.npv_after_tax:,.0f}", "unit": "", "match_reason": "derived_metrics"})
+        if dm.payback_period is not None:
+            metrics_list.append({"name": "投资回收期", "value": f"{dm.payback_period:.2f}年", "unit": "", "match_reason": "derived_metrics"})
+        if dm.dscr_avg is not None:
+            metrics_list.append({"name": "DSCR均值", "value": f"{dm.dscr_avg:.2f}", "unit": "", "match_reason": "derived_metrics"})
+        if dm.total_investment_dynamic is not None:
+            metrics_list.append({"name": "动态总投资", "value": f"{dm.total_investment_dynamic:,.0f}", "unit": "", "match_reason": "derived_metrics"})
+
+        if metrics_list:
+            return {
+                "text": f"**核心财务指标概览**（共 {len(metrics_list)} 项）",
+                "metrics": metrics_list,
+                "chart_data": [],
+                "confidence": 85,
+                "sources": [],
+            }
+
+    # 毛利率: need 营业收入 and 营业成本 → multi-indicator aggregation
+    if "毛利率" in q:
+        revenue_ind = None
+        cost_ind = None
+        for ind in graph.indicators.values():
+            name = ind.name or ""
+            if "营业收入" in name or "总收入" in name:
+                revenue_ind = ind
+            if "营业成本" in name or "总成本" in name or "购电成本" in name:
+                cost_ind = ind
+
+        if revenue_ind and cost_ind:
+            rev = revenue_ind.summary_value
+            cost = cost_ind.summary_value
+            if rev is not None and cost is not None:
+                try:
+                    rev_f, cost_f = float(rev), float(cost)
+                    if rev_f != 0:
+                        margin = (rev_f - cost_f) / rev_f * 100
+                        return {
+                            "text": f"**毛利率** 为 **{margin:.2f}%**\n\n计算：营业收入({rev_f:,.2f}) - 营业成本({cost_f:,.2f}) / 营业收入({rev_f:,.2f})",
+                            "metrics": [
+                                {"name": "营业收入", "value": f"{rev_f:,.2f}", "unit": revenue_ind.unit or "", "match_reason": "aggregation"},
+                                {"name": "营业成本", "value": f"{cost_f:,.2f}", "unit": cost_ind.unit or "", "match_reason": "aggregation"},
+                                {"name": "毛利率", "value": f"{margin:.2f}%", "unit": "%", "match_reason": "computed"},
+                            ],
+                            "chart_data": [],
+                            "confidence": 80,
+                            "sources": [
+                                {"name": revenue_ind.name, "sheet": revenue_ind.sheet, "value": f"{rev_f:,.2f}", "unit": revenue_ind.unit or "", "score": 8.0, "indicator_id": revenue_ind.id},
+                                {"name": cost_ind.name, "sheet": cost_ind.sheet, "value": f"{cost_f:,.2f}", "unit": cost_ind.unit or "", "score": 8.0, "indicator_id": cost_ind.id},
+                            ],
+                        }
+                except (TypeError, ValueError):
+                    pass
+
+    # 净利率: need 净利润 and 营业收入
+    if "净利率" in q:
+        net_profit_ind = None
+        revenue_ind = None
+        for ind in graph.indicators.values():
+            name = ind.name or ""
+            if "净利润" in name:
+                net_profit_ind = ind
+            if "营业收入" in name or "总收入" in name:
+                revenue_ind = ind
+
+        if net_profit_ind and revenue_ind:
+            profit = net_profit_ind.summary_value
+            rev = revenue_ind.summary_value
+            if profit is not None and rev is not None:
+                try:
+                    profit_f, rev_f = float(profit), float(rev)
+                    if rev_f != 0:
+                        net_margin = profit_f / rev_f * 100
+                        return {
+                            "text": f"**净利率** 为 **{net_margin:.2f}%**\n\n计算：净利润({profit_f:,.2f}) / 营业收入({rev_f:,.2f})",
+                            "metrics": [
+                                {"name": "净利润", "value": f"{profit_f:,.2f}", "unit": net_profit_ind.unit or "", "match_reason": "aggregation"},
+                                {"name": "营业收入", "value": f"{rev_f:,.2f}", "unit": revenue_ind.unit or "", "match_reason": "aggregation"},
+                                {"name": "净利率", "value": f"{net_margin:.2f}%", "unit": "%", "match_reason": "computed"},
+                            ],
+                            "chart_data": [],
+                            "confidence": 80,
+                            "sources": [
+                                {"name": net_profit_ind.name, "sheet": net_profit_ind.sheet, "value": f"{profit_f:,.2f}", "unit": net_profit_ind.unit or "", "score": 8.0, "indicator_id": net_profit_ind.id},
+                                {"name": revenue_ind.name, "sheet": revenue_ind.sheet, "value": f"{rev_f:,.2f}", "unit": revenue_ind.unit or "", "score": 8.0, "indicator_id": revenue_ind.id},
+                            ],
+                        }
+                except (TypeError, ValueError):
+                    pass
+
+    return None
 
 
 def _build_structured_answer(question: str, state: dict) -> dict:
@@ -394,31 +620,39 @@ if question:
         st.markdown(question)
 
     with st.chat_message("assistant"):
-        state = {"full_answer": "", "retrieval": None, "cypher": None, "structured": None}
+        # ── Step 1: Try derived metrics answer first (fast, no LLM) ──────────
+        derived_answer = _try_derived_metrics_answer(question, dm_data, graph)
 
-        def _stream():
-            for event_type, data in engine.ask_stream(
-                question,
-                chat_history=chat_history,
-                top_k=top_k,
-            ):
-                if event_type == "retrieval":
-                    state["retrieval"] = data
-                elif event_type == "cypher":
-                    state["cypher"] = data
-                elif event_type == "chunk":
-                    state["full_answer"] += data
-                    yield data
-                elif event_type in ("answer", "error"):
-                    state["full_answer"] = data
-                    yield data
+        if derived_answer:
+            # Direct answer from pre-computed metrics — skip LLM
+            structured = derived_answer
+        else:
+            # ── Step 2: Fall back to LLM + retrieval ────────────────────────
+            state = {"full_answer": "", "retrieval": None, "cypher": None, "structured": None}
 
-        answer_text = st.write_stream(_stream())
-        state["full_answer"] = answer_text
+            def _stream():
+                for event_type, data in engine.ask_stream(
+                    question,
+                    chat_history=chat_history,
+                    top_k=top_k,
+                ):
+                    if event_type == "retrieval":
+                        state["retrieval"] = data
+                    elif event_type == "cypher":
+                        state["cypher"] = data
+                    elif event_type == "chunk":
+                        state["full_answer"] += data
+                        yield data
+                    elif event_type in ("answer", "error"):
+                        state["full_answer"] = data
+                        yield data
 
-    # Build structured answer from retrieval + text
-    structured = _build_structured_answer(question, state)
-    state["structured"] = structured
+            answer_text = st.write_stream(_stream())
+            state["full_answer"] = answer_text
+
+            # Build structured answer from retrieval + text
+            structured = _build_structured_answer(question, state)
+            state["structured"] = structured
 
     # Save user question + structured answer to history
     # Note: quick question / follow-up buttons already appended user message
@@ -458,4 +692,32 @@ if chat_history and chat_history[-1]["role"] == "assistant":
                         _persist_chat()
                         st.session_state["qa_auto_question"] = sq
                         st.rerun()
+
+# ── Export Financial Report ──────────────────────────────────────────────────
+st.divider()
+st.subheader("导出财务效益分析报告")
+st.caption("按甲方模板结构生成 Word 报告，含基础参数、盈利能力、偿债能力、财务生存能力、敏感性分析。")
+
+if st.button("导出 Word 报告", type="primary"):
+    from financial_kg.engine.report_export import export_financial_report, _auto_detect_params
+
+    report_path = os.path.join(task.output_dir, f"{task.id}_financial_report.docx")
+    with st.spinner("生成报告中..."):
+        params = _auto_detect_params(graph)
+        export_financial_report(
+            graph=graph,
+            output_path=report_path,
+            task_id=task.id,
+            output_dir=task.output_dir,
+            project_name=task.filename,
+            sensitivity_params=params,
+        )
+
+    with open(report_path, "rb") as f:
+        st.download_button(
+            "下载财务效益分析报告",
+            data=f,
+            file_name=f"{task.filename.rsplit('.', 1)[0]}_财务效益分析报告.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
 

@@ -36,6 +36,14 @@ def _extract_years(text: str) -> list[str]:
 class IndicatorRetriever:
     """Structured indicator retrieval with fuzzy matching and graph context."""
 
+    # Questions needing expanded context — retrieve related indicators
+    _EXPANSION_KEYWORDS = [
+        "毛利率", "净利率", "利润率", "收益率",
+        "占比", "比例", "比率",
+        "对比", "比较",
+        "变化", "趋势",
+    ]
+
     def __init__(
         self,
         graph: FinancialGraph,
@@ -70,12 +78,51 @@ class IndicatorRetriever:
         ]
         self._enrich_with_graph_context(contexts)
 
+        # If question involves ratios/comparisons, expand with related indicators
+        if any(kw in question for kw in self._EXPANSION_KEYWORDS):
+            contexts = self._expand_for_aggregation(contexts, top_k)
+
         return RetrievalResult(
             contexts=contexts,
             query_tokens=tokens,
             query_years=years,
             total_candidates=len(scored),
         )
+
+    def _expand_for_aggregation(
+        self,
+        contexts: list[IndicatorContext],
+        top_k: int,
+    ) -> list[IndicatorContext]:
+        """When question needs multi-indicator computation, expand context with related indicators."""
+        seen_ids: set[str] = {ctx.indicator.id for ctx in contexts}
+
+        for ctx in contexts:
+            ind = ctx.indicator
+            # Add indicators this one depends on
+            for dep_id in ind.depends_on_indicators[:3]:
+                if dep_id not in seen_ids and dep_id in self._graph.indicators:
+                    dep = self._graph.indicators[dep_id]
+                    contexts.append(IndicatorContext(
+                        indicator=dep,
+                        match_score=ctx.match_score * 0.5,
+                        match_reason="dependency_expansion",
+                    ))
+                    seen_ids.add(dep_id)
+            # Add indicators that depend on this one
+            for dep_id in ind.depended_by_indicators[:3]:
+                if dep_id not in seen_ids and dep_id in self._graph.indicators:
+                    dep = self._graph.indicators[dep_id]
+                    contexts.append(IndicatorContext(
+                        indicator=dep,
+                        match_score=ctx.match_score * 0.5,
+                        match_reason="dependency_expansion",
+                    ))
+                    seen_ids.add(dep_id)
+
+        # Sort by score descending, limit to top_k * 2
+        contexts.sort(key=lambda c: -c.match_score)
+        return contexts[:top_k * 2]
 
     def _tokenize(self, question: str) -> list[str]:
         # Strip stop words and punctuation that carry no indicator meaning

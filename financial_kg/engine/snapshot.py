@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from financial_kg.models.graph import FinancialGraph
+from financial_kg.engine.derived_metrics import compute_derived_metrics, serialize_metrics, deserialize_metrics
 
 
 # ── Snapshot data structures ─────────────────────────────────────────────────
@@ -19,6 +20,8 @@ class Snapshot:
     filepath: str
     # cell_id -> value (serialized)
     values: dict[str, Any] = field(default_factory=dict)
+    # Pre-computed derived metrics (IRR, DSCR, NPV, etc.)
+    derived_metrics: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -45,6 +48,7 @@ def create_snapshot(
     filepath = os.path.join(snapshots_dir, task_id, filename)
 
     values = {cell_id: _serialize_value(cell.value) for cell_id, cell in graph.cells.items()}
+    derived = serialize_metrics(compute_derived_metrics(graph))
 
     payload = {
         "task_id": task_id,
@@ -52,6 +56,7 @@ def create_snapshot(
         "created_at": datetime.now().isoformat(),
         "cell_count": len(values),
         "values": values,
+        "derived_metrics": derived,
     }
 
     with open(filepath, "w", encoding="utf-8") as f:
@@ -75,6 +80,7 @@ def load_snapshot(filepath: str) -> Snapshot:
         created_at=data["created_at"],
         filepath=filepath,
         values=data["values"],
+        derived_metrics=data.get("derived_metrics", {}),
     )
 
 
