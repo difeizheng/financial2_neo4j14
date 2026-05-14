@@ -81,6 +81,18 @@ class TaskDB:
                     FOREIGN KEY (task_id) REFERENCES tasks(id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_qa_history_task ON qa_history(task_id);
+                CREATE TABLE IF NOT EXISTS sensitivity_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    run_name TEXT NOT NULL,
+                    params TEXT NOT NULL DEFAULT '[]',
+                    perturbations TEXT NOT NULL DEFAULT '[]',
+                    base_metrics TEXT NOT NULL DEFAULT '{}',
+                    scenarios TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (task_id) REFERENCES tasks(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_sensitivity_task ON sensitivity_history(task_id);
             """)
 
     # ── Tasks ────────────────────────────────────────────────────────────────
@@ -198,6 +210,70 @@ class TaskDB:
     def clear_qa_history(self, task_id: str) -> None:
         with self._conn() as conn:
             conn.execute("DELETE FROM qa_history WHERE task_id=?", (task_id,))
+
+    # ── Sensitivity History ──────────────────────────────────────────────────
+
+    def save_sensitivity(
+        self,
+        task_id: str,
+        run_name: str,
+        params: list[dict],
+        perturbations: list[float],
+        base_metrics: dict,
+        scenarios: list[dict],
+    ) -> int:
+        now = datetime.now().isoformat()
+        with self._conn() as conn:
+            cur = conn.execute(
+                "INSERT INTO sensitivity_history (task_id, run_name, params, perturbations, base_metrics, scenarios, created_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (task_id, run_name, json.dumps(params, ensure_ascii=False),
+                 json.dumps(perturbations), json.dumps(base_metrics, ensure_ascii=False),
+                 json.dumps(scenarios, ensure_ascii=False), now),
+            )
+            return cur.lastrowid
+
+    def list_sensitivity(self, task_id: str) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT id, run_name, params, perturbations, base_metrics, scenarios, created_at "
+                "FROM sensitivity_history WHERE task_id=? ORDER BY created_at DESC",
+                (task_id,),
+            ).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "run_name": r["run_name"],
+                "params": json.loads(r["params"]),
+                "perturbations": json.loads(r["perturbations"]),
+                "base_metrics": json.loads(r["base_metrics"]),
+                "scenarios": json.loads(r["scenarios"]),
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+
+    def load_sensitivity(self, record_id: int) -> Optional[dict]:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM sensitivity_history WHERE id=?", (record_id,)
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row["id"],
+            "task_id": row["task_id"],
+            "run_name": row["run_name"],
+            "params": json.loads(row["params"]),
+            "perturbations": json.loads(row["perturbations"]),
+            "base_metrics": json.loads(row["base_metrics"]),
+            "scenarios": json.loads(row["scenarios"]),
+            "created_at": row["created_at"],
+        }
+
+    def delete_sensitivity(self, record_id: int) -> None:
+        with self._conn() as conn:
+            conn.execute("DELETE FROM sensitivity_history WHERE id=?", (record_id,))
 
     # ── Delete ─────────────────────────────────────────────────────────────────
 

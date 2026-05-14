@@ -352,12 +352,15 @@ with tab_prop:
 # Tab 5: 敏感性分析
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_sensitivity:
-    from financial_kg.engine.sensitivity import run_sensitivity, _build_spider_table
-    from financial_kg.engine.derived_metrics import DerivedMetrics
+    from financial_kg.engine.sensitivity import run_sensitivity, _build_spider_table, _render_spider_chart, SensitivityScenario, SensitivityResult
+    from financial_kg.engine.derived_metrics import DerivedMetrics, serialize_metrics as _ser, deserialize_metrics as _deser
 
-    st.caption("选择关键参数，分析±5%/±10%扰动对IRR/NPV/DSCR等指标的影响。")
+    st.caption("选择关键数值参数，分析±5%/±10%扰动对IRR/NPV/DSCR等指标的影响。")
 
-    # Collect candidate parameter cells (numeric, non-formula, likely input params)
+    # ── Load sensitivity history ─────────────────────────────────────
+    history_list = db.list_sensitivity(task.id)
+
+    # Collect candidate parameter cells (numeric, non-formula, non-text/date)
     param_keywords = [
         "电价", "售电电价", "上网电价",
         "电量", "售电电量", "发电量",
@@ -369,6 +372,7 @@ with tab_sensitivity:
         "所得税率", "税率",
         "折现率", "基准收益率",
     ]
+    _DATE_TIME_KEYWORDS = {"年", "月", "日", "期", "时间", "date", "time", "year"}
 
     param_options: dict[str, str] = {}  # display -> cell_id
     for cid, cell in graph.cells.items():
@@ -378,48 +382,139 @@ with tab_sensitivity:
             continue
         if cell.indicator_id:
             ind = graph.indicators.get(cell.indicator_id)
-            if ind and any(kw in (ind.name or "") for kw in param_keywords):
-                label = f"{ind.name} ({cid})"
-                param_options[label] = cid
+            if ind:
+                name = ind.name or ""
+                # Filter out text/date type indicators
+                if any(kw in name for kw in _DATE_TIME_KEYWORDS):
+                    continue
+                # Only keep if indicator summary_value is numeric
+                sv = ind.summary_value
+                if sv is not None and not isinstance(sv, (int, float)):
+                    try:
+                        float(sv)
+                    except (TypeError, ValueError):
+                        continue
+                if any(kw in name for kw in param_keywords):
+                    label = f"{name} ({cid})"
+                    param_options[label] = cid
 
-    col_p1, col_p2 = st.columns(2)
-    with col_p1:
-        selected_params = st.multiselect(
-            "选择分析参数",
-            list(param_options.keys()),
-            default=list(param_options.keys())[:6],  # default first 6
-        )
-    with col_p2:
-        perturb_pct = st.multiselect(
-            "扰动幅度",
-            ["-10%", "-5%", "+5%", "+10%"],
-            default=["-10%", "-5%", "+5%", "+10%"],
-        )
+    # ── Controls ─────────────────────────────────────────────────────
+    col_mode1, col_mode2 = st.columns(2)
+    with col_mode1:
+        run_mode = st.radio("模式", ["新建分析", "查看历史"], horizontal=True)
 
-    perturb_map = {"-10%": -0.1, "-5%": -0.05, "+5%": 0.05, "+10%": 0.1}
-    perturbations = [perturb_map[p] for p in perturb_pct if p in perturb_map]
+    if run_mode == "新建分析":
+        col_p1, col_p2 = st.columns(2)
+        with col_p1:
+            selected_params = st.multiselect(
+                "选择分析参数",
+                list(param_options.keys()),
+                default=list(param_options.keys())[:6],
+            )
+        with col_p2:
+            perturb_pct = st.multiselect(
+                "扰动幅度",
+                ["-10%", "-5%", "+5%", "+10%"],
+                default=["-10%", "-5%", "+5%", "+10%"],
+            )
 
-    param_cells = [(param_options[p], p.split(" (")[0]) for p in selected_params if p in param_options]
+        perturb_map = {"-10%": -0.1, "-5%": -0.05, "+5%": 0.05, "+10%": 0.1}
+        perturbations = [perturb_map[p] for p in perturb_pct if p in perturb_map]
+        param_cells = [(param_options[p], p.split(" (")[0]) for p in selected_params if p in param_options]
 
-    if st.button("运行敏感性分析", type="primary"):
-        if not param_cells:
-            st.warning("请先选择分析参数")
-        elif not perturbations:
-            st.warning("请先选择扰动幅度")
-        else:
-            with st.spinner("敏感性分析计算中..."):
-                sen_result = run_sensitivity(
-                    graph=graph,
-                    param_cells=param_cells,
-                    perturbations=perturbations,
+        col_name, col_btn = st.columns([2, 1])
+        with col_name:
+            run_name = st.text_input("分析名称", value=f"灵敏度_{len(history_list)+1}")
+        with col_btn:
+            st.write("")
+            st.write("")
+            run_clicked = st.button("运行敏感性分析", type="primary", use_container_width=True)
+
+        if run_clicked:
+            if not param_cells:
+                st.warning("请先选择分析参数")
+            elif not perturbations:
+                st.warning("请先选择扰动幅度")
+            else:
+                with st.spinner("敏感性分析计算中..."):
+                    sen_result = run_sensitivity(
+                        graph=graph,
+                        param_cells=param_cells,
+                        perturbations=perturbations,
+                        task_id=task.id,
+                        output_dir=task.output_dir,
+                    )
+
+                # Save to history
+                scenario_dicts = []
+                for s in sen_result.scenarios:
+                    scenario_dicts.append({
+                        "name": s.name,
+                        "param_name": s.param_name,
+                        "param_cell_id": s.param_cell_id,
+                        "perturbation": s.perturbation,
+                        "original_value": s.original_value,
+                        "perturbed_value": s.perturbed_value,
+                        "metrics": _ser(s.metrics),
+                        "snapshot_name": s.snapshot_name,
+                    })
+
+                db.save_sensitivity(
                     task_id=task.id,
-                    output_dir=task.output_dir,
+                    run_name=run_name,
+                    params=[{"cell_id": c[0], "name": c[1]} for c in param_cells],
+                    perturbations=perturbations,
+                    base_metrics=_ser(sen_result.base_metrics),
+                    scenarios=scenario_dicts,
                 )
 
-            st.session_state["sensitivity_result"] = sen_result
+                st.session_state["sensitivity_result"] = sen_result
+                st.session_state["sensitivity_history_loaded"] = None
 
+    else:  # 查看历史
+        if not history_list:
+            st.info("暂无历史敏感性分析记录")
+            st.stop()
+
+        history_options = {f"{h['run_name']} ({h['created_at'][:19]})": h for h in history_list}
+        selected_hist_label = st.selectbox("选择历史记录", list(history_options.keys()))
+        selected_hist = history_options[selected_hist_label]
+
+        # Show meta
+        st.caption(f"参数: {', '.join(p['name'] for p in selected_hist['params'])} | "
+                   f"扰动: {', '.join(f'{p:+.0%}' for p in selected_hist['perturbations'])}")
+
+        # Delete button
+        if st.button("删除此记录", type="secondary", key="del_sensitivity"):
+            db.delete_sensitivity(selected_hist["id"])
+            st.session_state["sensitivity_history_loaded"] = None
+            st.rerun()
+
+        # Reconstruct result object from history
+        base_metrics = _deser(selected_hist["base_metrics"])
+        scenario_objs = []
+        for sd in selected_hist["scenarios"]:
+            scenario_objs.append(SensitivityScenario(
+                name=sd["name"],
+                param_name=sd["param_name"],
+                param_cell_id=sd["param_cell_id"],
+                perturbation=sd["perturbation"],
+                original_value=sd["original_value"],
+                perturbed_value=sd["perturbed_value"],
+                metrics=_deser(sd["metrics"]),
+                snapshot_name=sd["snapshot_name"],
+            ))
+        sen_result = SensitivityResult(base_metrics=base_metrics, scenarios=scenario_objs)
+        st.session_state["sensitivity_result"] = sen_result
+        st.session_state["sensitivity_history_loaded"] = selected_hist["id"]
+
+    # ── Render sensitivity result ─────────────────────────────────────
     sen_result = st.session_state.get("sensitivity_result")
-    if sen_result:
+    if sen_result and (
+        st.session_state.get("sensitivity_history_loaded") is None
+        or st.session_state.get("sensitivity_history_loaded") in [h["id"] for h in history_list]
+        if history_list else True
+    ):
         # ── Base metrics summary ──────────────────────────────────────
         st.subheader("基准情景")
         base = sen_result.base_metrics
@@ -436,24 +531,58 @@ with tab_sensitivity:
             c5.metric("DSCR最低值", f"{base.dscr_min:.2f}")
 
         st.divider()
-        st.subheader("敏感性分析表（IRR）")
 
-        spider = _build_spider_table(base, sen_result.scenarios, "irr_after_tax")
-        if spider:
-            st.dataframe(spider, use_container_width=True)
+        # ── Metric selector for charts ────────────────────────────────
+        chart_metrics = [
+            ("irr_after_tax", "税后IRR", "%"),
+            ("npv_after_tax", "财务净现值", ""),
+            ("dscr_avg", "DSCR均值", ""),
+            ("dscr_min", "DSCR最低值", ""),
+        ]
 
-            # IRR sensitivity chart
-            chart_rows = []
-            for row in spider:
-                for pct_label in ["-10%", "-5%", "+5%", "+10%"]:
-                    if pct_label in row and row[pct_label] is not None:
-                        chart_rows.append({
-                            "参数": row["参数"],
-                            "扰动": pct_label,
-                            "IRR": row[pct_label],
-                        })
-            if chart_rows:
-                st.bar_chart(chart_rows, x="参数", y="IRR", horizontal=True)
+        st.subheader("敏感性分析图")
+        chart_tab1, chart_tab2, chart_tab3, chart_tab4 = st.tabs([m[1] for m in chart_metrics])
+        chart_tabs = [chart_tab1, chart_tab2, chart_tab3, chart_tab4]
+
+        for (metric_key, metric_label, _), chart_tab in zip(chart_metrics, chart_tabs):
+            with chart_tab:
+                spider = _build_spider_table(base, sen_result.scenarios, metric_key)
+                if spider:
+                    st.dataframe(spider, use_container_width=True)
+
+                    # Line chart
+                    chart_html = _render_spider_chart(base, sen_result.scenarios, metric_key, metric_label)
+                    if chart_html:
+                        components.html(chart_html, height=400, scrolling=False)
+
+                # ── Sensitivity ranking ───────────────────────────────
+                if sen_result.scenarios:
+                    st.subheader("敏感度排序")
+                    # Calculate sensitivity: max absolute delta across perturbation levels
+                    base_val = getattr(base, metric_key, None)
+                    if base_val is not None:
+                        sensitivity_rows = []
+                        by_param: dict[str, list] = {}
+                        for s in sen_result.scenarios:
+                            by_param.setdefault(s.param_name, []).append(s)
+
+                        for pname, p_scenarios in by_param.items():
+                            deltas = []
+                            for s in p_scenarios:
+                                val = getattr(s.metrics, metric_key, None)
+                                if val is not None:
+                                    deltas.append(abs(val - base_val))
+                            if deltas:
+                                sensitivity_rows.append({
+                                    "参数": pname,
+                                    "最大影响": f"{max(deltas) * 100:.2f}pp" if "irr" in metric_key else f"{max(deltas):.4f}",
+                                    "影响幅度": max(deltas),
+                                })
+
+                        sensitivity_rows.sort(key=lambda x: x["影响幅度"], reverse=True)
+                        if sensitivity_rows:
+                            ranking_df = [{"参数": r["参数"], "最大影响": r["最大影响"]} for r in sensitivity_rows]
+                            st.dataframe(ranking_df, use_container_width=True, hide_index=True)
 
         st.divider()
         st.subheader("各情景详细指标")

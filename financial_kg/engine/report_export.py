@@ -41,6 +41,7 @@ def export_financial_report(
     snapshots_dir: str = "",
     project_name: str = "",
     sensitivity_params: list[tuple[str, str]] | None = None,
+    sensitivity_result: SensitivityResult | None = None,
 ) -> str:
     """Generate a financial benefit analysis Word report.
 
@@ -53,6 +54,7 @@ def export_financial_report(
         project_name: Project name for the report header.
         sensitivity_params: List of (cell_id, display_name) for sensitivity analysis.
             Defaults to common parameters if not specified.
+        sensitivity_result: Pre-computed sensitivity result to skip recalculation.
 
     Returns:
         Path to the generated .docx file.
@@ -103,13 +105,23 @@ def export_financial_report(
     # ── 5. 敏感性分析 ────────────────────────────────────────────────
     _add_section(doc, "五、敏感性分析", level=1)
 
-    if sensitivity_params:
-        _add_sensitivity_section(doc, graph, metrics, sensitivity_params, task_id, output_dir, snapshots_dir)
+    if sensitivity_params or sensitivity_result:
+        if sensitivity_result:
+            _add_sensitivity_from_result(doc, metrics, sensitivity_result)
+        else:
+            params = sensitivity_params
+            if params is None:
+                params = _auto_detect_params(graph)
+            if params:
+                _add_sensitivity_section(doc, graph, metrics, params, task_id, output_dir, snapshots_dir)
+            else:
+                p = doc.add_paragraph("未检测到可分析的输入参数。")
+                p.runs[0].font.color.rgb = RGBColor(128, 128, 128)
     else:
-        # Default parameters
-        default_params = _auto_detect_params(graph)
-        if default_params:
-            _add_sensitivity_section(doc, graph, metrics, default_params, task_id, output_dir, snapshots_dir)
+        # No params/result provided — auto-detect and run
+        params = _auto_detect_params(graph)
+        if params:
+            _add_sensitivity_section(doc, graph, metrics, params, task_id, output_dir, snapshots_dir)
         else:
             p = doc.add_paragraph("未检测到可分析的输入参数。")
             p.runs[0].font.color.rgb = RGBColor(128, 128, 128)
@@ -331,6 +343,38 @@ def _add_sensitivity_section(
         table.alignment = WD_TABLE_ALIGNMENT.CENTER
 
         # Header
+        headers = list(spider[0].keys())
+        for i, h in enumerate(headers):
+            cell = table.rows[0].cells[i]
+            cell.text = h
+            for run in cell.paragraphs[0].runs:
+                run.bold = True
+                run.font.size = Pt(9)
+
+        for row_idx, row_data in enumerate(spider, 1):
+            for col_idx, h in enumerate(headers):
+                val = row_data.get(h, "")
+                table.rows[row_idx].cells[col_idx].text = str(val) if val is not None else "—"
+                for run in table.rows[row_idx].cells[col_idx].paragraphs[0].runs:
+                    run.font.size = Pt(9)
+
+
+def _add_sensitivity_from_result(
+    doc: Document,
+    base_metrics: DerivedMetrics,
+    result: SensitivityResult,
+) -> None:
+    """Add pre-computed sensitivity results to report (no recalculation)."""
+    doc.add_paragraph("")
+    p = doc.add_paragraph("敏感性分析结果（IRR）：")
+    p.runs[0].bold = True
+
+    spider = _build_spider_table(base_metrics, result.scenarios, "irr_after_tax")
+    if spider:
+        cols_count = len(spider[0]) if spider else 0
+        table = doc.add_table(rows=len(spider) + 1, cols=cols_count, style="Light Grid Accent 1")
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+
         headers = list(spider[0].keys())
         for i, h in enumerate(headers):
             cell = table.rows[0].cells[i]

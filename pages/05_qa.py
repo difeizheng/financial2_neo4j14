@@ -182,37 +182,44 @@ dm_data = _load_derived_metrics(graph)
 
 if any(v is not None for v in dm_data.values()):
     dm = deserialize_metrics(dm_data)
-    st.subheader("核心财务指标")
-    r1, r2, r3, r4, r5, r6 = st.columns(6)
-    if dm.irr_after_tax is not None:
-        r1.metric("税后IRR", f"{dm.irr_after_tax * 100:.2f}%")
-    if dm.npv_after_tax is not None:
-        r2.metric("财务净现值", f"{dm.npv_after_tax:,.0f}")
-    if dm.payback_period is not None:
-        r3.metric("投资回收期", f"{dm.payback_period:.2f}年")
-    if dm.dscr_avg is not None:
-        r4.metric("DSCR均值", f"{dm.dscr_avg:.2f}")
-    if dm.dscr_min is not None:
-        r5.metric("DSCR最低值", f"{dm.dscr_min:.2f}")
-    if dm.total_investment_dynamic is not None:
-        r6.metric("动态总投资", f"{dm.total_investment_dynamic:,.0f}")
+    with st.expander("核心财务指标", expanded=False):
+        # Two-row layout: 5 + 4 aligned metrics, units in labels
+        metrics_list = []
+        if dm.irr_after_tax is not None:
+            metrics_list.append(("税后IRR(%)", f"{dm.irr_after_tax * 100:.2f}"))
+        if dm.npv_after_tax is not None:
+            metrics_list.append(("财务净现值(万元)", f"{dm.npv_after_tax / 10000:,.2f}"))
+        if dm.payback_period is not None:
+            metrics_list.append(("投资回收期(年)", f"{dm.payback_period:.1f}"))
+        if dm.dscr_avg is not None:
+            metrics_list.append(("DSCR均值", f"{dm.dscr_avg:.2f}"))
+        if dm.dscr_min is not None:
+            metrics_list.append(("DSCR最低值", f"{dm.dscr_min:.2f}"))
+        if dm.total_investment_dynamic is not None:
+            metrics_list.append(("动态总投资(万元)", f"{dm.total_investment_dynamic / 10000:,.2f}"))
+        if dm.total_investment_static is not None:
+            metrics_list.append(("静态总投资(万元)", f"{dm.total_investment_static / 10000:,.2f}"))
+        if dm.annual_net_cashflow is not None:
+            metrics_list.append(("年均净现金流(万元)", f"{dm.annual_net_cashflow / 10000:,.2f}"))
+        if dm.total_revenue is not None:
+            metrics_list.append(("全期营收(万元)", f"{dm.total_revenue / 10000:,.2f}"))
 
-    # Second row
-    r7, r8, r9 = st.columns(3)
-    if dm.total_investment_static is not None:
-        r7.metric("静态总投资", f"{dm.total_investment_static:,.0f}")
-    if dm.annual_net_cashflow is not None:
-        r8.metric("年均净现金流", f"{dm.annual_net_cashflow:,.0f}")
-    if dm.total_revenue is not None:
-        r9.metric("全期营业收入", f"{dm.total_revenue:,.0f}")
+        row1 = metrics_list[:5]
+        row2 = metrics_list[5:]
 
-    # DSCR series chart
-    if dm.dscr_series:
-        with st.expander("DSCR 年度分布", expanded=False):
+        if row1:
+            cols = st.columns(len(row1))
+            for i, (label, val) in enumerate(row1):
+                cols[i].metric(label, val)
+        if row2:
+            cols = st.columns(len(row2))
+            for i, (label, val) in enumerate(row2):
+                cols[i].metric(label, val)
+
+        # DSCR series chart
+        if dm.dscr_series:
             dscr_rows = [{"年份": k, "DSCR": round(v, 3)} for k, v in sorted(dm.dscr_series.items())]
             st.bar_chart(dscr_rows, x="年份", y="DSCR", horizontal=False)
-
-    st.divider()
 
 # ── Chat Input ────────────────────────────────────────────────────────────────
 question = st.chat_input("或输入自定义财务问题...")
@@ -695,31 +702,56 @@ if chat_history and chat_history[-1]["role"] == "assistant":
 
 # ── Export Financial Report ──────────────────────────────────────────────────
 st.divider()
-st.subheader("导出财务效益分析报告")
-st.caption("按甲方模板结构生成 Word 报告，含基础参数、盈利能力、偿债能力、财务生存能力、敏感性分析。")
+exp_col1, exp_col2, exp_col3 = st.columns([3, 1, 1])
+with exp_col1:
+    st.markdown("#### 导出财务效益分析报告")
+    st.caption("按甲方模板结构生成 Word 报告，含基础参数、盈利能力、偿债能力、财务生存能力、敏感性分析。")
 
-if st.button("导出 Word 报告", type="primary"):
-    from financial_kg.engine.report_export import export_financial_report, _auto_detect_params
+    # Pre-check sensitivity history availability
+    _export_history_list = db.list_sensitivity(task.id)
+    if _export_history_list:
+        st.caption(f"已检测到敏感性分析「{_export_history_list[0]['run_name']}」，导出时将自动复用，无需重新计算。")
 
-    report_path = os.path.join(task.output_dir, f"{task.id}_financial_report.docx")
-    with st.spinner("生成报告中..."):
-        params = _auto_detect_params(graph)
-        export_financial_report(
-            graph=graph,
-            output_path=report_path,
-            task_id=task.id,
-            output_dir=task.output_dir,
-            project_name=task.filename,
-            sensitivity_params=None,  # skip sensitivity — too slow (full recalc per scenario)
-        )
+with exp_col3:
+    if st.button("导出 Word 报告", type="primary", use_container_width=True):
+        from financial_kg.engine.report_export import export_financial_report, _auto_detect_params
+        from financial_kg.engine.sensitivity import SensitivityResult
+        from financial_kg.engine.derived_metrics import deserialize_metrics as _deser
+        from financial_kg.engine.sensitivity import SensitivityScenario
 
-    with open(report_path, "rb") as f:
-        st.download_button(
-            "下载财务效益分析报告",
-            data=f,
-            file_name=f"{task.filename.rsplit('.', 1)[0]}_财务效益分析报告.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        )
+        # Try to reuse sensitivity analysis from history
+        _sen_result = None
+        if _export_history_list:
+            latest = _export_history_list[0]
+            base_metrics = _deser(latest["base_metrics"])
+            scenario_objs = [
+                SensitivityScenario(
+                    name=s["name"], param_name=s["param_name"],
+                    param_cell_id=s["param_cell_id"], perturbation=s["perturbation"],
+                    original_value=s["original_value"], perturbed_value=s["perturbed_value"],
+                    metrics=_deser(s["metrics"]), snapshot_name=s["snapshot_name"],
+                )
+                for s in latest["scenarios"]
+            ]
+            _sen_result = SensitivityResult(base_metrics=base_metrics, scenarios=scenario_objs)
 
-    st.caption("注：敏感性分析需在「快照对比 → 敏感性分析」tab手动运行后添加到报告中。")
+        report_path = os.path.join(task.output_dir, f"{task.id}_financial_report.docx")
+        with st.spinner("生成报告中..."):
+            params = _auto_detect_params(graph)
+            export_financial_report(
+                graph=graph,
+                output_path=report_path,
+                task_id=task.id,
+                output_dir=task.output_dir,
+                project_name=task.filename,
+                sensitivity_result=_sen_result,
+            )
+
+        with open(report_path, "rb") as f:
+            st.download_button(
+                "下载财务效益分析报告",
+                data=f,
+                file_name=f"{task.filename.rsplit('.', 1)[0]}_财务效益分析报告.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
 

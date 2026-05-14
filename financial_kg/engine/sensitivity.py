@@ -217,3 +217,75 @@ def _build_spider_table(
         rows.append(row)
 
     return rows
+
+
+def _render_spider_chart(
+    base: DerivedMetrics,
+    scenarios: list[SensitivityScenario],
+    metric_key: str = "irr_after_tax",
+    metric_label: str = "税后IRR",
+) -> str:
+    """Generate ECharts line chart HTML for sensitivity analysis."""
+    import json
+
+    by_param: dict[str, list[SensitivityScenario]] = {}
+    for s in scenarios:
+        by_param.setdefault(s.param_name, []).append(s)
+
+    all_pcts = sorted({s.perturbation for s in scenarios})
+    pct_labels = {p: f"{p:+.0%}" for p in all_pcts}
+    params = list(by_param.keys())
+    if not params:
+        return ""
+
+    base_val = getattr(base, metric_key, None)
+    if base_val is None:
+        return ""
+
+    base_series = [round(base_val * 100, 2) if "irr" in metric_key else round(base_val, 2)] * len(params)
+
+    series_data: list[dict] = [{
+        "name": "基准", "type": "line", "data": base_series,
+        "lineStyle": {"type": "dashed", "color": "#888"},
+        "itemStyle": {"color": "#888"}, "symbol": "circle", "symbolSize": 6,
+    }]
+
+    for pct in all_pcts:
+        line_data: list = []
+        color = "#ef4444" if pct > 0 else "#3b82f6"
+        for p in params:
+            matched = [s for s in by_param[p] if s.perturbation == pct]
+            if matched:
+                val = getattr(matched[0].metrics, metric_key, None)
+                if val is not None:
+                    line_data.append(round(val * 100, 2) if "irr" in metric_key else round(val, 2))
+                else:
+                    line_data.append(None)
+            else:
+                line_data.append(None)
+        series_data.append({
+            "name": pct_labels[pct], "type": "line", "data": line_data,
+            "lineStyle": {"width": 2}, "itemStyle": {"color": color},
+            "symbol": "diamond", "symbolSize": 7,
+        })
+
+    option = {
+        "title": {"text": f"{metric_label} 敏感性分析", "left": "center", "textStyle": {"fontSize": 15}},
+        "tooltip": {"trigger": "axis"},
+        "legend": {"data": [s["name"] for s in series_data], "bottom": 0},
+        "grid": {"top": 50, "bottom": 60, "left": 70, "right": 30},
+        "xAxis": {"type": "category", "data": params, "axisLabel": {"rotate": 30, "interval": 0, "fontSize": 11}},
+        "yAxis": {"type": "value", "name": metric_label, "splitLine": {"lineStyle": {"type": "dashed"}}},
+        "series": series_data,
+    }
+
+    return (
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+        "<script src=\"https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js\"></script>"
+        "<style>body{margin:0;font-family:sans-serif;}#chart{width:100%;height:380px;}</style>"
+        "</head><body><div id=\"chart\"></div>"
+        "<script>var chart=echarts.init(document.getElementById('chart'));"
+        "var option=" + json.dumps(option, ensure_ascii=False) + ";"
+        "chart.setOption(option);window.addEventListener('resize',function(){chart.resize();});"
+        "</script></body></html>"
+    )
