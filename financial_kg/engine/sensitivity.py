@@ -9,6 +9,7 @@ Usage from Streamlit page:
 from __future__ import annotations
 
 import copy
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -108,7 +109,10 @@ def run_sensitivity(
             # Create snapshot if directories provided
             snap_name = f"sensitivity_{scenario_name.replace(' ', '_').replace('+', 'plus').replace('-', 'neg')}"
             if task_id and output_dir:
-                snap_dir = snapshots_dir or output_dir
+                # create_snapshot creates {snap_dir}/{task_id}/, so pass parent of output_dir
+                snap_dir = snapshots_dir or os.path.dirname(output_dir)
+                if not snap_dir:
+                    snap_dir = output_dir
                 create_snapshot(work_graph, task_id, snap_name, snap_dir)
 
             scenarios.append(SensitivityScenario(
