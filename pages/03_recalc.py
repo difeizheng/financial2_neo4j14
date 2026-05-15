@@ -243,7 +243,100 @@ scenario = ws.scenarios.get(ws.active_scenario)
 with editor_col:
     st.subheader("📝 编辑参数")
 
-    # Global filter bar
+    # ── 树形数据结构构建 ────────────────────────────────────────────────
+
+    def _is_modified(cell_id: str, scenario, pending: dict) -> bool:
+        """Check if a cell has override or pending edit."""
+        if scenario and cell_id in scenario.overrides:
+            return True
+        return cell_id in pending
+
+    def _build_tree(rows: list[dict], scenario, pending: dict) -> dict:
+        """Build Sheet → Table → Indicator → Cells tree."""
+        tree: dict[str, dict] = {}
+        for r in rows:
+            sheet = r["Sheet"] or "未分组"
+            tbl = r["Table 名称"] or "未分组"
+            ind_name = r["Indicator 名称"] or "未命名"
+            ind_key = f"{ind_name}|{r['类别']}"
+
+            if sheet not in tree:
+                tree[sheet] = {"tables": {}}
+            if tbl not in tree[sheet]["tables"]:
+                tree[sheet]["tables"][tbl] = {"indicators": {}}
+
+            tbl_node = tree[sheet]["tables"][tbl]
+            if ind_key not in tbl_node["indicators"]:
+                tbl_node["indicators"][ind_key] = {
+                    "name": ind_name,
+                    "category": r["类别"],
+                    "cells": [],
+                }
+
+            cid = r["Cell ID"]
+            base_val = r["当前值"]
+            scenario_val = base_val
+            if scenario and cid in scenario.overrides:
+                scenario_val = scenario.overrides[cid]
+            if cid in pending:
+                scenario_val = pending[cid]
+
+            tbl_node["indicators"][ind_key]["cells"].append({
+                "cell_id": cid,
+                "type": r["类型"],
+                "current_value": base_val,
+                "scenario_value": scenario_val,
+                "modified": _is_modified(cid, scenario, pending),
+            })
+
+        return tree
+
+    def _tree_match_search(tree: dict, kw: str) -> set[str]:
+        """Return set of sheet names that have cells matching search kw."""
+        if not kw:
+            return set(tree.keys())
+        matching_sheets: set[str] = set()
+        kw_lower = kw.lower()
+        for sheet_name, sheet_data in tree.items():
+            for tbl_name, tbl_data in sheet_data["tables"].items():
+                for ind_key, ind_data in tbl_data["indicators"].items():
+                    for c in ind_data["cells"]:
+                        if (kw_lower in c["cell_id"].lower()
+                                or kw_lower in ind_data["name"].lower()
+                                or kw_lower in tbl_name.lower()):
+                            matching_sheets.add(sheet_name)
+                            break
+                    else:
+                        continue
+                    break
+                else:
+                    continue
+                break
+        return matching_sheets
+
+    def _count_tree_cells(tree: dict) -> int:
+        """Total cells in tree."""
+        total = 0
+        for sheet_data in tree.values():
+            for tbl_data in sheet_data["tables"].values():
+                for ind_data in tbl_data["indicators"].values():
+                    total += len(ind_data["cells"])
+        return total
+
+    def _collect_tree_modifications(tree: dict, pending: dict) -> dict:
+        """Walk tree and collect all modified cells into pending dict."""
+        for sheet_data in tree.values():
+            for tbl_data in sheet_data["tables"].values():
+                for ind_data in tbl_data["indicators"].values():
+                    for c in ind_data["cells"]:
+                        try:
+                            if abs(float(c["scenario_value"]) - float(c["current_value"])) > 1e-9:
+                                pending[c["cell_id"]] = c["scenario_value"]
+                        except (ValueError, TypeError):
+                            if c["scenario_value"] != c["current_value"]:
+                                pending[c["cell_id"]] = c["scenario_value"]
+
+    # Filter bar
     filter_a, filter_b, filter_c = st.columns([2, 1, 1])
     with filter_a:
         search_kw = st.text_input("搜索", placeholder="Cell ID / Indicator / Table", label_visibility="collapsed", key="p_search")
@@ -253,87 +346,97 @@ with editor_col:
         all_types = sorted(set(r["类型"] for r in all_param_cells if r["类型"]))
         selected_types = st.multiselect("类型", all_types, default=["number"], label_visibility="collapsed", key="p_types")
 
-    # Group by category
-    category_groups: dict[str, list[dict]] = {}
+    # Filter rows
+    filtered_rows = []
     for r in all_param_cells:
         if selected_types and r["类型"] not in selected_types:
             continue
         if selected_sheets and r["Sheet"] not in selected_sheets:
             continue
         if search_kw:
-            kw = search_kw.lower()
-            if kw not in r["Cell ID"].lower() and kw not in r["Indicator 名称"].lower() and kw not in r["Table 名称"].lower():
+            kw_lower = search_kw.lower()
+            if (kw_lower not in r["Cell ID"].lower()
+                    and kw_lower not in r["Indicator 名称"].lower()
+                    and kw_lower not in r["Table 名称"].lower()):
                 continue
-        cat = r["类别"] or "未分类"
-        category_groups.setdefault(cat, []).append(r)
+        filtered_rows.append(r)
 
-    # Sort categories, "未分类" at end
-    sorted_cats = sorted(
-        [c for c in category_groups if c != "未分类"],
-        key=lambda c: len(category_groups[c]),
-        reverse=True,
-    )
-    if "未分类" in category_groups:
-        sorted_cats.append("未分类")
-
-    if not sorted_cats:
+    if not filtered_rows:
         st.info("无匹配参数")
     else:
-        cat_tabs = st.tabs([f"{c} ({len(category_groups[c])})" for c in sorted_cats])
-
         pending_key = f"pending_{ws.active_scenario}"
         global_pending: dict[str, Any] = st.session_state.get(pending_key, {})
 
-        for ti, cat in enumerate(sorted_cats):
-            with cat_tabs[ti]:
-                cat_rows = category_groups[cat]
-                if not cat_rows:
-                    st.info("当前类别无参数")
-                    continue
+        # Build tree
+        param_tree = _build_tree(filtered_rows, scenario, global_pending)
+        total_cells = _count_tree_cells(param_tree)
 
-                df = pd.DataFrame(cat_rows)
-                df["场景值"] = df["当前值"].copy()
+        # Sheet expanders
+        sheet_names_sorted = sorted(param_tree.keys())
+        sheet_expanders = st.tabs([f"📁 {s}" for s in sheet_names_sorted])
 
-                # Pre-fill scenario overrides
-                if scenario:
-                    for idx in df.index:
-                        cid = df.at[idx, "Cell ID"]
-                        if cid in scenario.overrides:
-                            df.at[idx, "场景值"] = scenario.overrides[cid]
+        for si, sheet_name in enumerate(sheet_names_sorted):
+            with sheet_expanders[si]:
+                sheet_data = param_tree[sheet_name]
+                table_names = sorted(sheet_data["tables"].keys())
 
-                # Pre-fill pending edits
-                for idx in df.index:
-                    cid = df.at[idx, "Cell ID"]
-                    if cid in global_pending:
-                        df.at[idx, "场景值"] = global_pending[cid]
+                for tbl_name in table_names:
+                    tbl_data = sheet_data["tables"][tbl_name]
+                    indicators = tbl_data["indicators"]
 
-                edited_df = st.data_editor(
-                    df,
-                    column_config={
-                        "Cell ID": st.column_config.TextColumn("Cell ID", disabled=True, width="medium"),
-                        "Indicator 名称": st.column_config.TextColumn("Indicator", disabled=True),
-                        "Table 名称": st.column_config.TextColumn("Table", disabled=True),
-                        "Sheet": st.column_config.TextColumn("Sheet", disabled=True, width="small"),
-                        "类型": st.column_config.TextColumn("类型", disabled=True, width="small"),
-                        "当前值": st.column_config.NumberColumn("当前值", disabled=True, width="small"),
-                        "场景值": st.column_config.NumberColumn("场景值", width="small"),
-                    },
-                    use_container_width=True,
-                    hide_index=True,
-                    key=f"pedit_{ws.active_scenario}_{cat}",
-                )
+                    # Count modified cells in this table
+                    mod_count = sum(
+                        1 for ind_data in indicators.values()
+                        for c in ind_data["cells"]
+                        if c["modified"]
+                    )
 
-                # Collect per-tab pending edits
-                for _, row in edited_df.iterrows():
-                    cid = row["Cell ID"]
-                    new_val = row["场景值"]
-                    old_val = row["当前值"]
-                    try:
-                        if abs(float(new_val) - float(old_val)) > 1e-9:
-                            global_pending[cid] = new_val
-                    except (ValueError, TypeError):
-                        if new_val != old_val:
-                            global_pending[cid] = new_val
+                    tbl_label = f"📋 {tbl_name} ({len(indicators)} 项)"
+                    if mod_count > 0:
+                        tbl_label = f"🔴 {tbl_name} ({mod_count} 已修改)"
+
+                    with st.expander(tbl_label, expanded=(mod_count > 0)):
+                        # Build a mini dataframe for this table's cells
+                        cell_rows = []
+                        for ind_key in sorted(indicators.keys()):
+                            ind_data = indicators[ind_key]
+                            for c in ind_data["cells"]:
+                                cell_rows.append({
+                                    "Cell ID": c["cell_id"],
+                                    "Indicator": ind_data["name"],
+                                    "类别": ind_data["category"],
+                                    "类型": c["type"],
+                                    "当前值": c["current_value"],
+                                    "场景值": c["scenario_value"],
+                                })
+
+                        tbl_df = pd.DataFrame(cell_rows)
+                        edited_df = st.data_editor(
+                            tbl_df,
+                            column_config={
+                                "Cell ID": st.column_config.TextColumn("Cell ID", disabled=True, width="medium"),
+                                "Indicator": st.column_config.TextColumn("Indicator", disabled=True),
+                                "类别": st.column_config.TextColumn("类别", disabled=True, width="small"),
+                                "类型": st.column_config.TextColumn("类型", disabled=True, width="small"),
+                                "当前值": st.column_config.NumberColumn("当前值", disabled=True, width="small"),
+                                "场景值": st.column_config.NumberColumn("场景值", width="small"),
+                            },
+                            use_container_width=True,
+                            hide_index=True,
+                            key=f"tree_edit_{ws.active_scenario}_{sheet_name}_{tbl_name}",
+                        )
+
+                        # Collect edits
+                        for _, row in edited_df.iterrows():
+                            cid = row["Cell ID"]
+                            new_val = row["场景值"]
+                            old_val = row["当前值"]
+                            try:
+                                if abs(float(new_val) - float(old_val)) > 1e-9:
+                                    global_pending[cid] = new_val
+                            except (ValueError, TypeError):
+                                if new_val != old_val:
+                                    global_pending[cid] = new_val
 
         # Save global pending edits
         st.session_state[pending_key] = global_pending
