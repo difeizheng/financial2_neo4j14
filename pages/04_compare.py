@@ -1,4 +1,4 @@
-"""Page 4: Snapshot comparison — enhanced with tabs, heatmap, export."""
+"""Page 4: Snapshot comparison — card selector, derived metrics, change matrix."""
 from __future__ import annotations
 
 import json
@@ -18,15 +18,15 @@ from financial_kg.viz.propagation_graph import build_propagation_data
 from financial_kg.viz.echarts_template import render_propagation_html
 from financial_kg.viz.compare_viz import (
     compute_change_summary,
-    build_indicator_change_chart,
-    render_indicator_chart_html,
     build_heatmap_data,
     render_heatmap_html,
     export_diff_report_excel,
 )
 from financial_kg.engine.excel_export import export_modified_excel, find_original_excel
+from financial_kg.engine.derived_metrics import DerivedMetrics
 
-st.title("快照对比")
+st.set_page_config(layout="wide")
+st.title("📊 快照对比")
 
 db = TaskDB()
 tasks = [t for t in db.list_tasks() if t.status == "done"]
@@ -36,96 +36,77 @@ if not tasks:
     st.stop()
 
 task_options = {f"{t.id} — {t.filename}": t for t in tasks}
-selected_label = st.selectbox("选择任务", list(task_options.keys()))
+selected_label = st.selectbox("任务", list(task_options.keys()), label_visibility="collapsed")
 task = task_options[selected_label]
+
 
 @st.cache_resource(show_spinner="加载图谱...")
 def _load(task_id: str, output_dir: str):
     cells_path = os.path.join(output_dir, f"{task_id}_cells.json")
     return load_graph(cells_path)
 
+
 graph = _load(task.id, task.output_dir)
 
-# ── Quick compare latest two ──────────────────────────────────────────────────
+# ── Snapshot selection (card-style) ───────────────────────────────────────────
 snaps = db.list_snapshots(task.id)
 
-if "locked_baseline" not in st.session_state:
-    st.session_state["locked_baseline"] = None
-
-if "locked_baseline_task" not in st.session_state:
-    st.session_state["locked_baseline_task"] = None
-
-# If task changed and baseline was locked to a different task, reset lock
-if st.session_state["locked_baseline_task"] != task.id:
-    st.session_state["locked_baseline"] = None
-    st.session_state["locked_baseline_task"] = None
-
-# ── Snapshot Selection ────────────────────────────────────────────────────────
 if len(snaps) < 2:
-    st.info("该任务快照不足 2 个，请先在「参数重算」页面创建快照。")
+    st.info("该任务快照不足 2 个，请先在「参数工作台」页面创建快照。")
     st.stop()
 
-snap_options = {f"{s.name} ({s.created_at[:19]})": s for s in snaps}
-snap_labels = list(snap_options.keys())
-oldest_label = snap_labels[0]
-latest_label = snap_labels[-1]
+snap_map = {f"{s.name} ({s.created_at[:19]})": s for s in snaps}
+snap_labels = list(snap_map.keys())
 
-# Initialize A/B selection in session_state on first render per task
-_sel_key_a = f"_sel_label_a_{task.id}"
-_sel_key_b = f"_sel_label_b_{task.id}"
-if _sel_key_a not in st.session_state:
-    st.session_state[_sel_key_a] = oldest_label  # default A = oldest (baseline)
-if _sel_key_b not in st.session_state:
-    st.session_state[_sel_key_b] = latest_label  # default B = latest (comparison)
+# Session state for A/B selection
+_key_a = f"cmp_a_{task.id}"
+_key_b = f"cmp_b_{task.id}"
+if _key_a not in st.session_state:
+    st.session_state[_key_a] = snap_labels[0]
+if _key_b not in st.session_state:
+    st.session_state[_key_b] = snap_labels[-1]
 
-# ── Button handlers (run BEFORE selectbox render, mutate session_state) ───────
-if snaps:
-    if st.button("对比最新两个快照", use_container_width=False):
-        if len(snaps) >= 2:
-            sorted_snaps = sorted(snaps, key=lambda s: s.created_at, reverse=True)
-            st.session_state[_sel_key_a] = f"{sorted_snaps[1].name} ({sorted_snaps[1].created_at[:19]})"  # older = baseline
-            st.session_state[_sel_key_b] = f"{sorted_snaps[0].name} ({sorted_snaps[0].created_at[:19]})"  # newer = comparison
-            st.session_state["_run_auto_diff"] = True
-        else:
-            st.info("至少需要 2 个快照")
+# Card-style selector
+st.subheader("选择对比快照")
+card_cols = st.columns([4, 1, 4, 1])
 
-# Swap: exchange session_state values so selectboxes update on re-render
-if st.button("⇄", help="交换 A/B"):
-    tmp = st.session_state[_sel_key_a]
-    st.session_state[_sel_key_a] = st.session_state[_sel_key_b]
-    st.session_state[_sel_key_b] = tmp
-    st.session_state["_run_swap_diff"] = True
+with card_cols[0]:
+    label_a = st.selectbox("← 基准快照 A", snap_labels, index=snap_labels.index(st.session_state[_key_a]))
+    st.session_state[_key_a] = label_a
 
-col_lock, col_a, col_swap, col_b = st.columns([1, 5, 1, 5])
+with card_cols[1]:
+    st.write("")  # spacer
+    st.write("")
+    st.write("")
+    if st.button("⇄ 交换", use_container_width=True, key="swap_snapshots"):
+        tmp = st.session_state[_key_a]
+        st.session_state[_key_a] = st.session_state[_key_b]
+        st.session_state[_key_b] = tmp
+        st.rerun()
 
-with col_lock:
-    lock_baseline = st.checkbox("🔒 锁定基准", key="lock_cb")
+with card_cols[2]:
+    label_b = st.selectbox("对比快照 B →", snap_labels, index=snap_labels.index(st.session_state[_key_b]))
+    st.session_state[_key_b] = label_b
 
-# Initialize locked baseline
-if lock_baseline and st.session_state["locked_baseline"] is None:
-    st.session_state["locked_baseline"] = st.session_state[_sel_key_a]
-    st.session_state["locked_baseline_task"] = task.id
-elif not lock_baseline:
-    st.session_state["locked_baseline"] = None
-    st.session_state["locked_baseline_task"] = None
+# Quick actions
+quick_row = st.columns([2, 2, 10])
+with quick_row[0]:
+    if st.button("📌 锁定最新为基准", use_container_width=True, key="lock_latest_a"):
+        st.session_state[_key_a] = snap_labels[-2] if len(snap_labels) >= 2 else snap_labels[-1]
+        st.session_state[_key_b] = snap_labels[-1]
+        st.rerun()
+with quick_row[1]:
+    if st.button("📌 锁定最旧为基准", use_container_width=True, key="lock_oldest_a"):
+        st.session_state[_key_a] = snap_labels[0]
+        st.session_state[_key_b] = snap_labels[-1]
+        st.rerun()
 
-with col_a:
-    if st.session_state["locked_baseline"]:
-        label_a = st.selectbox("快照 A（基准，已锁定）", [st.session_state["locked_baseline"]])
-    else:
-        label_a = st.selectbox("快照 A（基准）", snap_labels, index=snap_labels.index(st.session_state[_sel_key_a]))
-
-with col_b:
-    label_b = st.selectbox("快照 B（对比）", snap_labels, index=snap_labels.index(st.session_state[_sel_key_b]))
-
-# Sync selectbox changes back to session_state
-st.session_state[_sel_key_a] = label_a
-st.session_state[_sel_key_b] = label_b
+st.divider()
 
 # ── Execute diff ──────────────────────────────────────────────────────────────
-if st.button("执行对比", type="primary"):
-    rec_a = snap_options[label_a]
-    rec_b = snap_options[label_b]
+if st.button("执行对比", type="primary", use_container_width=True):
+    rec_a = snap_map[label_a]
+    rec_b = snap_map[label_b]
 
     if rec_a.id == rec_b.id:
         st.warning("请选择两个不同的快照")
@@ -138,68 +119,162 @@ if st.button("执行对比", type="primary"):
 
     st.session_state["diff"] = diff
     st.session_state["diff_task_id"] = task.id
+    st.session_state["snap_a_values"] = snap_a.values
     st.session_state["snap_b_values"] = snap_b.values
+    st.session_state["snap_a_name"] = rec_a.name
+    st.session_state["snap_b_name"] = rec_b.name
     st.session_state.pop("prop_html", None)
-
-# Auto diff triggered by "latest two" button
-if st.session_state.pop("_run_auto_diff", False):
-    auto_a = st.session_state.get(_sel_key_a, "")
-    auto_b = st.session_state.get(_sel_key_b, "")
-    if auto_a and auto_b and auto_a in snap_options and auto_b in snap_options:
-        rec_a = snap_options[auto_a]
-        rec_b = snap_options[auto_b]
-        with st.spinner("对比中..."):
-            snap_a = load_snapshot(rec_a.filepath)
-            snap_b = load_snapshot(rec_b.filepath)
-            diff = diff_snapshots(snap_a, snap_b, graph)
-        st.session_state["diff"] = diff
-        st.session_state["diff_task_id"] = task.id
-        st.session_state["snap_b_values"] = snap_b.values
-        st.session_state.pop("prop_html", None)
-
-# Swap diff
-if st.session_state.pop("_run_swap_diff", False):
-    sw_a = st.session_state.get(_sel_key_a, "")
-    sw_b = st.session_state.get(_sel_key_b, "")
-    if sw_a and sw_b and sw_a in snap_options and sw_b in snap_options:
-        rec_a = snap_options[sw_a]
-        rec_b = snap_options[sw_b]
-        with st.spinner("对比中..."):
-            snap_a = load_snapshot(rec_a.filepath)
-            snap_b = load_snapshot(rec_b.filepath)
-            diff = diff_snapshots(snap_a, snap_b, graph)
-        st.session_state["diff"] = diff
-        st.session_state["diff_task_id"] = task.id
-        st.session_state["snap_b_values"] = snap_b.values
-        st.session_state.pop("prop_html", None)
 
 # ── Show diff results ─────────────────────────────────────────────────────────
 diff = st.session_state.get("diff")
 if diff is None or st.session_state.get("diff_task_id") != task.id:
+    st.info("选择两个快照后点击「执行对比」显示差异")
     st.stop()
 
+snap_a_name = st.session_state.get("snap_a_name", "A")
+snap_b_name = st.session_state.get("snap_b_name", "B")
+snap_b_values = st.session_state.get("snap_b_values", {})
+snap_a_values = st.session_state.get("snap_a_values", {})
+
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_summary, tab_heatmap, tab_cells, tab_prop, tab_sensitivity, tab_export = st.tabs([
-    "汇总分析",
-    "热力图",
-    "变化明细",
+tab_metrics, tab_matrix, tab_prop, tab_export = st.tabs([
+    "关键指标对比",
+    "变化矩阵",
     "传播图",
-    "敏感性分析",
     "导出",
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Tab 1: 汇总分析
+# Tab 1: Key metrics comparison
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_summary:
+with tab_metrics:
+    # Summary metrics
     c1, c2, c3 = st.columns(3)
     c1.metric("变化单元格数", diff.summary["total_changed_cells"])
     c2.metric("受影响 Indicator 数", diff.summary["total_changed_indicators"])
     c3.metric("涉及 Sheet 数", len(diff.summary["sheets_affected"]))
 
     if diff.summary["sheets_affected"]:
-        st.write("涉及 Sheet：", "、".join(diff.summary["sheets_affected"]))
+        st.caption("涉及 Sheet：" + "、".join(diff.summary["sheets_affected"]))
 
+    st.divider()
+
+    # Derived metrics comparison
+    st.subheader(f"{snap_a_name} vs {snap_b_name} — 关键财务指标")
+
+    def _compute_metrics_for_snapshot(snapshot_values, graph):
+        """Compute derived metrics for a snapshot."""
+        # Apply snapshot values to graph cells temporarily
+        original_values = {}
+        for cid, val in snapshot_values.items():
+            cell = graph.cells.get(cid)
+            if cell:
+                original_values[cid] = cell.value
+                cell.value = val
+
+        # Collect metrics from graph indicators
+        irr = None
+        npv = None
+        payback = None
+        dscr_avg = None
+        dscr_min = None
+
+        for ind_id, ind in graph.indicators.items():
+            if ind.name:
+                name_lower = ind.name.lower()
+                val = ind.summary_value
+                if val is not None:
+                    try:
+                        float_val = float(val)
+                    except (ValueError, TypeError):
+                        continue
+                    if any(k in name_lower for k in ["irr", "内部收益率"]):
+                        if irr is None:
+                            irr = float_val
+                    elif any(k in name_lower for k in ["净现值", "npv"]):
+                        if npv is None:
+                            npv = float_val
+                    elif any(k in name_lower for k in ["回收期", "payback"]):
+                        if payback is None:
+                            payback = float_val
+                    elif "dscr" in name_lower:
+                        if dscr_avg is None:
+                            dscr_avg = float_val
+                        if dscr_min is None or float_val < dscr_min:
+                            dscr_min = float_val
+
+        # Restore original values
+        for cid, val in original_values.items():
+            cell = graph.cells.get(cid)
+            if cell:
+                cell.value = val
+
+        return DerivedMetrics(
+            irr_after_tax=irr,
+            npv_after_tax=npv,
+            payback_period=payback,
+            dscr_avg=dscr_avg,
+            dscr_min=dscr_min,
+        )
+
+    # Compute metrics for both snapshots
+    metrics_a = _compute_metrics_for_snapshot(snap_a_values, graph)
+    metrics_b = _compute_metrics_for_snapshot(snap_b_values, graph)
+
+    # Display comparison cards
+    metric_defs = [
+        ("税后IRR", "irr_after_tax", "{:.2f}%", 100, True),
+        ("财务净现值", "npv_after_tax", "{:,.0f}", 1, False),
+        ("投资回收期", "payback_period", "{:.2f}年", 1, True),
+        ("DSCR均值", "dscr_avg", "{:.2f}", 1, False),
+        ("DSCR最低值", "dscr_min", "{:.2f}", 1, False),
+    ]
+
+    n_cols = min(len(metric_defs), 5)
+    metric_cols = st.columns(n_cols)
+
+    for i, (label, attr, fmt, multiplier, lower_is_better) in enumerate(metric_defs):
+        val_a = getattr(metrics_a, attr, None)
+        val_b = getattr(metrics_b, attr, None)
+
+        with metric_cols[i % n_cols]:
+            row_a, row_b = st.columns(2)
+            with row_a:
+                st.caption(snap_a_name)
+                if val_a is not None:
+                    st.markdown(f"**{fmt.format(val_a * multiplier)}**")
+                else:
+                    st.caption("—")
+            with row_b:
+                st.caption(snap_b_name)
+                if val_b is not None:
+                    st.markdown(f"**{fmt.format(val_b * multiplier)}**")
+                else:
+                    st.caption("—")
+
+            # Delta
+            if val_a is not None and val_b is not None:
+                delta = val_b - val_a
+                pct = (delta / abs(val_a) * 100) if val_a != 0 else None
+                delta_str = f"{delta:+.2f}" if multiplier == 1 else f"{delta * multiplier:+.2f}"
+                if pct is not None:
+                    delta_str += f" ({pct:+.1f}%)"
+                # Color: green = positive change, red = negative
+                if "irr" in attr or "npv" in attr or "dscr" in attr:
+                    good = delta > 0
+                elif "payback" in attr:
+                    good = delta < 0  # shorter payback is better
+                else:
+                    good = True
+
+                color = "green" if good else "red"
+                st.markdown(f"<span style='color:{color};font-weight:bold;font-size:0.9em'>变化: {delta_str}</span>", unsafe_allow_html=True)
+            else:
+                st.caption("无法计算变化")
+
+    st.divider()
+
+    # Change summary
     if diff.changed_cells:
         summary = compute_change_summary(diff, graph)
 
@@ -210,102 +285,125 @@ with tab_summary:
         r3.metric("最大变化单元格", summary["max_magnitude_cell"][:30])
         r4.metric("最大变化幅度", f"{summary['max_magnitude']:,.2f}")
 
-        st.subheader("影响分布")
-        ic1, ic2 = st.columns(2)
-        ic1.metric("关键单元格", summary["critical_count"])
-        ic2.metric("普通单元格", summary["normal_count"])
-
-        if summary["sheets_ranking"]:
-            st.subheader("Sheet 变更排行")
-            sheet_rows = [{"Sheet": s, "变化数": c} for s, c in summary["sheets_ranking"]]
-            st.bar_chart(sheet_rows, x="Sheet", y="变化数", horizontal=True)
-
-        if summary["top_indicators"]:
-            st.subheader("Top 10 受影响 Indicator")
-            ind_rows = [{"Indicator": n, "变化单元格数": c} for n, c in summary["top_indicators"]]
-            st.bar_chart(ind_rows, x="Indicator", y="变化单元格数", horizontal=True)
-
-        # Indicator chart
-        if st.button("查看指标变化图表", key="show_ind_chart"):
-            chart_data = build_indicator_change_chart(diff, graph)
-            html = render_indicator_chart_html(chart_data)
-            components.html(html, height=520, scrolling=False)
+        # Sheet + Indicator ranking side by side
+        rank_a, rank_b = st.columns(2)
+        with rank_a:
+            if summary["sheets_ranking"]:
+                st.caption("Sheet 变更排行")
+                sheet_rows = [{"Sheet": s, "变化数": c} for s, c in summary["sheets_ranking"]]
+                st.bar_chart(sheet_rows, x="Sheet", y="变化数", horizontal=True)
+        with rank_b:
+            if summary["top_indicators"]:
+                st.caption("Top 10 受影响 Indicator")
+                ind_rows = [{"Indicator": n, "变化单元格数": c} for n, c in summary["top_indicators"]]
+                st.bar_chart(ind_rows, x="Indicator", y="变化单元格数", horizontal=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Tab 2: 热力图
+# Tab 2: Change matrix
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_heatmap:
-    view_mode = st.radio("视图模式", ["指标聚合图", "单元格热力图"], horizontal=True)
+with tab_matrix:
+    st.subheader("变化矩阵")
 
-    if view_mode == "指标聚合图":
-        chart_data = build_indicator_change_chart(diff, graph)
-        if chart_data["items"]:
-            html = render_indicator_chart_html(chart_data)
-            components.html(html, height=520, scrolling=False)
+    # Build matrix data: rows = indicators, columns = cells with old/new/delta
+    matrix_data = []
+    for ind_entry in diff.affected_indicators:
+        ind_id = ind_entry.get("id") if isinstance(ind_entry, dict) else ind_entry
+        ind = graph.indicators.get(ind_id)
+        if not ind:
+            continue
+
+        # Find cells for this indicator that changed
+        changed_cells_for_ind = [
+            c for c in diff.changed_cells
+            if c.get("indicator_name") == (ind.name or "")
+        ]
+
+        if not changed_cells_for_ind:
+            continue
+
+        old_summary = ind_entry.get("old_summary") if isinstance(ind_entry, dict) else None
+        new_summary = ind_entry.get("new_summary") if isinstance(ind_entry, dict) else None
+
+        matrix_data.append({
+            "Indicator": ind.name or ind_id,
+            f"{snap_a_name}": old_summary,
+            f"{snap_b_name}": new_summary,
+            "变化": (float(new_summary) - float(old_summary)) if (old_summary is not None and new_summary is not None) else None,
+            "变化单元格数": len(changed_cells_for_ind),
+        })
+
+    if matrix_data:
+        # Filter bar
+        mat_search = st.text_input("搜索 Indicator", placeholder="输入 Indicator 名称筛选", label_visibility="collapsed")
+
+        filtered_mat = matrix_data
+        if mat_search:
+            kw = mat_search.lower()
+            filtered_mat = [r for r in filtered_mat if kw in r["Indicator"].lower()]
+
+        if filtered_mat:
+            st.dataframe(
+                filtered_mat,
+                use_container_width=True,
+                hide_index=True,
+                height=600,
+                column_config={
+                    "Indicator": st.column_config.TextColumn("Indicator", width="medium"),
+                    f"{snap_a_name}": st.column_config.NumberColumn(snap_a_name, width="small"),
+                    f"{snap_b_name}": st.column_config.NumberColumn(snap_b_name, width="small"),
+                    "变化": st.column_config.NumberColumn("变化", width="small"),
+                    "变化单元格数": st.column_config.NumberColumn("变化单元格数", width="small"),
+                },
+            )
+            st.caption(f"显示 {len(filtered_mat)} / {len(matrix_data)} 行")
         else:
-            st.info("无关联 indicator 的变化单元格")
-
+            st.info("无匹配数据")
     else:
-        sheets = sorted({c.get("sheet", "") for c in diff.changed_cells if c.get("sheet")})
-        selected_sheet = st.selectbox("选择 Sheet", sheets)
-        if selected_sheet:
-            hdata = build_heatmap_data(graph, diff, sheet_name=selected_sheet)
-            html = render_heatmap_html(hdata, sheet_name=selected_sheet)
-            components.html(html, height=620, scrolling=False)
+        st.info("无受影响的时间序列数据")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Tab 3: 变化明细
-# ══════════════════════════════════════════════════════════════════════════════
-with tab_cells:
+    # Heatmap sub-tab
+    st.divider()
+    st.subheader("单元格热力图")
+
     all_sheets = sorted({c.get("sheet", "") for c in diff.changed_cells if c.get("sheet")})
-
-    st.caption(f"共 {len(diff.changed_cells)} 条变化")
-
-    col_f1, col_f2 = st.columns(2)
-    with col_f1:
-        selected_sheets = st.multiselect("按 Sheet 筛选", all_sheets, default=[])
-    with col_f2:
-        search_kw = st.text_input("搜索", placeholder="Cell ID / Sheet / Indicator / 值")
-
-    filtered = diff.changed_cells
-    if selected_sheets:
-        filtered = [c for c in filtered if c.get("sheet") in selected_sheets]
-    if search_kw:
-        kw = search_kw.lower()
-        filtered = [
-            c for c in filtered
-            if kw in c["id"].lower()
-            or kw in c.get("sheet", "").lower()
-            or kw in c.get("indicator_name", "").lower()
-            or kw in str(c.get("old", "")).lower()
-            or kw in str(c.get("new", "")).lower()
-        ]
-
-    if not filtered:
-        st.info("无匹配的变化单元格")
+    if all_sheets:
+        sheet_tabs = st.tabs(all_sheets)
+        for si, sheet_name in enumerate(all_sheets):
+            with sheet_tabs[si]:
+                hdata = build_heatmap_data(graph, diff, sheet_name=sheet_name)
+                if hdata:
+                    html = render_heatmap_html(hdata, sheet_name=sheet_name)
+                    components.html(html, height=520, scrolling=False)
+                else:
+                    st.info(f"{sheet_name} 无变化单元格")
     else:
-        rows = [
-            {
-                "Cell ID": c["id"],
-                "Sheet": c.get("sheet", ""),
-                "旧值": c.get("old"),
-                "新值": c.get("new"),
-                "变化量": c.get("change_magnitude", 0),
-                "方向": "↑ 增加" if c.get("direction") == "increase" else "↓ 减少",
-                "公式": c.get("formula") or "",
-                "Indicator": c.get("indicator_name", ""),
-            }
-            for c in filtered
-        ]
-        st.dataframe(rows, use_container_width=True, height=500)
-        if search_kw or selected_sheets:
-            st.caption(f"筛选结果：{len(rows)} / {len(diff.changed_cells)} 条")
+        st.info("无变化单元格")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Tab 4: 传播图 (保留现有功能)
+# Tab 3: Propagation graph
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_prop:
-    cell_search = st.text_input("搜索传播起点", placeholder="输入 Cell ID、Sheet 名或值...")
+    if not diff.changed_cells:
+        st.info("无变化单元格，无法生成传播图")
+        st.stop()
+
+    # Default: show top 5 cells by magnitude
+    sorted_by_mag = sorted(diff.changed_cells, key=lambda c: c.get("change_magnitude", 0), reverse=True)
+    top5 = sorted_by_mag[:5]
+
+    st.caption("默认显示变化最大的 5 个单元格作为传播起点，也可搜索自定义起点")
+
+    # Quick picks
+    quick_cells = st.columns(min(len(top5), 5))
+    for i, c in enumerate(top5):
+        with quick_cells[i]:
+            cid_short = c["id"][:20] + ("…" if len(c["id"]) > 20 else "")
+            mag = c.get("change_magnitude", 0)
+            if st.button(f"{cid_short}\nΔ={mag:.2f}", use_container_width=True, key=f"qc_{c['id']}"):
+                st.session_state["prop_root"] = c["id"]
+
+    # Search
+    cell_search = st.text_input("搜索传播起点", placeholder="输入 Cell ID、Sheet 名或值...", label_visibility="collapsed")
     if cell_search:
         kw = cell_search.lower()
         candidates = [
@@ -318,310 +416,37 @@ with tab_prop:
     else:
         candidates = diff.changed_cells
 
-    cell_options = {
-        f"{c['id']}  ({c['sheet']})  {c['old']} → {c['new']}": c["id"]
-        for c in candidates[:500]
-    }
-    if not cell_options:
-        st.warning("无匹配的变化单元格，请调整搜索条件")
-        st.stop()
-    root_id = cell_options[st.selectbox("选择传播起点", list(cell_options.keys()))]
-    if cell_search and len(candidates) > 500:
-        st.caption(f"匹配 {len(candidates)} 个，显示前 500 个")
+    root_id = st.session_state.get("prop_root", top5[0]["id"] if top5 else diff.changed_cells[0]["id"])
 
-    col_d, col_s = st.columns(2)
-    max_depth = col_d.slider("最大传播深度", 1, 15, 8)
-    max_nodes = col_s.slider("最大节点数", 100, 2000, 500, 100)
+    if cell_search and candidates:
+        cell_options = {
+            f"{c['id']}  ({c['sheet']})  {c['old']} → {c['new']}": c["id"]
+            for c in candidates[:500]
+        }
+        if cell_options:
+            selected_label_prop = st.selectbox("选择传播起点", list(cell_options.keys()))
+            root_id = cell_options[selected_label_prop]
 
-    if st.button("生成传播图"):
+    max_depth = st.slider("传播深度", 1, 15, 8)
+    max_nodes = st.slider("最大节点数", 100, 2000, 500, 100)
+
+    if st.button("生成传播图", type="primary"):
         with st.spinner("构建传播图..."):
             data = build_propagation_data(graph, diff, root_id, max_depth, max_nodes)
-            html = render_propagation_html(
-                json.dumps(data, ensure_ascii=False, default=str)
-            )
+            html = render_propagation_html(json.dumps(data, ensure_ascii=False, default=str))
         st.session_state["prop_html"] = html
         st.session_state["prop_truncated"] = data["stats"]["truncated"]
         st.session_state["prop_nodes"] = data["stats"]["total_nodes"]
 
     if "prop_html" in st.session_state:
         if st.session_state.get("prop_truncated"):
-            st.warning(f"图谱已截断至 {st.session_state['prop_nodes']} 个节点（下游更多）")
+            st.warning(f"图谱已截断至 {st.session_state['prop_nodes']} 个节点")
         components.html(st.session_state["prop_html"], height=780, scrolling=False)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Tab 5: 敏感性分析
-# ══════════════════════════════════════════════════════════════════════════════
-with tab_sensitivity:
-    from financial_kg.engine.sensitivity import run_sensitivity, _build_spider_table, _render_spider_chart, SensitivityScenario, SensitivityResult
-    from financial_kg.engine.derived_metrics import DerivedMetrics, serialize_metrics as _ser, deserialize_metrics as _deser
-
-    st.caption("选择关键数值参数，分析±5%/±10%扰动对IRR/NPV/DSCR等指标的影响。")
-
-    # ── Load sensitivity history ─────────────────────────────────────
-    history_list = db.list_sensitivity(task.id)
-
-    # Collect candidate parameter cells (numeric, non-formula, non-text/date)
-    param_keywords = [
-        "电价", "售电电价", "上网电价",
-        "电量", "售电电量", "发电量",
-        "贷款利率", "利率",
-        "还款期", "贷款期限",
-        "成本", "购电成本",
-        "投资", "总投资", "静态投资",
-        "宽限期",
-        "所得税率", "税率",
-        "折现率", "基准收益率",
-    ]
-    _DATE_TIME_KEYWORDS = {"年", "月", "日", "期", "时间", "date", "time", "year"}
-
-    # Business keyword filter toggle (default: on)
-    use_keyword_filter = st.toggle(
-        "仅显示业务参数",
-        value=True,
-        help="关闭后显示所有数值型非公式单元格，由用户自行判断",
-    )
-
-    param_options: dict[str, str] = {}  # display -> cell_id
-    for cid, cell in graph.cells.items():
-        if cell.formula_raw:
-            continue
-        if not isinstance(cell.value, (int, float)) or cell.value == 0:
-            continue
-        if cell.indicator_id:
-            ind = graph.indicators.get(cell.indicator_id)
-            if ind:
-                name = ind.name or ""
-                # Filter out text/date type indicators
-                if any(kw in name for kw in _DATE_TIME_KEYWORDS):
-                    continue
-                # Only keep if indicator summary_value is numeric
-                sv = ind.summary_value
-                if sv is not None and not isinstance(sv, (int, float)):
-                    try:
-                        float(sv)
-                    except (TypeError, ValueError):
-                        continue
-        else:
-            name = ""
-
-        # Business keyword filter — toggleable
-        if use_keyword_filter:
-            if not any(kw in name for kw in param_keywords):
-                continue
-
-        label = f"{name} ({cid})" if name else cid
-        param_options[label] = cid
-
-    # ── Controls ─────────────────────────────────────────────────────
-    col_mode1, col_mode2 = st.columns(2)
-    with col_mode1:
-        run_mode = st.radio("模式", ["新建分析", "查看历史"], horizontal=True)
-
-    if run_mode == "新建分析":
-        col_p1, col_p2 = st.columns(2)
-        with col_p1:
-            selected_params = st.multiselect(
-                "选择分析参数",
-                list(param_options.keys()),
-                default=list(param_options.keys())[:6],
-            )
-        with col_p2:
-            perturb_pct = st.multiselect(
-                "扰动幅度",
-                ["-10%", "-5%", "+5%", "+10%"],
-                default=["-10%", "-5%", "+5%", "+10%"],
-            )
-
-        perturb_map = {"-10%": -0.1, "-5%": -0.05, "+5%": 0.05, "+10%": 0.1}
-        perturbations = [perturb_map[p] for p in perturb_pct if p in perturb_map]
-        param_cells = [(param_options[p], p.split(" (")[0]) for p in selected_params if p in param_options]
-
-        col_name, col_btn = st.columns([2, 1])
-        with col_name:
-            run_name = st.text_input("分析名称", value=f"灵敏度_{len(history_list)+1}")
-        with col_btn:
-            st.write("")
-            st.write("")
-            run_clicked = st.button("运行敏感性分析", type="primary", use_container_width=True)
-
-        if run_clicked:
-            if not param_cells:
-                st.warning("请先选择分析参数")
-            elif not perturbations:
-                st.warning("请先选择扰动幅度")
-            else:
-                with st.spinner("敏感性分析计算中..."):
-                    sen_result = run_sensitivity(
-                        graph=graph,
-                        param_cells=param_cells,
-                        perturbations=perturbations,
-                        task_id=task.id,
-                        output_dir=task.output_dir,
-                    )
-
-                # Save to history
-                scenario_dicts = []
-                for s in sen_result.scenarios:
-                    scenario_dicts.append({
-                        "name": s.name,
-                        "param_name": s.param_name,
-                        "param_cell_id": s.param_cell_id,
-                        "perturbation": s.perturbation,
-                        "original_value": s.original_value,
-                        "perturbed_value": s.perturbed_value,
-                        "metrics": _ser(s.metrics),
-                        "snapshot_name": s.snapshot_name,
-                    })
-
-                db.save_sensitivity(
-                    task_id=task.id,
-                    run_name=run_name,
-                    params=[{"cell_id": c[0], "name": c[1]} for c in param_cells],
-                    perturbations=perturbations,
-                    base_metrics=_ser(sen_result.base_metrics),
-                    scenarios=scenario_dicts,
-                )
-
-                st.session_state["sensitivity_result"] = sen_result
-                st.session_state["sensitivity_history_loaded"] = None
-
-    else:  # 查看历史
-        if not history_list:
-            st.info("暂无历史敏感性分析记录")
-            st.stop()
-
-        history_options = {f"{h['run_name']} ({h['created_at'][:19]})": h for h in history_list}
-        selected_hist_label = st.selectbox("选择历史记录", list(history_options.keys()))
-        selected_hist = history_options[selected_hist_label]
-
-        # Show meta
-        st.caption(f"参数: {', '.join(p['name'] for p in selected_hist['params'])} | "
-                   f"扰动: {', '.join(f'{p:+.0%}' for p in selected_hist['perturbations'])}")
-
-        # Delete button
-        if st.button("删除此记录", type="secondary", key="del_sensitivity"):
-            db.delete_sensitivity(selected_hist["id"])
-            st.session_state["sensitivity_history_loaded"] = None
-            st.rerun()
-
-        # Reconstruct result object from history
-        base_metrics = _deser(selected_hist["base_metrics"])
-        scenario_objs = []
-        for sd in selected_hist["scenarios"]:
-            scenario_objs.append(SensitivityScenario(
-                name=sd["name"],
-                param_name=sd["param_name"],
-                param_cell_id=sd["param_cell_id"],
-                perturbation=sd["perturbation"],
-                original_value=sd["original_value"],
-                perturbed_value=sd["perturbed_value"],
-                metrics=_deser(sd["metrics"]),
-                snapshot_name=sd["snapshot_name"],
-            ))
-        sen_result = SensitivityResult(base_metrics=base_metrics, scenarios=scenario_objs)
-        st.session_state["sensitivity_result"] = sen_result
-        st.session_state["sensitivity_history_loaded"] = selected_hist["id"]
-
-    # ── Render sensitivity result ─────────────────────────────────────
-    sen_result = st.session_state.get("sensitivity_result")
-    if sen_result and (
-        st.session_state.get("sensitivity_history_loaded") is None
-        or st.session_state.get("sensitivity_history_loaded") in [h["id"] for h in history_list]
-        if history_list else True
-    ):
-        # ── Base metrics summary ──────────────────────────────────────
-        st.subheader("基准情景")
-        base = sen_result.base_metrics
-        c1, c2, c3, c4, c5 = st.columns(5)
-        if base.irr_after_tax is not None:
-            c1.metric("税后IRR", f"{base.irr_after_tax * 100:.2f}%")
-        if base.npv_after_tax is not None:
-            c2.metric("财务净现值", f"{base.npv_after_tax:,.0f}")
-        if base.payback_period is not None:
-            c3.metric("投资回收期", f"{base.payback_period:.2f}年")
-        if base.dscr_avg is not None:
-            c4.metric("DSCR均值", f"{base.dscr_avg:.2f}")
-        if base.dscr_min is not None:
-            c5.metric("DSCR最低值", f"{base.dscr_min:.2f}")
-
-        st.divider()
-
-        # ── Metric selector for charts ────────────────────────────────
-        chart_metrics = [
-            ("irr_after_tax", "税后IRR", "%"),
-            ("npv_after_tax", "财务净现值", ""),
-            ("dscr_avg", "DSCR均值", ""),
-            ("dscr_min", "DSCR最低值", ""),
-        ]
-
-        st.subheader("敏感性分析图")
-        chart_tab1, chart_tab2, chart_tab3, chart_tab4 = st.tabs([m[1] for m in chart_metrics])
-        chart_tabs = [chart_tab1, chart_tab2, chart_tab3, chart_tab4]
-
-        for (metric_key, metric_label, _), chart_tab in zip(chart_metrics, chart_tabs):
-            with chart_tab:
-                spider = _build_spider_table(base, sen_result.scenarios, metric_key)
-                if spider:
-                    st.dataframe(spider, use_container_width=True)
-
-                    # Line chart
-                    chart_html = _render_spider_chart(base, sen_result.scenarios, metric_key, metric_label)
-                    if chart_html:
-                        components.html(chart_html, height=400, scrolling=False)
-
-                # ── Sensitivity ranking ───────────────────────────────
-                if sen_result.scenarios:
-                    st.subheader("敏感度排序")
-                    # Calculate sensitivity: max absolute delta across perturbation levels
-                    base_val = getattr(base, metric_key, None)
-                    if base_val is not None:
-                        sensitivity_rows = []
-                        by_param: dict[str, list] = {}
-                        for s in sen_result.scenarios:
-                            by_param.setdefault(s.param_name, []).append(s)
-
-                        for pname, p_scenarios in by_param.items():
-                            deltas = []
-                            for s in p_scenarios:
-                                val = getattr(s.metrics, metric_key, None)
-                                if val is not None:
-                                    deltas.append(abs(val - base_val))
-                            if deltas:
-                                sensitivity_rows.append({
-                                    "参数": pname,
-                                    "最大影响": f"{max(deltas) * 100:.2f}pp" if "irr" in metric_key else f"{max(deltas):.4f}",
-                                    "影响幅度": max(deltas),
-                                })
-
-                        sensitivity_rows.sort(key=lambda x: x["影响幅度"], reverse=True)
-                        if sensitivity_rows:
-                            ranking_df = [{"参数": r["参数"], "最大影响": r["最大影响"]} for r in sensitivity_rows]
-                            st.dataframe(ranking_df, use_container_width=True, hide_index=True)
-
-        st.divider()
-        st.subheader("各情景详细指标")
-
-        scenario_rows = []
-        for s in sen_result.scenarios:
-            row_data = {"情景": s.name}
-            if s.metrics.irr_after_tax is not None:
-                row_data["IRR"] = round(s.metrics.irr_after_tax * 100, 2)
-            if s.metrics.npv_after_tax is not None:
-                row_data["NPV"] = round(s.metrics.npv_after_tax, 2)
-            if s.metrics.dscr_avg is not None:
-                row_data["DSCR均值"] = round(s.metrics.dscr_avg, 2)
-            if s.metrics.dscr_min is not None:
-                row_data["DSCR最低值"] = round(s.metrics.dscr_min, 2)
-            scenario_rows.append(row_data)
-
-        if scenario_rows:
-            st.dataframe(scenario_rows, use_container_width=True)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Tab 6: 导出
+# Tab 4: Export
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_export:
-    # ── 文件来源 ─────────────────────────────────────────────────────
     original_path = find_original_excel(task.id, task.output_dir)
     has_original = original_path is not None
 
@@ -635,84 +460,48 @@ with tab_export:
         uploaded_original = st.file_uploader("上传原始 Excel 文件", type=["xlsx"], key="compare_original")
 
     can_export = has_original or uploaded_original
-
-    # 预计算公式单元格集合
     formula_ids = {cid for cid, cell in graph.cells.items() if cell.formula_raw}
 
     st.subheader("导出修改后 Excel")
 
-    col_export1, col_export2 = st.columns(2)
+    # Toggle for formula preservation
+    keep_formulas = st.toggle("保留公式", value=False, help="开启后公式单元格保留原公式，只覆盖常量值")
 
-    with col_export1:
-        if st.button("导出全量值", type="primary", use_container_width=True,
-                     disabled=not can_export, help="所有单元格覆盖为快照值，公式变为常数"):
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_orig:
-                if uploaded_original:
-                    uploaded_original.seek(0)
-                    tmp_orig.write(uploaded_original.read())
-                else:
-                    with open(original_path, "rb") as f:
-                        tmp_orig.write(f.read())
-                tmp_orig_path = tmp_orig.name
+    if st.button("导出 Excel", type="primary", disabled=not can_export, use_container_width=True):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_orig:
+            if uploaded_original:
+                uploaded_original.seek(0)
+                tmp_orig.write(uploaded_original.read())
+            else:
+                with open(original_path, "rb") as f:
+                    tmp_orig.write(f.read())
+            tmp_orig_path = tmp_orig.name
 
-            snap_b_values = st.session_state.get("snap_b_values", {})
-            out_path = os.path.join(task.output_dir, f"{task.id}_modified.xlsx")
+        suffix = "_with_formulas" if keep_formulas else "_modified"
+        out_path = os.path.join(task.output_dir, f"{task.id}{suffix}.xlsx")
 
-            with st.spinner("导出中..."):
+        with st.spinner("导出中..."):
+            if keep_formulas:
+                export_modified_excel(tmp_orig_path, snap_b_values, out_path, formula_cell_ids=formula_ids)
+            else:
                 export_modified_excel(tmp_orig_path, snap_b_values, out_path)
-                os.unlink(tmp_orig_path)
+            os.unlink(tmp_orig_path)
 
-            with open(out_path, "rb") as f:
-                st.download_button(
-                    "下载 全量值 Excel",
-                    data=f,
-                    file_name=f"{task.filename.rsplit('.', 1)[0]}_modified.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="dl_all_values",
-                )
+        with open(out_path, "rb") as f:
+            st.download_button(
+                f"下载 {suffix}.xlsx",
+                data=f,
+                file_name=f"{task.filename.rsplit('.', 1)[0]}{suffix}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"dl_export{suffix}",
+            )
 
-    with col_export2:
-        if st.button("保留公式导出", type="primary", use_container_width=True,
-                     disabled=not can_export, help="公式单元格保留原公式，只覆盖常量值"):
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_orig:
-                if uploaded_original:
-                    uploaded_original.seek(0)
-                    tmp_orig.write(uploaded_original.read())
-                else:
-                    with open(original_path, "rb") as f:
-                        tmp_orig.write(f.read())
-                tmp_orig_path = tmp_orig.name
-
-            snap_b_values = st.session_state.get("snap_b_values", {})
-            out_path = os.path.join(task.output_dir, f"{task.id}_modified_with_formulas.xlsx")
-
-            with st.spinner("导出中..."):
-                export_modified_excel(
-                    tmp_orig_path, snap_b_values, out_path,
-                    formula_cell_ids=formula_ids,
-                )
-                os.unlink(tmp_orig_path)
-
-            with open(out_path, "rb") as f:
-                st.download_button(
-                    "下载 保留公式 Excel",
-                    data=f,
-                    file_name=f"{task.filename.rsplit('.', 1)[0]}_with_formulas.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="dl_with_formulas",
-                )
-
-    st.caption(
-        f"公式单元格: {len(formula_ids):,} 个，"
-        f"常量单元格: {len(graph.cells) - len(formula_ids):,} 个。"
-        f"保留公式导出只覆盖 {len(graph.cells) - len(formula_ids):,} 个常量单元格。"
-    )
+    st.caption(f"公式单元格: {len(formula_ids):,} 个，常量单元格: {len(graph.cells) - len(formula_ids):,} 个")
 
     st.divider()
     st.subheader("导出差异报告")
-    st.caption("生成 Excel 格式的差异报告，含汇总、变化明细、受影响 Indicator。")
 
-    if st.button("导出差异报告", type="secondary"):
+    if st.button("导出差异报告", type="secondary", use_container_width=True):
         report_path = os.path.join(task.output_dir, f"{task.id}_diff_report.xlsx")
         with st.spinner("生成中..."):
             export_diff_report_excel(diff, graph, report_path)
@@ -723,4 +512,5 @@ with tab_export:
                 data=f,
                 file_name=f"{task.filename.rsplit('.', 1)[0]}_diff_report.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_diff_report",
             )
