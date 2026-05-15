@@ -13,6 +13,7 @@ from financial_kg.storage.json_store import load_graph
 from financial_kg.storage.task_db import TaskDB
 from financial_kg.engine.sensitivity import run_sensitivity, SensitivityResult
 from financial_kg.engine.derived_metrics import DerivedMetrics
+from financial_kg.engine.break_even import find_break_even, BreakEvenResult
 from financial_kg.viz.tornado_chart import render_tornado_html, render_spider_chart
 
 st.set_page_config(layout="wide")
@@ -83,7 +84,7 @@ all_params = _build_params(task.id, task.output_dir)
 all_categories = sorted(set(r["category"] for r in all_params if r["category"]))
 
 # ── Tabs ─────────────────────────────────────────────────────────────────────
-tab_sensitivity, tab_history = st.tabs(["敏感性分析", "历史记录"])
+tab_sensitivity, tab_break_even, tab_history = st.tabs(["敏感性分析", "盈亏平衡", "历史记录"])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -374,7 +375,108 @@ with tab_sensitivity:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Tab 2: Sensitivity History
+# Tab 2: Break-even Analysis
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_break_even:
+    st.subheader("盈亏平衡分析")
+    st.caption("搜索参数需要变化多少，关键指标才会触达设定的阈值")
+
+    # Configuration
+    col_be1, col_be2, col_be3 = st.columns(3)
+    with col_be1:
+        be_metric_label = st.selectbox(
+            "目标指标",
+            list(METRICS.keys()),
+            key="be_metric",
+        )
+    with col_be2:
+        be_threshold = st.number_input(
+            "阈值",
+            value=0.08 if "IRR" in be_metric_label else 0.0,
+            step=0.01,
+            format="%.4f",
+            key="be_threshold",
+        )
+    with col_be3:
+        be_perturb_pct = st.slider(
+            "最大扰动范围",
+            min_value=10,
+            max_value=80,
+            value=50,
+            step=5,
+            key="be_perturb",
+        )
+
+    be_metric_key, be_mult, be_unit, _, _ = METRICS[be_metric_label]
+
+    # Parameter selector
+    be_param_options = {
+        f"{r['name']} | {r['sheet']} 第{r['row']}行 {r['col']}列 = {r['value']:,.2f}": r["cell_id"]
+        for r in all_params
+    }
+    be_param_labels = list(be_param_options.keys())
+    selected_be_param = st.selectbox("参数", be_param_labels, key="be_param_sel")
+
+    # Run
+    if st.button("搜索盈亏平衡点", type="primary", use_container_width=True):
+        with st.spinner("二分搜索中..."):
+            be_result = find_break_even(
+                graph=graph,
+                cell_id=be_param_options[selected_be_param],
+                metric_key=be_metric_key,
+                threshold=be_threshold,
+                max_iterations=50,
+            )
+            # Fill in param name
+            be_result = BreakEvenResult(
+                param_name=be_param_options[selected_be_param].split(" | ")[0] if " | " in be_param_options[selected_be_param] else "",
+                param_cell_id=be_result.param_cell_id,
+                original_value=be_result.original_value,
+                metric_key=be_result.metric_key,
+                metric_label=be_metric_label,
+                threshold=be_threshold,
+                break_even_value=be_result.break_even_value,
+                break_even_pct=be_result.break_even_pct,
+                found=be_result.found,
+                iterations=be_result.iterations,
+                metric_at_break_even=be_result.metric_at_break_even,
+                direction=be_result.direction,
+            )
+        st.session_state[f"be_result_{task.id}"] = be_result
+
+    # Display result
+    be_key = f"be_result_{task.id}"
+    be: BreakEvenResult | None = st.session_state.get(be_key)
+
+    if be:
+        st.divider()
+        if not be.found:
+            st.warning(
+                f"在 ±{be_perturb_pct}% 范围内未找到 {be_metric_label}={be_threshold} 的盈亏平衡点。"
+                f"当前 {be_metric_label} 基准值可能已高于/低于阈值。"
+            )
+        else:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("参数原值", f"{be.original_value:,.2f}")
+            c2.metric("盈亏平衡值", f"{be.break_even_value:,.2f}" if be.break_even_value else "—")
+            c3.metric("需要变化", f"{be.break_even_pct:+.1%}" if be.break_even_pct else "—")
+            c4.metric("搜索次数", str(be.iterations))
+
+            # Base metric value
+            from financial_kg.engine.derived_metrics import compute_derived_metrics
+            base_m = compute_derived_metrics(graph)
+            base_val = getattr(base_m, be.metric_key, None)
+
+            st.info(
+                f"**{be_metric_label}** 当前值: {base_val * be_mult:.2f}{be_unit}，"
+                f"阈值: {be_threshold * be_mult:.2f}{be_unit}\n\n"
+                f"当参数值变为 **{be.break_even_value:,.2f}**（变化 **{be.break_even_pct:+.1%}**）时，"
+                f"{be_metric_label} 刚好触达阈值。"
+            )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Tab 3: Sensitivity History
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_history:
     history = db.list_sensitivity(task.id)
