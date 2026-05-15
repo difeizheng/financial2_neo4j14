@@ -1,7 +1,6 @@
-"""Page 6: Financial analysis — sensitivity, history."""
+"""Page 6: Financial analysis — sensitivity, history, comparison."""
 from __future__ import annotations
 
-import json
 import os
 import sys
 import time
@@ -40,6 +39,14 @@ def _load(task_id: str, output_dir: str):
 
 graph = _load(task.id, task.output_dir)
 
+# ── Metric definitions ───────────────────────────────────────────────────────
+METRICS = {
+    "税后IRR": ("irr_after_tax", 100, "%", True, "越低越好"),
+    "财务净现值": ("npv_after_tax", 1, "", False, "越高越好"),
+    "投资回收期": ("payback_period", 1, "年", True, "越低越好"),
+    "DSCR均值": ("dscr_avg", 1, "", False, "越高越好"),
+    "DSCR最低值": ("dscr_min", 1, "", False, "越高越好"),
+}
 
 # ── Build parameter list ─────────────────────────────────────────────────────
 @st.cache_data(show_spinner="构建参数列表...")
@@ -73,9 +80,7 @@ def _build_params(task_id: str, output_dir: str):
 
 
 all_params = _build_params(task.id, task.output_dir)
-all_param_names = sorted(set(r["name"] for r in all_params if r["name"]))
 all_categories = sorted(set(r["category"] for r in all_params if r["category"]))
-
 
 # ── Tabs ─────────────────────────────────────────────────────────────────────
 tab_sensitivity, tab_history = st.tabs(["敏感性分析", "历史记录"])
@@ -184,7 +189,7 @@ with tab_sensitivity:
                 st.toast("分析完成并已保存")
                 st.rerun()
 
-        # Display results
+        # ── Display results ──────────────────────────────────────────────
         result_key = f"sens_result_{task.id}"
         result: SensitivityResult | None = st.session_state.get(result_key)
 
@@ -193,35 +198,114 @@ with tab_sensitivity:
             st.subheader("分析结果")
 
             # Base metrics summary
-            st.caption(f"基准: IRR={result.base_metrics.irr_after_tax * 100:.2f}%, "
-                       f"NPV={result.base_metrics.npv_after_tax:,.0f}, "
-                       f"回收期={result.base_metrics.payback_period or 0:.2f}年, "
-                       f"DSCR均值={result.base_metrics.dscr_avg or 0:.2f}")
+            bm = result.base_metrics
+            st.caption(
+                f"基准: IRR={bm.irr_after_tax * 100:.2f}%, "
+                f"NPV={bm.npv_after_tax:,.0f}, "
+                f"回收期={bm.payback_period or 0:.2f}年, "
+                f"DSCR均值={bm.dscr_avg or 0:.2f}"
+            )
 
-            # Charts
-            chart_row = st.columns(2)
-            with chart_row[0]:
-                tornado_html = render_tornado_html(result)
-                if tornado_html:
-                    st.components.v1.html(tornado_html, height=450, scrolling=False)
-                else:
-                    st.info("无可视化数据")
+            # Metric selector
+            col_m1, col_m2 = st.columns([3, 3])
+            with col_m1:
+                selected_metric_label = st.selectbox(
+                    "查看指标",
+                    list(METRICS.keys()),
+                    index=0,
+                    key="metric_selector",
+                )
+            with col_m2:
+                chart_type = st.selectbox(
+                    "图表类型",
+                    ["龙卷风图", "蛛网图"],
+                    key="chart_selector",
+                )
 
-            with chart_row[1]:
-                spider_html = render_spider_chart(result)
-                if spider_html:
-                    st.components.v1.html(spider_html, height=450, scrolling=False)
+            metric_key, multiplier, unit, lower_is_better, note = METRICS[selected_metric_label]
 
-            # Summary table
-            st.divider()
-            st.subheader("汇总数据")
-
-            if result.summary_table:
-                st.dataframe(result.summary_table, use_container_width=True, hide_index=True)
+            # Render chart
+            if chart_type == "龙卷风图":
+                html = render_tornado_html(result, metric_key, selected_metric_label)
             else:
-                st.info("无汇总数据")
+                html = render_spider_chart(result, metric_key, selected_metric_label)
 
-            # Detailed scenario table
+            if html:
+                st.components.v1.html(html, height=450, scrolling=False)
+            else:
+                st.info("无可视化数据")
+
+            # ── Sensitivity ranking table ─────────────────────────────────
+            st.divider()
+            st.subheader("敏感度排名")
+
+            # Compute sensitivity per parameter: max delta from base
+            base_val = getattr(result.base_metrics, metric_key, None)
+            if base_val is not None:
+                by_param: dict[str, dict] = {}
+                for s in result.scenarios:
+                    s_val = getattr(s.metrics, metric_key, None)
+                    if s_val is not None:
+                        by_param.setdefault(s.param_name, {})[s.perturbation] = s_val
+
+                sensitivity_rows = []
+                for pname, perts in by_param.items():
+                    max_delta = max(
+                        abs(v - base_val) for v in perts.values()
+                    )
+                    # Find which perturbation causes max impact
+                    max_pert = max(perts.keys(), key=lambda p: abs(perts[p] - base_val))
+                    pct_at_max = perts[max_pert]
+                    sensitivity_rows.append({
+                        "排名": 0,
+                        "参数": pname,
+                        "基准值": f"{base_val * multiplier:.2f}{unit}",
+                        "最大变化后值": f"{pct_at_max * multiplier:.2f}{unit}",
+                        "最大偏差": f"{abs(pct_at_max - base_val) * multiplier:.2f}{unit}",
+                        "触发扰动": f"{max_pert:+.0%}",
+                    })
+
+                sensitivity_rows.sort(key=lambda r: float(r["最大偏差"].replace(unit, "")), reverse=True)
+                for i, r in enumerate(sensitivity_rows):
+                    r["排名"] = i + 1
+
+                st.dataframe(
+                    sensitivity_rows,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=300,
+                    column_config={
+                        "排名": st.column_config.NumberColumn("排名", width="small"),
+                        "参数": st.column_config.TextColumn("参数", width="medium"),
+                        "基准值": st.column_config.TextColumn("基准值", width="small"),
+                        "最大变化后值": st.column_config.TextColumn("最大变化后值", width="small"),
+                        "最大偏差": st.column_config.TextColumn("最大偏差", width="small"),
+                        "触发扰动": st.column_config.TextColumn("触发扰动", width="small"),
+                    },
+                )
+
+            # ── Multi-metric summary ──────────────────────────────────────
+            st.divider()
+            st.subheader("多指标敏感性汇总")
+
+            mm_rows = []
+            for metric_label, (mkey, mmult, munit, mlower, mnote) in METRICS.items():
+                bv = getattr(result.base_metrics, mkey, None)
+                if bv is None:
+                    continue
+                row = {"指标": metric_label, "基准值": f"{bv * mmult:.2f}{munit}"}
+                for s in sorted(result.scenarios, key=lambda x: (x.param_name, x.perturbation)):
+                    sv = getattr(s.metrics, mkey, None)
+                    if sv is not None:
+                        delta = (sv - bv) * mmult
+                        key = f"{s.param_name[:6]}… {s.perturbation:+.0%}"
+                        row[key] = f"{sv * mmult:.2f}{munit}"
+                mm_rows.append(row)
+
+            if mm_rows:
+                st.dataframe(mm_rows, use_container_width=True, hide_index=True, height=250)
+
+            # ── Detailed scenario table ───────────────────────────────────
             st.divider()
             st.subheader("详细场景")
 
@@ -239,6 +323,54 @@ with tab_sensitivity:
                         "DSCR均值": getattr(s.metrics, "dscr_avg", None),
                     })
                 st.dataframe(detail_rows, use_container_width=True, hide_index=True, height=400)
+
+            # ── Conclusion summary ────────────────────────────────────────
+            st.divider()
+            st.subheader("分析结论")
+
+            if base_val is not None and by_param:
+                # Top 3 sensitive parameters
+                ranked = sorted(
+                    [(p, max(abs(v - base_val) for v in vs)) for p, vs in by_param.items()],
+                    key=lambda x: x[1],
+                    reverse=True,
+                )
+                top3 = ranked[:3]
+
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    st.info(f"最敏感参数: **{top3[0][0]}** (偏差 ±{top3[0][1] * multiplier:.2f}{unit})")
+                with c2:
+                    if len(top3) > 1:
+                        st.info(f"次敏感参数: **{top3[1][0]}** (偏差 ±{top3[1][1] * multiplier:.2f}{unit})")
+                with c3:
+                    if len(top3) > 2:
+                        st.info(f"第三敏感: **{top3[2][0]}** (偏差 ±{top3[2][1] * multiplier:.2f}{unit})")
+
+                # Risk assessment
+                max_impact_pct = (top3[0][1] / abs(base_val) * 100) if base_val != 0 else 0
+                if max_impact_pct > 20:
+                    risk_level = "高风险"
+                    risk_color = "#dc2626"
+                elif max_impact_pct > 10:
+                    risk_level = "中风险"
+                    risk_color = "#f59e0b"
+                else:
+                    risk_level = "低风险"
+                    risk_color = "#16a34a"
+
+                st.markdown(
+                    f"<div style='padding:12px;background:#f8fafc;border-left:4px solid {risk_color};"
+                    f"border-radius:4px;margin-top:12px'>"
+                    f"<strong>风险等级:</strong> <span style='color:{risk_color};font-weight:bold'>{risk_level}</span> "
+                    f"(最大偏差占基准值 {max_impact_pct:.1f}%)<br/>"
+                    f"<strong>结论:</strong> {selected_metric_label} 对 "
+                    f"{', '.join(p for p, _ in top3)} 最敏感。"
+                    f"建议重点关注这些参数的实际取值范围，"
+                    f"以评估项目{selected_metric_label}的稳定性和可靠性。"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -270,50 +402,140 @@ with tab_history:
             "场景数": len(h["scenarios"]),
         })
 
-    st.dataframe(hist_rows, use_container_width=True, hide_index=True, height=400)
+    st.dataframe(hist_rows, use_container_width=True, hide_index=True, height=300)
 
-    # Detail / delete
-    st.divider()
-    hist_ids = {f"[{h['id']}] {h['run_name']} ({h['created_at'][:19]})": h for h in history}
-    selected_hist = st.selectbox("查看历史详情", list(hist_ids.keys()), label_visibility="collapsed")
+    # Comparison mode toggle
+    comparison_mode = st.toggle("对比模式", key="hist_compare_mode")
 
-    if selected_hist:
-        h = hist_ids[selected_hist]
+    if comparison_mode:
+        st.divider()
+        st.subheader("选择两条历史记录进行对比")
 
-        detail_row = st.columns([8, 1])
-        with detail_row[1]:
-            if st.button("🗑️ 删除", type="secondary", use_container_width=True, key=f"del_hist_{h['id']}"):
-                db.delete_sensitivity(h["id"])
-                st.toast("已删除")
-                st.rerun()
+        col_h1, col_h2 = st.columns(2)
+        with col_h1:
+            hist_ids_a = {f"[{h['id']}] {h['run_name']} ({h['created_at'][:19]})": h for h in history}
+            sel_a = st.selectbox("记录 A", list(hist_ids_a.keys()), key="hist_sel_a")
+        with col_h2:
+            hist_ids_b = {f"[{h['id']}] {h['run_name']} ({h['created_at'][:19]})": h for h in history}
+            sel_b = st.selectbox("记录 B", list(hist_ids_b.keys()), key="hist_sel_b")
 
-        st.caption(f"运行时间: {h['created_at'][:19]} | "
-                   f"参数: {', '.join(p['name'] for p in h['params'])} | "
-                   f"扰动: {', '.join(f'{p:+.0%}' for p in h['perturbations'])}")
+        if sel_a and sel_b:
+            h_a = hist_ids_a[sel_a]
+            h_b = hist_ids_b[sel_b]
 
-        # Reconstruct result for visualization
-        base_m = h["base_metrics"]
-        scenarios = h["scenarios"]
+            # Comparison table
+            st.divider()
+            st.subheader(f"{h_a['run_name']} vs {h_b['run_name']}")
 
-        # Show summary as table
-        summary_data = []
-        by_param: dict[str, dict] = {}
-        for s in scenarios:
-            by_param.setdefault(s["param_name"], {})[s["perturbation"]] = s["metrics"]
+            # Base metrics comparison
+            base_a = h_a["base_metrics"]
+            base_b = h_b["base_metrics"]
 
-        for pname, perts in by_param.items():
-            row = {"参数": pname}
-            for pct, metrics in sorted(perts.items()):
-                label = f"{pct:+.0%}"
-                irr = metrics.get("irr_after_tax")
-                if irr is not None:
-                    base_irr = base_m.get("irr_after_tax")
-                    delta = (irr - base_irr) * 100 if base_irr is not None else 0
-                    row[label] = f"{irr * 100:.2f}% ({delta:+.2f}pp)"
-                else:
-                    row[label] = "—"
-            summary_data.append(row)
+            compare_rows = []
+            for label, (mkey, mmult, munit, _, _) in METRICS.items():
+                va = base_a.get(mkey)
+                vb = base_b.get(mkey)
+                if va is None and vb is None:
+                    continue
+                delta = (vb - va) * mmult if (va is not None and vb is not None) else None
+                compare_rows.append({
+                    "指标": label,
+                    "记录 A 基准": f"{va * mmult:.2f}{munit}" if va is not None else "—",
+                    "记录 B 基准": f"{vb * mmult:.2f}{munit}" if vb is not None else "—",
+                    "差异": f"{delta:+.2f}{munit}" if delta is not None else "—",
+                })
 
-        if summary_data:
+            st.dataframe(compare_rows, use_container_width=True, hide_index=True)
+
+            # Parameter impact comparison
+            st.divider()
+            st.subheader("参数影响对比")
+
+            # Build IRR summary for both
+            def _build_hist_summary(hist):
+                by_p: dict[str, dict] = {}
+                for s in hist["scenarios"]:
+                    by_p.setdefault(s["param_name"], {})[s["perturbation"]] = s["metrics"]
+                return by_p
+
+            pa = _build_hist_summary(h_a)
+            pb = _build_hist_summary(h_b)
+
+            all_params_hist = sorted(set(list(pa.keys()) + list(pb.keys())))
+            all_perts = sorted(set(
+                list(p for perts in pa.values() for p in perts)
+                + list(p for perts in pb.values() for p in perts)
+            ))
+
+            compare_param_rows = []
+            for pname in all_params_hist:
+                row = {"参数": pname}
+                base_irr_a = h_a["base_metrics"].get("irr_after_tax")
+                base_irr_b = h_b["base_metrics"].get("irr_after_tax")
+                for pct in all_perts:
+                    val_a = pa.get(pname, {}).get(pct, {})
+                    val_b = pb.get(pname, {}).get(pct, {})
+                    irr_a = val_a.get("irr_after_tax") if isinstance(val_a, dict) else None
+                    irr_b = val_b.get("irr_after_tax") if isinstance(val_b, dict) else None
+                    if irr_a is not None or irr_b is not None:
+                        a_str = f"{irr_a * 100:.2f}%" if irr_a is not None else "—"
+                        b_str = f"{irr_b * 100:.2f}%" if irr_b is not None else "—"
+                        row[f"{pct:+.0%}"] = f"A: {a_str} / B: {b_str}"
+                compare_param_rows.append(row)
+
+            if compare_param_rows:
+                st.dataframe(compare_param_rows, use_container_width=True, hide_index=True)
+
+    else:
+        # Single record view
+        st.divider()
+        hist_ids = {f"[{h['id']}] {h['run_name']} ({h['created_at'][:19]})": h for h in history}
+        selected_hist = st.selectbox("查看历史详情", list(hist_ids.keys()), label_visibility="collapsed")
+
+        if selected_hist:
+            h = hist_ids[selected_hist]
+
+            detail_row = st.columns([8, 1])
+            with detail_row[1]:
+                if st.button("🗑️ 删除", type="secondary", use_container_width=True, key=f"del_hist_{h['id']}"):
+                    db.delete_sensitivity(h["id"])
+                    st.toast("已删除")
+                    st.rerun()
+
+            st.caption(f"运行时间: {h['created_at'][:19]} | "
+                       f"参数: {', '.join(p['name'] for p in h['params'])} | "
+                       f"扰动: {', '.join(f'{p:+.0%}' for p in h['perturbations'])}")
+
+            # Multi-metric base comparison
+            st.subheader("基准指标")
+            base_m = h["base_metrics"]
+            base_rows = []
+            for label, (mkey, mmult, munit, _, _) in METRICS.items():
+                val = base_m.get(mkey)
+                if val is not None:
+                    base_rows.append({"指标": label, "基准值": f"{val * mmult:.2f}{munit}"})
+            if base_rows:
+                st.dataframe(base_rows, use_container_width=True, hide_index=True, height=200)
+
+            # IRR summary
             st.subheader("IRR 敏感性汇总表")
-            st.dataframe(summary_data, use_container_width=True, hide_index=True)
+            summary_data = []
+            by_param: dict[str, dict] = {}
+            for s in h["scenarios"]:
+                by_param.setdefault(s["param_name"], {})[s["perturbation"]] = s["metrics"]
+
+            for pname, perts in by_param.items():
+                row = {"参数": pname}
+                for pct, metrics in sorted(perts.items()):
+                    label = f"{pct:+.0%}"
+                    irr = metrics.get("irr_after_tax")
+                    if irr is not None:
+                        base_irr = base_m.get("irr_after_tax")
+                        delta = (irr - base_irr) * 100 if base_irr is not None else 0
+                        row[label] = f"{irr * 100:.2f}% ({delta:+.2f}pp)"
+                    else:
+                        row[label] = "—"
+                summary_data.append(row)
+
+            if summary_data:
+                st.dataframe(summary_data, use_container_width=True, hide_index=True)
