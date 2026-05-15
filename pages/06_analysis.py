@@ -664,6 +664,44 @@ with tab_scenario:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Export section (available in sensitivity + scenario tabs)
+# ══════════════════════════════════════════════════════════════════════════════
+result_key = f"sens_result_{task.id}"
+has_result = result_key in st.session_state
+_key_scn_list = f"scn_list_{task.id}"
+scn_list = st.session_state.get(_key_scn_list, [])
+be_key = f"be_result_{task.id}"
+be_result = st.session_state.get(be_key)
+
+if has_result or scn_list or be_result:
+    if st.button("📄 导出 Word 报告", type="secondary", use_container_width=True, key="export_report"):
+        from financial_kg.engine.report_export import export_financial_report
+        import tempfile as _tf
+
+        sens = st.session_state.get(result_key)
+
+        with _tf.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
+            export_financial_report(
+                graph=graph,
+                output_path=tmp.name,
+                project_name=task.filename,
+                sensitivity_result=sens,
+                scenarios=scn_list,
+                break_even_results=[be_result] if be_result else None,
+            )
+            with open(tmp.name, "rb") as f:
+                st.download_button(
+                    "下载报告",
+                    data=f,
+                    file_name=f"{task.filename}_分析报告.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True,
+                    key="dl_report",
+                )
+            os.unlink(tmp.name)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Tab 4: Sensitivity History
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_history:

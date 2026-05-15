@@ -42,6 +42,8 @@ def export_financial_report(
     project_name: str = "",
     sensitivity_params: list[tuple[str, str]] | None = None,
     sensitivity_result: SensitivityResult | None = None,
+    scenarios: list[dict] | None = None,
+    break_even_results: list[dict] | None = None,
 ) -> str:
     """Generate a financial benefit analysis Word report.
 
@@ -55,6 +57,8 @@ def export_financial_report(
         sensitivity_params: List of (cell_id, display_name) for sensitivity analysis.
             Defaults to common parameters if not specified.
         sensitivity_result: Pre-computed sensitivity result to skip recalculation.
+        scenarios: List of scenario dicts with name/cells/metrics keys.
+        break_even_results: List of break-even result dicts.
 
     Returns:
         Path to the generated .docx file.
@@ -125,6 +129,78 @@ def export_financial_report(
         else:
             p = doc.add_paragraph("未检测到可分析的输入参数。")
             p.runs[0].font.color.rgb = RGBColor(128, 128, 128)
+
+    # ── 6. 场景对比分析 ──────────────────────────────────────────────
+    if scenarios:
+        _add_section(doc, "六、场景对比分析", level=1)
+
+        table = doc.add_table(rows=len(scenarios) + 2, cols=6, style="Light Grid Accent 1")
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+        headers = ["场景", "IRR", "NPV", "回收期(年)", "DSCR均值", "DSCR最低"]
+        for i, h in enumerate(headers):
+            cell = table.rows[0].cells[i]
+            cell.text = h
+            for run in cell.paragraphs[0].runs:
+                run.bold = True
+                run.font.size = Pt(9)
+
+        # Base row
+        base_m = compute_derived_metrics(graph)
+        base_vals = [
+            "基准",
+            f"{base_m.irr_after_tax * 100:.2f}%" if base_m.irr_after_tax else "—",
+            f"{base_m.npv_after_tax:,.0f}" if base_m.npv_after_tax else "—",
+            f"{base_m.payback_period:.2f}" if base_m.payback_period else "—",
+            f"{base_m.dscr_avg:.2f}" if base_m.dscr_avg else "—",
+            f"{base_m.dscr_min:.2f}" if base_m.dscr_min else "—",
+        ]
+        for i, v in enumerate(base_vals):
+            table.rows[1].cells[i].text = v
+
+        for row_idx, sc in enumerate(scenarios, 2):
+            m = sc.get("metrics", {})
+            vals = [
+                sc.get("name", ""),
+                f"{m.get('irr_after_tax', 0) * 100:.2f}%" if m.get("irr_after_tax") else "—",
+                f"{m.get('npv_after_tax', 0):,.0f}" if m.get("npv_after_tax") else "—",
+                f"{m.get('payback_period', 0):.2f}" if m.get("payback_period") else "—",
+                f"{m.get('dscr_avg', 0):.2f}" if m.get("dscr_avg") else "—",
+                f"{m.get('dscr_min', 0):.2f}" if m.get("dscr_min") else "—",
+            ]
+            for i, v in enumerate(vals):
+                table.rows[row_idx].cells[i].text = v
+
+        # Parameters used per scenario
+        for sc in scenarios:
+            cells = sc.get("cells", {})
+            if cells:
+                p = doc.add_paragraph()
+                run = p.add_run(f"场景「{sc.get('name', '')}」参数设置：")
+                run.bold = True
+                run.font.size = Pt(10)
+                for cid, val in cells.items():
+                    p.add_run(f"  {cid} = {val:,.2f}").font.size = Pt(9)
+
+    # ── 7. 盈亏平衡分析 ──────────────────────────────────────────────
+    if break_even_results:
+        if scenarios:
+            _add_section(doc, "七、盈亏平衡分析", level=1)
+        else:
+            _add_section(doc, "六、盈亏平衡分析", level=1)
+
+        for be in break_even_results:
+            p = doc.add_paragraph()
+            run = p.add_run(f"参数：{be.get('param_name', '—')}")
+            run.bold = True
+            run.font.size = Pt(10)
+            p.add_run(f"  指标：{be.get('metric_label', '—')}")
+            p.add_run(f"  阈值：{be.get('threshold', 0) * 100:.2f}%")
+            if be.get("found"):
+                p.add_run(f"  盈亏平衡值：{be.get('break_even_value', 0):,.2f}")
+                p.add_run(f"  需变化：{be.get('break_even_pct', 0) * 100:.1f}%")
+            else:
+                p.add_run("  未找到盈亏平衡点").font.color.rgb = RGBColor(128, 128, 128)
 
     # Save
     doc.save(output_path)
