@@ -324,11 +324,19 @@ with tab_matrix:
         old_summary = ind_entry.get("old_summary") if isinstance(ind_entry, dict) else None
         new_summary = ind_entry.get("new_summary") if isinstance(ind_entry, dict) else None
 
+        def _safe_float(v):
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                return None
+
+        va = _safe_float(old_summary)
+        vb = _safe_float(new_summary)
         matrix_data.append({
             "Indicator": ind.name or ind_id,
             f"{snap_a_name}": old_summary,
             f"{snap_b_name}": new_summary,
-            "变化": (float(new_summary) - float(old_summary)) if (old_summary is not None and new_summary is not None) else None,
+            "变化": (vb - va) if (va is not None and vb is not None) else None,
             "变化单元格数": len(changed_cells_for_ind),
         })
 
