@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from financial_kg.storage.json_store import load_graph
 from financial_kg.storage.task_db import TaskDB
+from financial_kg.models.graph import FinancialGraph
 from financial_kg.engine.sensitivity import run_sensitivity, SensitivityResult
 from financial_kg.engine.derived_metrics import DerivedMetrics
 from financial_kg.engine.break_even import find_break_even, BreakEvenResult
@@ -84,7 +85,7 @@ all_params = _build_params(task.id, task.output_dir)
 all_categories = sorted(set(r["category"] for r in all_params if r["category"]))
 
 # ── Tabs ─────────────────────────────────────────────────────────────────────
-tab_sensitivity, tab_break_even, tab_history = st.tabs(["敏感性分析", "盈亏平衡", "历史记录"])
+tab_sensitivity, tab_break_even, tab_scenario, tab_history = st.tabs(["敏感性分析", "盈亏平衡", "场景构建", "历史记录"])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -476,7 +477,194 @@ with tab_break_even:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Tab 3: Sensitivity History
+# Tab 3: Scenario Builder
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_scenario:
+    st.subheader("场景构建")
+    st.caption("同时设置多个参数值，对比不同场景下的关键指标差异")
+
+    # Scenario name
+    scenario_name = st.text_input("场景名称", placeholder="如：悲观情景 / 乐观情景 / 基准", key="scn_name")
+
+    # Parameter selection
+    st.subheader("设置参数")
+    scn_filter = st.multiselect("按类别筛选", all_categories, default=[], key="scn_cat")
+    scn_search = st.text_input("搜索", placeholder="Indicator 名称 / Sheet", key="scn_search")
+
+    scn_filtered = all_params
+    if scn_filter:
+        scn_filtered = [r for r in scn_filtered if r["category"] in scn_filter]
+    if scn_search:
+        kw = scn_search.lower()
+        scn_filtered = [r for r in scn_filtered if kw in r["name"].lower() or kw in r["sheet"].lower()]
+
+    # Session state for scenario params
+    _key_scn = f"scn_params_{task.id}"
+    if _key_scn not in st.session_state:
+        st.session_state[_key_scn] = {}
+
+    # Add/remove param rows
+    add_row = st.columns([4, 2, 1])
+    with add_row[2]:
+        if st.button("+ 添加参数", use_container_width=True, key="add_param"):
+            pass  # Just trigger rerun
+
+    param_labels_scn = [
+        f"{r['name']} | {r['sheet']} 第{r['row']}行 {r['col']}列 = {r['value']:,.2f}"
+        for r in scn_filtered
+    ]
+
+    # Selected param labels
+    if _key_scn not in st.session_state:
+        st.session_state[_key_scn] = {}
+
+    # Number of param rows
+    num_rows = st.number_input("参数数量", min_value=1, max_value=20, value=3, key="scn_num_rows")
+
+    st.divider()
+
+    # Build param rows
+    scenario_cells = {}
+    for i in range(num_rows):
+        row_key = f"scn_row_{i}"
+        if row_key not in st.session_state:
+            st.session_state[row_key] = param_labels_scn[0] if param_labels_scn else ""
+
+        col_s1, col_s2, col_s3, col_s4 = st.columns([4, 2, 2, 1])
+        with col_s1:
+            sel = st.selectbox(
+                f"参数 {i+1}",
+                param_labels_scn,
+                index=min(i, len(param_labels_scn) - 1),
+                key=row_key,
+            )
+            if sel in be_param_options:
+                cid = be_param_options[sel]
+                scenario_cells[cid] = {"label": sel}
+        with col_s2:
+            original_val = 0
+            if sel:
+                parts = sel.split(" = ")
+                if len(parts) == 2:
+                    try:
+                        original_val = float(parts[1].replace(",", ""))
+                    except ValueError:
+                        pass
+            new_val = st.number_input("新值", value=original_val, step=0.01, format="%.2f", key=f"scn_val_{i}")
+            if sel:
+                scenario_cells[cid]["new_value"] = new_val
+                scenario_cells[cid]["original"] = original_val
+        with col_s3:
+            if original_val != 0:
+                chg = (new_val - original_val) / original_val if original_val else 0
+                color = "#ef4444" if abs(chg) > 0.1 else "#16a34a" if abs(chg) < 0.05 else "#f59e0b"
+                st.markdown(f"<span style='color:{color}'>变化: {chg:+.1%}</span>", unsafe_allow_html=True)
+
+    # Run scenario
+    if scenario_cells and scenario_name:
+        if st.button("运行场景", type="primary", use_container_width=True):
+            valid_cells = {cid: v["new_value"] for cid, v in scenario_cells.items() if "new_value" in v}
+            if valid_cells:
+                from financial_kg.engine.recalculator import recalculate
+                from financial_kg.engine.derived_metrics import compute_derived_metrics
+                import copy as _copy
+
+                # Clone graph, apply all changes, recalculate
+                work = FinancialGraph(source_file=graph.source_file)
+                work.cells = {}
+                for cid, cell in graph.cells.items():
+                    cell_copy = _copy.copy(cell)
+                    cell_copy.dependencies = list(cell.dependencies)
+                    cell_copy.dependents = list(cell.dependents)
+                    work.cells[cid] = cell_copy
+                work.indicators = dict(graph.indicators)
+                work.tables = dict(graph.tables)
+                work.cell_graph = graph.cell_graph.copy()
+
+                for cid, val in valid_cells.items():
+                    c = work.cells.get(cid)
+                    if c:
+                        c.value = val
+
+                recalc_result = recalculate(work, valid_cells)
+                metrics = compute_derived_metrics(work)
+
+                # Store scenario result
+                scenario_result = {
+                    "name": scenario_name,
+                    "cells": valid_cells,
+                    "metrics": {
+                        k: v for k in ("irr_after_tax", "irr_before_tax", "npv_after_tax",
+                                       "npv_before_tax", "payback_period", "dscr_avg", "dscr_min")
+                        if (v := getattr(metrics, k, None)) is not None
+                    },
+                    "changed_count": len(recalc_result.changed_cells) if recalc_result else 0,
+                }
+
+                # Append to session state scenario list
+                _key_scn_list = f"scn_list_{task.id}"
+                if _key_scn_list not in st.session_state:
+                    st.session_state[_key_scn_list] = []
+                st.session_state[_key_scn_list].append(scenario_result)
+
+                st.toast(f"场景「{scenario_name}」已运行")
+                st.rerun()
+
+    # Display scenarios
+    _key_scn_list = f"scn_list_{task.id}"
+    scn_list = st.session_state.get(_key_scn_list, [])
+
+    if scn_list:
+        st.divider()
+        st.subheader("场景对比")
+
+        # Clear all button
+        if st.button("清空所有场景", type="secondary", key="clear_scn"):
+            st.session_state[_key_scn_list] = []
+            st.rerun()
+
+        # Comparison table
+        compare_data = []
+        # Base scenario
+        base_m = compute_derived_metrics(graph)
+        base_row = {"场景": "基准"}
+        for label, (mkey, mmult, munit, _, _) in METRICS.items():
+            val = getattr(base_m, mkey, None)
+            if val is not None:
+                base_row[label] = f"{val * mmult:.2f}{munit}"
+        compare_data.append(base_row)
+
+        for sc in scn_list:
+            row = {"场景": sc["name"]}
+            for label, (mkey, mmult, munit, _, _) in METRICS.items():
+                val = sc["metrics"].get(mkey)
+                if val is not None:
+                    row[label] = f"{val * mmult:.2f}{munit}"
+            compare_data.append(row)
+
+        st.dataframe(compare_data, use_container_width=True, hide_index=True, height=300)
+
+        # Delta from base
+        st.divider()
+        st.subheader("与基准差异")
+
+        delta_data = []
+        for sc in scn_list:
+            row = {"场景": sc["name"], "影响单元格数": sc.get("changed_count", 0)}
+            for label, (mkey, mmult, munit, _, _) in METRICS.items():
+                base_val = getattr(base_m, mkey, None)
+                scn_val = sc["metrics"].get(mkey)
+                if base_val is not None and scn_val is not None:
+                    delta = (scn_val - base_val) * mmult
+                    row[label] = f"{delta:+.2f}{munit}"
+            delta_data.append(row)
+
+        if delta_data:
+            st.dataframe(delta_data, use_container_width=True, hide_index=True, height=250)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Tab 4: Sensitivity History
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_history:
     history = db.list_sensitivity(task.id)
