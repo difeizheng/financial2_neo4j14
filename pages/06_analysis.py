@@ -66,6 +66,8 @@ def _build_params(task_id: str, output_dir: str):
             "category": ind_category,
             "sheet": cell.sheet or "",
             "value": float(val),
+            "row": cell.row,
+            "col": cell.col,
         })
     return rows
 
@@ -108,7 +110,7 @@ with tab_sensitivity:
         filtered = [r for r in filtered if kw in r["name"].lower() or kw in r["sheet"].lower()]
 
     # Parameter multiselect
-    param_options = {f"{r['name']} ({r['sheet']}) = {r['value']:,.2f}": (r["cell_id"], r["name"]) for r in filtered}
+    param_options = {f"{r['name']} | {r['sheet']} 第{r['row']}行 {r['col']}列 = {r['value']:,.2f}": (r["cell_id"], r["name"]) for r in filtered}
     if not param_options:
         st.info("无匹配的参数")
     else:
