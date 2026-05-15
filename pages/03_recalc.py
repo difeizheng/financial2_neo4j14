@@ -57,27 +57,57 @@ def _load_base(task_id: str, output_dir: str):
 base_graph = _load_base(task.id, task.output_dir)
 ws: WorkspaceState = load_workspace(task.id)
 
-# ── Scenario button row ─────────────────────────────────────────────────────
+# ── Scenario management ───────────────────────────────────────────────────
 
 scenario_names = list(ws.scenarios.keys())
-scenario_cols = st.columns([len(s) * 2 + 3 for s in scenario_names] + [8, 4])
 
-for i, sname in enumerate(scenario_names):
-    with scenario_cols[i]:
-        is_active = (sname == ws.active_scenario)
-        label = f"● {sname}" if is_active else f"○ {sname}"
-        btn_type = "primary" if is_active else "secondary"
-        if st.button(label, type=btn_type, use_container_width=True, key=f"scn_{sname}"):
-            ws.active_scenario = sname
+# 场景选择行
+scn_row = st.columns([3, 2, 2, 2, 2, 4])
+with scn_row[0]:
+    selected_scenario = st.selectbox(
+        "场景",
+        scenario_names,
+        index=scenario_names.index(ws.active_scenario) if ws.active_scenario in scenario_names else 0,
+        label_visibility="collapsed",
+        key="scn_select",
+    )
+    if selected_scenario != ws.active_scenario:
+        ws.active_scenario = selected_scenario
+        save_workspace(ws)
+        st.rerun()
+
+with scn_row[1]:
+    if st.button("✏️ 重命名", use_container_width=True, key="scn_rename_btn"):
+        st.session_state["show_rename"] = True
+with scn_row[2]:
+    if st.button("📋 复制场景", use_container_width=True, key="scn_copy_btn"):
+        st.session_state["show_copy"] = True
+with scn_row[3]:
+    if st.button("🧹 清空覆盖", use_container_width=True, key="scn_clear_btn"):
+        scenario = ws.scenarios.get(ws.active_scenario)
+        if scenario and scenario.overrides:
+            count = len(scenario.overrides)
+            scenario.overrides = {}
+            ws.pending_edits = {}
             save_workspace(ws)
+            st.toast(f"已清空 {count} 个参数覆盖", icon="🧹")
             st.rerun()
+        else:
+            st.toast("当前场景无参数覆盖", icon="ℹ️")
+with scn_row[4]:
+    if len(scenario_names) > 1 and ws.active_scenario != "基准":
+        if st.button("🗑 删除", use_container_width=True, key="scn_del_btn"):
+            st.session_state["show_delete_confirm"] = True
+    elif st.button("🗑 删除", use_container_width=True, key="scn_del_btn", disabled=True):
+        pass
 
-with scenario_cols[len(scenario_names)]:
-    new_name = st.text_input("新场景", placeholder="名称", label_visibility="collapsed")
-
-with scenario_cols[len(scenario_names) + 1]:
-    if st.button("+ 新建", use_container_width=True, key="scn_new"):
-        if new_name.strip() and new_name not in ws.scenarios:
+# 新场景创建行
+new_row = st.columns([3, 2, 10])
+with new_row[0]:
+    new_name = st.text_input("新场景名称", placeholder="输入名称后点击创建", label_visibility="collapsed", key="scn_new_name")
+with new_row[1]:
+    if st.button("+ 新建场景", use_container_width=True, key="scn_new"):
+        if new_name.strip() and new_name.strip() not in ws.scenarios:
             ws.scenarios[new_name.strip()] = Scenario(
                 id=str(uuid.uuid4())[:8],
                 task_id=task.id,
@@ -86,22 +116,85 @@ with scenario_cols[len(scenario_names) + 1]:
             )
             ws.active_scenario = new_name.strip()
             save_workspace(ws)
+            st.toast(f"已创建场景「{new_name.strip()}」", icon="✅")
             st.rerun()
         elif new_name.strip():
             st.toast("场景已存在", icon="⚠️")
 
-# Delete row
-if len(ws.scenarios) > 1:
-    _, del_btn, _ = st.columns([8, 2, 8])
-    with del_btn:
-        if st.button(f"🗑 删除「{ws.active_scenario}」", type="secondary", use_container_width=True, key="scn_del"):
-            if ws.active_scenario != "基准":
-                del ws.scenarios[ws.active_scenario]
-                ws.active_scenario = "基准"
-                save_workspace(ws)
+# 重命名对话框
+if st.session_state.get("show_rename"):
+    with st.expander("重命名场景", expanded=True):
+        rename_col_a, rename_col_b, rename_col_c = st.columns([3, 1, 1])
+        with rename_col_a:
+            new_rename = st.text_input("新名称", value=ws.active_scenario, key="rename_input")
+        with rename_col_b:
+            if st.button("确认", type="primary", use_container_width=True, key="rename_confirm"):
+                if new_rename.strip() and new_rename.strip() != ws.active_scenario and new_rename.strip() not in ws.scenarios:
+                    old_name = ws.active_scenario
+                    # 重建 scenarios dict 以新 key 保存
+                    old_scenario = ws.scenarios.pop(old_name)
+                    old_scenario.name = new_rename.strip()
+                    ws.scenarios[new_rename.strip()] = old_scenario
+                    ws.active_scenario = new_rename.strip()
+                    save_workspace(ws)
+                    st.session_state["show_rename"] = False
+                    st.toast("已重命名", icon="✅")
+                    st.rerun()
+                elif new_rename.strip() in ws.scenarios:
+                    st.toast("名称已存在", icon="⚠️")
+        with rename_col_c:
+            if st.button("取消", use_container_width=True, key="rename_cancel"):
+                st.session_state["show_rename"] = False
                 st.rerun()
-            else:
-                st.toast("不能删除基准", icon="⚠️")
+
+# 复制场景对话框
+if st.session_state.get("show_copy"):
+    with st.expander("复制场景", expanded=True):
+        copy_col_a, copy_col_b, copy_col_c = st.columns([3, 1, 1])
+        with copy_col_a:
+            copy_name = st.text_input("新场景名称", value=f"{ws.active_scenario} (副本)", key="copy_input")
+        with copy_col_b:
+            if st.button("确认复制", type="primary", use_container_width=True, key="copy_confirm"):
+                if copy_name.strip() and copy_name.strip() not in ws.scenarios:
+                    src = ws.scenarios[ws.active_scenario]
+                    ws.scenarios[copy_name.strip()] = Scenario(
+                        id=str(uuid.uuid4())[:8],
+                        task_id=task.id,
+                        name=copy_name.strip(),
+                        created_at=datetime.now(timezone.utc).isoformat(),
+                        overrides=dict(src.overrides),
+                    )
+                    ws.active_scenario = copy_name.strip()
+                    save_workspace(ws)
+                    st.session_state["show_copy"] = False
+                    st.toast("已复制场景", icon="✅")
+                    st.rerun()
+                elif copy_name.strip():
+                    st.toast("名称已存在", icon="⚠️")
+        with copy_col_c:
+            if st.button("取消", use_container_width=True, key="copy_cancel"):
+                st.session_state["show_copy"] = False
+                st.rerun()
+
+# 删除确认对话框
+if st.session_state.get("show_delete_confirm"):
+    with st.expander("确认删除", expanded=True):
+        del_col_a, del_col_b, del_col_c = st.columns([4, 1, 1])
+        with del_col_a:
+            st.warning(f"确定要删除场景「{ws.active_scenario}」吗？此操作不可撤销。")
+        with del_col_b:
+            if st.button("确认删除", type="primary", use_container_width=True, key="del_confirm"):
+                if ws.active_scenario != "基准":
+                    del ws.scenarios[ws.active_scenario]
+                    ws.active_scenario = "基准"
+                    save_workspace(ws)
+                    st.session_state["show_delete_confirm"] = False
+                    st.toast("已删除场景", icon="🗑")
+                    st.rerun()
+        with del_col_c:
+            if st.button("取消", use_container_width=True, key="del_cancel"):
+                st.session_state["show_delete_confirm"] = False
+                st.rerun()
 
 st.divider()
 
@@ -246,8 +339,72 @@ with editor_col:
         st.session_state[pending_key] = global_pending
         ws.pending_edits = global_pending
 
-        # Status metrics
-        st.metric("已修改", len(global_pending))
+        # ── 统一修改清单 ──────────────────────────────────────────────
+        st.divider()
+        st.subheader("📋 修改清单")
+
+        if global_pending:
+            # 汇总统计
+            pending_sheets = set()
+            pending_indicators = set()
+            pending_rows = []
+            for cid, new_val in global_pending.items():
+                info = cell_lookup.get(cid, {})
+                pending_sheets.add(info.get("Sheet", ""))
+                ind_name = info.get("Indicator 名称", cid)
+                pending_indicators.add(ind_name)
+                old_val = info.get("当前值", None)
+                try:
+                    delta = float(new_val) - float(old_val) if old_val is not None else None
+                    delta_pct = (delta / abs(float(old_val)) * 100) if (old_val is not None and float(old_val) != 0) else None
+                except (ValueError, TypeError):
+                    delta = None
+                    delta_pct = None
+                pending_rows.append({
+                    "Cell ID": cid,
+                    "Indicator": ind_name,
+                    "旧值": old_val,
+                    "新值": new_val,
+                    "变化": delta,
+                    "变化%": delta_pct,
+                })
+
+            stat_a, stat_b, stat_c = st.columns(3)
+            stat_a.metric("已修改参数", len(global_pending))
+            stat_b.metric("涉及 Sheet", len(pending_sheets - {""}))
+            stat_c.metric("涉及 Indicator", len(pending_indicators))
+
+            # 修改清单表格
+            pending_df = pd.DataFrame(pending_rows)
+            st.dataframe(
+                pending_df,
+                use_container_width=True,
+                hide_index=True,
+                height=min(len(pending_rows) * 35 + 38, 300),
+                column_config={
+                    "Cell ID": st.column_config.TextColumn("Cell ID", width="medium"),
+                    "Indicator": st.column_config.TextColumn("Indicator", width="medium"),
+                    "旧值": st.column_config.NumberColumn("旧值", width="small"),
+                    "新值": st.column_config.NumberColumn("新值", width="small"),
+                    "变化": st.column_config.NumberColumn("变化", width="small"),
+                    "变化%": st.column_config.NumberColumn("变化%", format="%.1f%%", width="small"),
+                },
+            )
+
+            # 单条删除
+            st.caption("点击移除单项修改：")
+            del_cols = st.columns(min(len(pending_rows), 5))
+            for i, row_data in enumerate(pending_rows):
+                with del_cols[i % 5]:
+                    label = f"↩ {row_data['Cell ID'][:18]}{'…' if len(row_data['Cell ID']) > 18 else ''}"
+                    if st.button(label, key=f"pend_del_{row_data['Cell ID']}", use_container_width=True):
+                        global_pending.pop(row_data["Cell ID"])
+                        st.session_state[pending_key] = global_pending
+                        ws.pending_edits = global_pending
+                        save_workspace(ws)
+                        st.rerun()
+        else:
+            st.info("暂无待应用的修改")
 
         # Action buttons
         act_a, act_b, act_c = st.columns([1, 1, 2])
@@ -313,43 +470,74 @@ with results_col:
 
     # ── Tab 1: Key metrics ───────────────────────────────────────────────
     with r_tabs[0]:
-        if recalc_result and working_graph:
-            key_ids = get_key_metrics(base_graph)
-            if key_ids:
-                for row_idx in range(min(len(key_ids), 9), 0, -3):
-                    pass
-                n_show = min(len(key_ids), 9)
-                for ri in range((n_show + 2) // 3):
-                    mc = st.columns(3)
-                    for j, ind_id in enumerate(key_ids[ri * 3:(ri + 1) * 3]):
-                        ind = base_graph.indicators.get(ind_id)
-                        if not ind:
-                            continue
-                        old_val = ind.summary_value
+        # 始终显示关键指标（基线 + 变化）
+        all_key_ids = get_key_metrics(base_graph)
+
+        # 用户可选关注指标
+        fav_key = f"fav_metrics_{task.id}"
+        if fav_key not in st.session_state:
+            st.session_state[fav_key] = set(all_key_ids[:12])  # 默认前12个
+
+        with st.expander("⭐ 自定义关注指标", expanded=len(all_key_ids) <= 12):
+            st.caption("勾选需要追踪的指标（不勾选则使用自动匹配的关键指标）")
+            metric_cols = st.columns(3)
+            for idx, ind_id in enumerate(sorted(all_key_ids)):
+                ind = base_graph.indicators.get(ind_id)
+                label = ind.name if ind else ind_id
+                with metric_cols[idx % 3]:
+                    checked = ind_id in st.session_state[fav_key]
+                    if st.checkbox(label, value=checked, key=f"fav_{ind_id}"):
+                        st.session_state[fav_key].add(ind_id)
+                    elif ind_id in st.session_state[fav_key]:
+                        st.session_state[fav_key].discard(ind_id)
+
+        display_ids = st.session_state[fav_key] if st.session_state[fav_key] else set(all_key_ids)
+        if not display_ids:
+            st.info("未选择任何关注指标，请在上方勾选")
+        else:
+            n_show = min(len(display_ids), 12)
+            for ri in range((n_show + 2) // 3):
+                mc = st.columns(3)
+                for j, ind_id in enumerate(sorted(display_ids)[ri * 3:(ri + 1) * 3]):
+                    ind = base_graph.indicators.get(ind_id)
+                    if not ind:
+                        continue
+                    old_val = ind.summary_value
+                    new_val = old_val
+
+                    # 如果有重算结果，显示新值
+                    if recalc_result and working_graph:
                         w_ind = working_graph.indicators.get(ind_id)
-                        new_val = w_ind.summary_value if w_ind else old_val
+                        if w_ind:
+                            new_val = w_ind.summary_value
 
-                        delta = None
-                        delta_pct = None
-                        if old_val is not None and new_val is not None:
-                            try:
-                                delta = float(new_val) - float(old_val)
-                                if abs(delta) > 1e-9:
-                                    delta_pct = (delta / abs(float(old_val)) * 100) if old_val != 0 else None
-                                else:
-                                    delta = None
-                            except (ValueError, TypeError):
-                                pass
+                    delta = None
+                    delta_pct = None
+                    if old_val is not None and new_val is not None:
+                        try:
+                            delta = float(new_val) - float(old_val)
+                            if abs(delta) > 1e-9:
+                                delta_pct = (delta / abs(float(old_val)) * 100) if old_val != 0 else None
+                            else:
+                                delta = None
+                        except (ValueError, TypeError):
+                            pass
 
-                        with mc[j]:
-                            st.metric(
-                                label=ind.name or ind_id,
-                                value=new_val if new_val is not None else "—",
-                                delta=f"{delta:+.2f} ({delta_pct:+.1f}%)" if delta is not None else None,
-                                delta_color="inverse" if delta is not None and delta < 0 else "normal",
-                            )
+                    # 有变化时高亮颜色
+                    metric_color = "normal"
+                    if delta is not None and delta < 0:
+                        metric_color = "inverse"
 
-                # Affected indicators table
+                    with mc[j]:
+                        st.metric(
+                            label=ind.name or ind_id,
+                            value=new_val if new_val is not None else "—",
+                            delta=f"{delta:+.2f} ({delta_pct:+.1f}%)" if delta is not None else None,
+                            delta_color=metric_color,
+                        )
+
+            # 受影响 Indicator 详情（仅重算后显示）
+            if recalc_result and working_graph:
                 aff_ids: set[str] = set()
                 for cc in recalc_result.changed_cells:
                     cell = working_graph.cells.get(cc.cell_id)
@@ -372,10 +560,6 @@ with results_col:
                 if recalc_result.error_cells:
                     with st.expander(f"求值失败（{len(recalc_result.error_cells)} 个）"):
                         st.write(recalc_result.error_cells[:50])
-            else:
-                st.info("未找到关键指标")
-        else:
-            st.info("重算后显示指标变化")
 
     # ── Tab 2: Impact chain ──────────────────────────────────────────────
     with r_tabs[1]:
