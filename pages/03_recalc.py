@@ -29,6 +29,7 @@ from financial_kg.engine.workspace import (
 from financial_kg.viz.propagation_graph import build_propagation_data
 from financial_kg.viz.echarts_template import render_propagation_html
 from financial_kg.viz.echarts_compare import render_compare_html
+from financial_kg.engine.excel_export import export_modified_excel, find_original_excel
 
 st.set_page_config(layout="wide")
 
@@ -196,6 +197,85 @@ if st.session_state.get("show_delete_confirm"):
             if st.button("取消", use_container_width=True, key="del_cancel"):
                 st.session_state["show_delete_confirm"] = False
                 st.rerun()
+
+# ── Export buttons ──────────────────────────────────────────────────────
+
+export_row = st.columns([2, 2, 2, 8])
+with export_row[0]:
+    if st.button("📥 导出当前场景到 Excel", use_container_width=True, key="export_scenario"):
+        original_excel = find_original_excel(task.id, task.output_dir)
+        if original_excel:
+            # Build snapshot values from scenario overrides + pending edits
+            scenario = ws.scenarios.get(ws.active_scenario)
+            snapshot_vals = {}
+            if scenario:
+                snapshot_vals.update(scenario.overrides)
+            snapshot_vals.update(ws.pending_edits)
+            if snapshot_vals:
+                export_dir = os.path.join(task.output_dir, "exports")
+                os.makedirs(export_dir, exist_ok=True)
+                out_path = os.path.join(export_dir, f"{ws.active_scenario}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.xlsx")
+                try:
+                    export_modified_excel(original_excel, snapshot_vals, out_path)
+                    with open(out_path, "rb") as f:
+                        st.download_button(
+                            label="下载 Excel",
+                            data=f,
+                            file_name=os.path.basename(out_path),
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key=f"dl_{ws.active_scenario}",
+                        )
+                    st.toast(f"已导出到 {out_path}", icon="✅")
+                except Exception as e:
+                    st.toast(f"导出失败: {e}", icon="❌")
+            else:
+                st.toast("当前场景无参数修改", icon="ℹ️")
+        else:
+            st.toast("未找到原始 Excel 文件", icon="⚠️")
+
+with export_row[1]:
+    if st.button("📊 导出场景对比报告", use_container_width=True, key="export_compare"):
+        comp_base = st.session_state.get("comp_base", "基准")
+        comp_targets = st.session_state.get("comp_targets", [])
+        if comp_targets:
+            all_scenarios_in_comp = [comp_base] + list(comp_targets)
+            rows = []
+            comp_key_ids = get_key_metrics(base_graph)
+            for ind_id in comp_key_ids:
+                ind = base_graph.indicators.get(ind_id)
+                if not ind:
+                    continue
+                row = {"指标": ind.name or ind_id, "基准值": ind.summary_value}
+                for scn_name in all_scenarios_in_comp:
+                    scn = ws.scenarios.get(scn_name)
+                    val = ind.summary_value
+                    if scn and scn.overrides:
+                        for cid, override_val in scn.overrides.items():
+                            cell = base_graph.cells.get(cid)
+                            if cell and cell.indicator_id == ind_id:
+                                val = float(override_val)
+                                break
+                    row[scn_name] = val
+                    if val is not None and ind.summary_value is not None:
+                        try:
+                            delta = float(val) - float(ind.summary_value)
+                            row[f"{scn_name} 差异"] = f"{delta:+.2f}"
+                        except (ValueError, TypeError):
+                            row[f"{scn_name} 差异"] = "—"
+                rows.append(row)
+            if rows:
+                df_compare = pd.DataFrame(rows)
+                csv = df_compare.to_csv(index=False, encoding="utf-8-sig")
+                st.download_button(
+                    label="下载对比报告 (CSV)",
+                    data=csv,
+                    file_name=f"scenario_compare_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    key="dl_compare",
+                )
+                st.toast("对比报告已生成", icon="✅")
+        else:
+            st.toast("请先在场景对比 tab 选择对比场景", icon="ℹ️")
 
 st.divider()
 
@@ -734,42 +814,57 @@ with results_col:
     # ── Tab 4: History ───────────────────────────────────────────────────
     with r_tabs[3]:
         if ws.history:
-            sorted_hist = sorted(ws.history, key=lambda r: r.timestamp, reverse=True)[:100]
+            sorted_hist = sorted(ws.history, key=lambda r: r.timestamp, reverse=True)
 
-            hrows = []
+            # 按批次分组
+            batches: dict[str, list] = {}
             for r in sorted_hist:
-                hrows.append({
-                    "时间": r.timestamp[:19],
-                    "场景": r.scenario,
-                    "Cell ID": r.cell_id,
-                    "旧值": r.old_value,
-                    "新值": r.new_value,
-                })
-            st.dataframe(hrows, use_container_width=True, hide_index=True, height=250)
+                batches.setdefault(r.batch_id, []).append(r)
 
-            st.caption("回滚最近 10 条：")
-            rc = st.columns(min(len(sorted_hist[:10]), 5))
-            for i, r in enumerate(sorted_hist[:10]):
-                with rc[i % 5]:
-                    sc = r.cell_id[:15] + "…" if len(r.cell_id) > 15 else r.cell_id
-                    if st.button(f"↩ {sc}", key=f"rb2_{r.id}", use_container_width=True):
-                        updates = rollback_record(ws, r.id)
-                        if updates is not None:
-                            wg = copy.deepcopy(base_graph)
-                            with st.spinner("回滚中..."):
-                                result = apply_and_recalc(wg, ws, base_graph, record_history=False)
-                            st.session_state[f"wg_{task.id}"] = wg
-                            st.session_state[f"rr_{task.id}"] = result
-                            st.toast(f"已回滚 {r.cell_id}", icon="↩️")
-                            st.rerun()
-                        else:
-                            st.toast("回滚失败", icon="❌")
+            # 排序批次（按最早时间）
+            sorted_batch_ids = sorted(
+                batches.keys(),
+                key=lambda bid: min(r.timestamp for r in batches[bid]),
+                reverse=True,
+            )
 
-            if len(ws.history) > 100:
-                st.caption(f"仅显示 100 条，共 {len(ws.history)} 条")
+            for i, bid in enumerate(sorted_batch_ids[:20]):
+                records = batches[bid]
+                first_record = records[0]
+                batch_time = first_record.timestamp[:19]
+                batch_scenario = first_record.scenario
+                batch_size = len(records)
 
-            if st.button("清空历史（保留 10 条）", key="ch2"):
-                ws.history = ws.history[-10:]
+                with st.expander(f"批次 {i+1}: {batch_scenario} — {batch_time} ({batch_size} 项修改)", expanded=(i == 0)):
+                    # 批次内详情
+                    brow = []
+                    for r in records:
+                        brow.append({
+                            "Cell ID": r.cell_id,
+                            "Indicator": r.indicator_name,
+                            "旧值": r.old_value,
+                            "新值": r.new_value,
+                        })
+                    st.dataframe(brow, use_container_width=True, hide_index=True, height=min(batch_size * 35 + 38, 200))
+
+                    # 批量回滚
+                    if st.button("↩ 回滚此批次", key=f"rb_batch_{bid}"):
+                        for r in records:
+                            rollback_record(ws, r.id)
+                        wg = copy.deepcopy(base_graph)
+                        with st.spinner("回滚中..."):
+                            result = apply_and_recalc(wg, ws, base_graph, record_history=False)
+                        st.session_state[f"wg_{task.id}"] = wg
+                        st.session_state[f"rr_{task.id}"] = result
+                        st.toast(f"已回滚 {len(records)} 条修改", icon="↩️")
+                        st.rerun()
+
+            if len(sorted_batch_ids) > 20:
+                st.caption(f"仅显示 20 个批次，共 {len(sorted_batch_ids)} 个")
+
+            # 清空历史
+            if st.button("清空全部历史", key="ch_clear_all"):
+                ws.history = []
                 save_workspace(ws)
                 st.rerun()
         else:
@@ -877,3 +972,20 @@ with results_col:
                 st.rerun()
         else:
             st.info("请先搜索并添加参数")
+
+# ── Keyboard shortcuts ─────────────────────────────────────────────────
+
+shortcut_js = """
+<script>
+document.addEventListener('keydown', function(e) {
+    if (e.ctrlKey && e.key === 's') {
+        e.preventDefault();
+        var saveBtn = Array.from(document.querySelectorAll('button')).find(
+            b => b.textContent.includes('保存到场景')
+        );
+        if (saveBtn) saveBtn.click();
+    }
+});
+</script>
+"""
+components.html(shortcut_js, height=0, scrolling=False)
