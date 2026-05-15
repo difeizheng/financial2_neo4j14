@@ -432,16 +432,9 @@ with editor_col:
                     affected_preview.add(cid)
                     cell = base_graph.cells.get(cid)
                     if cell:
-                        # 查找直接依赖此 cell 的其他 cell
-                        for other_cid, other_cell in base_graph.cells.items():
-                            if other_cid != cid and other_cell.formula:
-                                # 简单检查：formula 中是否包含此 cell 的引用
-                                ref = cid.rsplit("_", 2)
-                                if len(ref) == 3:
-                                    col_letter = ref[2]
-                                    row_num = ref[1]
-                                    if f"{col_letter}{row_num}" in other_cell.formula.upper() or col_letter.lower() in other_cell.formula.lower():
-                                        affected_preview.add(other_cid)
+                        # 查找直接依赖此 cell 的其他 cell（ predecessors = 依赖此节点的）
+                        for other_cid in base_graph.cell_graph.predecessors(cid):
+                            affected_preview.add(other_cid)
                 st.caption(f"预计影响约 {len(affected_preview)} 个单元格")
 
             apply_clicked = st.button("🔄 应用并重算", type="primary", use_container_width=True)
