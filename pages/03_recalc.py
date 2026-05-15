@@ -28,6 +28,7 @@ from financial_kg.engine.workspace import (
 )
 from financial_kg.viz.propagation_graph import build_propagation_data
 from financial_kg.viz.echarts_template import render_propagation_html
+from financial_kg.viz.echarts_compare import render_compare_html
 
 st.set_page_config(layout="wide")
 
@@ -243,100 +244,7 @@ scenario = ws.scenarios.get(ws.active_scenario)
 with editor_col:
     st.subheader("📝 编辑参数")
 
-    # ── 树形数据结构构建 ────────────────────────────────────────────────
-
-    def _is_modified(cell_id: str, scenario, pending: dict) -> bool:
-        """Check if a cell has override or pending edit."""
-        if scenario and cell_id in scenario.overrides:
-            return True
-        return cell_id in pending
-
-    def _build_tree(rows: list[dict], scenario, pending: dict) -> dict:
-        """Build Sheet → Table → Indicator → Cells tree."""
-        tree: dict[str, dict] = {}
-        for r in rows:
-            sheet = r["Sheet"] or "未分组"
-            tbl = r["Table 名称"] or "未分组"
-            ind_name = r["Indicator 名称"] or "未命名"
-            ind_key = f"{ind_name}|{r['类别']}"
-
-            if sheet not in tree:
-                tree[sheet] = {"tables": {}}
-            if tbl not in tree[sheet]["tables"]:
-                tree[sheet]["tables"][tbl] = {"indicators": {}}
-
-            tbl_node = tree[sheet]["tables"][tbl]
-            if ind_key not in tbl_node["indicators"]:
-                tbl_node["indicators"][ind_key] = {
-                    "name": ind_name,
-                    "category": r["类别"],
-                    "cells": [],
-                }
-
-            cid = r["Cell ID"]
-            base_val = r["当前值"]
-            scenario_val = base_val
-            if scenario and cid in scenario.overrides:
-                scenario_val = scenario.overrides[cid]
-            if cid in pending:
-                scenario_val = pending[cid]
-
-            tbl_node["indicators"][ind_key]["cells"].append({
-                "cell_id": cid,
-                "type": r["类型"],
-                "current_value": base_val,
-                "scenario_value": scenario_val,
-                "modified": _is_modified(cid, scenario, pending),
-            })
-
-        return tree
-
-    def _tree_match_search(tree: dict, kw: str) -> set[str]:
-        """Return set of sheet names that have cells matching search kw."""
-        if not kw:
-            return set(tree.keys())
-        matching_sheets: set[str] = set()
-        kw_lower = kw.lower()
-        for sheet_name, sheet_data in tree.items():
-            for tbl_name, tbl_data in sheet_data["tables"].items():
-                for ind_key, ind_data in tbl_data["indicators"].items():
-                    for c in ind_data["cells"]:
-                        if (kw_lower in c["cell_id"].lower()
-                                or kw_lower in ind_data["name"].lower()
-                                or kw_lower in tbl_name.lower()):
-                            matching_sheets.add(sheet_name)
-                            break
-                    else:
-                        continue
-                    break
-                else:
-                    continue
-                break
-        return matching_sheets
-
-    def _count_tree_cells(tree: dict) -> int:
-        """Total cells in tree."""
-        total = 0
-        for sheet_data in tree.values():
-            for tbl_data in sheet_data["tables"].values():
-                for ind_data in tbl_data["indicators"].values():
-                    total += len(ind_data["cells"])
-        return total
-
-    def _collect_tree_modifications(tree: dict, pending: dict) -> dict:
-        """Walk tree and collect all modified cells into pending dict."""
-        for sheet_data in tree.values():
-            for tbl_data in sheet_data["tables"].values():
-                for ind_data in tbl_data["indicators"].values():
-                    for c in ind_data["cells"]:
-                        try:
-                            if abs(float(c["scenario_value"]) - float(c["current_value"])) > 1e-9:
-                                pending[c["cell_id"]] = c["scenario_value"]
-                        except (ValueError, TypeError):
-                            if c["scenario_value"] != c["current_value"]:
-                                pending[c["cell_id"]] = c["scenario_value"]
-
-    # Filter bar
+    # Global filter bar
     filter_a, filter_b, filter_c = st.columns([2, 1, 1])
     with filter_a:
         search_kw = st.text_input("搜索", placeholder="Cell ID / Indicator / Table", label_visibility="collapsed", key="p_search")
@@ -346,97 +254,87 @@ with editor_col:
         all_types = sorted(set(r["类型"] for r in all_param_cells if r["类型"]))
         selected_types = st.multiselect("类型", all_types, default=["number"], label_visibility="collapsed", key="p_types")
 
-    # Filter rows
-    filtered_rows = []
+    # Group by category
+    category_groups: dict[str, list[dict]] = {}
     for r in all_param_cells:
         if selected_types and r["类型"] not in selected_types:
             continue
         if selected_sheets and r["Sheet"] not in selected_sheets:
             continue
         if search_kw:
-            kw_lower = search_kw.lower()
-            if (kw_lower not in r["Cell ID"].lower()
-                    and kw_lower not in r["Indicator 名称"].lower()
-                    and kw_lower not in r["Table 名称"].lower()):
+            kw = search_kw.lower()
+            if kw not in r["Cell ID"].lower() and kw not in r["Indicator 名称"].lower() and kw not in r["Table 名称"].lower():
                 continue
-        filtered_rows.append(r)
+        cat = r["类别"] or "未分类"
+        category_groups.setdefault(cat, []).append(r)
 
-    if not filtered_rows:
+    # Sort categories, "未分类" at end
+    sorted_cats = sorted(
+        [c for c in category_groups if c != "未分类"],
+        key=lambda c: len(category_groups[c]),
+        reverse=True,
+    )
+    if "未分类" in category_groups:
+        sorted_cats.append("未分类")
+
+    if not sorted_cats:
         st.info("无匹配参数")
     else:
+        cat_tabs = st.tabs([f"{c} ({len(category_groups[c])})" for c in sorted_cats])
+
         pending_key = f"pending_{ws.active_scenario}"
         global_pending: dict[str, Any] = st.session_state.get(pending_key, {})
 
-        # Build tree
-        param_tree = _build_tree(filtered_rows, scenario, global_pending)
-        total_cells = _count_tree_cells(param_tree)
+        for ti, cat in enumerate(sorted_cats):
+            with cat_tabs[ti]:
+                cat_rows = category_groups[cat]
+                if not cat_rows:
+                    st.info("当前类别无参数")
+                    continue
 
-        # Sheet expanders
-        sheet_names_sorted = sorted(param_tree.keys())
-        sheet_expanders = st.tabs([f"📁 {s}" for s in sheet_names_sorted])
+                df = pd.DataFrame(cat_rows)
+                df["场景值"] = df["当前值"].copy()
 
-        for si, sheet_name in enumerate(sheet_names_sorted):
-            with sheet_expanders[si]:
-                sheet_data = param_tree[sheet_name]
-                table_names = sorted(sheet_data["tables"].keys())
+                # Pre-fill scenario overrides
+                if scenario:
+                    for idx in df.index:
+                        cid = df.at[idx, "Cell ID"]
+                        if cid in scenario.overrides:
+                            df.at[idx, "场景值"] = scenario.overrides[cid]
 
-                for tbl_name in table_names:
-                    tbl_data = sheet_data["tables"][tbl_name]
-                    indicators = tbl_data["indicators"]
+                # Pre-fill pending edits
+                for idx in df.index:
+                    cid = df.at[idx, "Cell ID"]
+                    if cid in global_pending:
+                        df.at[idx, "场景值"] = global_pending[cid]
 
-                    # Count modified cells in this table
-                    mod_count = sum(
-                        1 for ind_data in indicators.values()
-                        for c in ind_data["cells"]
-                        if c["modified"]
-                    )
+                edited_df = st.data_editor(
+                    df,
+                    column_config={
+                        "Cell ID": st.column_config.TextColumn("Cell ID", disabled=True, width="medium"),
+                        "Indicator 名称": st.column_config.TextColumn("Indicator", disabled=True),
+                        "Table 名称": st.column_config.TextColumn("Table", disabled=True),
+                        "Sheet": st.column_config.TextColumn("Sheet", disabled=True, width="small"),
+                        "类型": st.column_config.TextColumn("类型", disabled=True, width="small"),
+                        "当前值": st.column_config.NumberColumn("当前值", disabled=True, width="small"),
+                        "场景值": st.column_config.NumberColumn("场景值", width="small"),
+                    },
+                    use_container_width=True,
+                    hide_index=True,
+                    key=f"pedit_{ws.active_scenario}_{cat}",
+                )
 
-                    tbl_label = f"📋 {tbl_name} ({len(indicators)} 项)"
-                    if mod_count > 0:
-                        tbl_label = f"🔴 {tbl_name} ({mod_count} 已修改)"
-
-                    with st.expander(tbl_label, expanded=(mod_count > 0)):
-                        # Build a mini dataframe for this table's cells
-                        cell_rows = []
-                        for ind_key in sorted(indicators.keys()):
-                            ind_data = indicators[ind_key]
-                            for c in ind_data["cells"]:
-                                cell_rows.append({
-                                    "Cell ID": c["cell_id"],
-                                    "Indicator": ind_data["name"],
-                                    "类别": ind_data["category"],
-                                    "类型": c["type"],
-                                    "当前值": c["current_value"],
-                                    "场景值": c["scenario_value"],
-                                })
-
-                        tbl_df = pd.DataFrame(cell_rows)
-                        edited_df = st.data_editor(
-                            tbl_df,
-                            column_config={
-                                "Cell ID": st.column_config.TextColumn("Cell ID", disabled=True, width="medium"),
-                                "Indicator": st.column_config.TextColumn("Indicator", disabled=True),
-                                "类别": st.column_config.TextColumn("类别", disabled=True, width="small"),
-                                "类型": st.column_config.TextColumn("类型", disabled=True, width="small"),
-                                "当前值": st.column_config.NumberColumn("当前值", disabled=True, width="small"),
-                                "场景值": st.column_config.NumberColumn("场景值", width="small"),
-                            },
-                            use_container_width=True,
-                            hide_index=True,
-                            key=f"tree_edit_{ws.active_scenario}_{sheet_name}_{tbl_name}",
-                        )
-
-                        # Collect edits
-                        for _, row in edited_df.iterrows():
-                            cid = row["Cell ID"]
-                            new_val = row["场景值"]
-                            old_val = row["当前值"]
-                            try:
-                                if abs(float(new_val) - float(old_val)) > 1e-9:
-                                    global_pending[cid] = new_val
-                            except (ValueError, TypeError):
-                                if new_val != old_val:
-                                    global_pending[cid] = new_val
+                # Collect per-tab pending edits
+                for _, row in edited_df.iterrows():
+                    cid = row["Cell ID"]
+                    new_val = row["场景值"]
+                    old_val = row["当前值"]
+                    try:
+                        if abs(float(new_val) - float(old_val)) > 1e-9:
+                            global_pending[cid] = new_val
+                    except (ValueError, TypeError):
+                        if new_val != old_val:
+                            global_pending[cid] = new_val
 
         # Save global pending edits
         st.session_state[pending_key] = global_pending
@@ -527,6 +425,25 @@ with editor_col:
                     st.toast(f"已保存 {len(global_pending)} 个修改到「{ws.active_scenario}」", icon="💾")
                     st.rerun()
         with act_c:
+            # 影响预览
+            if global_pending:
+                affected_preview = set()
+                for cid in global_pending:
+                    affected_preview.add(cid)
+                    cell = base_graph.cells.get(cid)
+                    if cell:
+                        # 查找直接依赖此 cell 的其他 cell
+                        for other_cid, other_cell in base_graph.cells.items():
+                            if other_cid != cid and other_cell.formula:
+                                # 简单检查：formula 中是否包含此 cell 的引用
+                                ref = cid.rsplit("_", 2)
+                                if len(ref) == 3:
+                                    col_letter = ref[2]
+                                    row_num = ref[1]
+                                    if f"{col_letter}{row_num}" in other_cell.formula.upper() or col_letter.lower() in other_cell.formula.lower():
+                                        affected_preview.add(other_cid)
+                st.caption(f"预计影响约 {len(affected_preview)} 个单元格")
+
             apply_clicked = st.button("🔄 应用并重算", type="primary", use_container_width=True)
 
         if apply_clicked:
@@ -569,7 +486,7 @@ working_graph = st.session_state.get(f"wg_{task.id}")
 with results_col:
     st.subheader("📊 结果面板")
 
-    r_tabs = st.tabs(["关键指标", "影响链", "修改历史", "重算设置"])
+    r_tabs = st.tabs(["关键指标", "场景对比", "影响链", "修改历史", "重算设置", "批量修改"])
 
     # ── Tab 1: Key metrics ───────────────────────────────────────────────
     with r_tabs[0]:
@@ -664,8 +581,112 @@ with results_col:
                     with st.expander(f"求值失败（{len(recalc_result.error_cells)} 个）"):
                         st.write(recalc_result.error_cells[:50])
 
-    # ── Tab 2: Impact chain ──────────────────────────────────────────────
+    # ── Tab 2: Scenario comparison ──────────────────────────────────────
     with r_tabs[1]:
+        st.subheader("场景对比")
+
+        # 场景选择器
+        comp_col_a, comp_col_b = st.columns(2)
+        with comp_col_a:
+            comp_base = st.selectbox(
+                "基准场景",
+                scenario_names,
+                index=scenario_names.index("基准") if "基准" in scenario_names else 0,
+                key="comp_base",
+            )
+        with comp_col_b:
+            compare_options = [s for s in scenario_names if s != comp_base]
+            comp_targets = st.multiselect(
+                "对比场景",
+                compare_options,
+                default=compare_options[:1] if compare_options else [],
+                key="comp_targets",
+            )
+
+        if comp_targets:
+            # 收集所有场景的 overrides
+            all_scenarios_in_comp = [comp_base] + list(comp_targets)
+
+            # 获取关键指标
+            comp_key_ids = get_key_metrics(base_graph)
+            if comp_key_ids:
+                # 构建对比数据
+                metrics_data = []
+                for ind_id in comp_key_ids:
+                    ind = base_graph.indicators.get(ind_id)
+                    if not ind:
+                        continue
+                    values = []
+                    for scn_name in all_scenarios_in_comp:
+                        scn = ws.scenarios.get(scn_name)
+                        # 计算该场景下此 indicator 的值
+                        if scn and scn.overrides:
+                            # 找到此 indicator 关联的 cell 是否有 override
+                            for cid, override_val in scn.overrides.items():
+                                cell = base_graph.cells.get(cid)
+                                if cell and cell.indicator_id == ind_id:
+                                    values.append({
+                                        "scenario": scn_name,
+                                        "value": float(override_val),
+                                        "isBaseline": scn_name == comp_base,
+                                    })
+                                    break
+                            else:
+                                values.append({
+                                    "scenario": scn_name,
+                                    "value": float(ind.summary_value) if ind.summary_value is not None else None,
+                                    "isBaseline": scn_name == comp_base,
+                                })
+                        else:
+                            values.append({
+                                "scenario": scn_name,
+                                "value": float(ind.summary_value) if ind.summary_value is not None else None,
+                                "isBaseline": scn_name == comp_base,
+                            })
+                    metrics_data.append({
+                        "name": ind.name or ind_id,
+                        "values": values,
+                    })
+
+                if metrics_data:
+                    # 参数覆盖对比表
+                    st.caption("参数覆盖差异：")
+                    override_rows = []
+                    all_override_cells = set()
+                    for scn_name in all_scenarios_in_comp:
+                        scn = ws.scenarios.get(scn_name)
+                        if scn:
+                            all_override_cells.update(scn.overrides.keys())
+
+                    for cid in sorted(all_override_cells):
+                        info = cell_lookup.get(cid, {})
+                        row = {"Cell ID": cid, "Indicator": info.get("Indicator 名称", ""), "基准值": info.get("当前值", "")}
+                        for scn_name in all_scenarios_in_comp:
+                            scn = ws.scenarios.get(scn_name)
+                            row[scn_name] = scn.overrides.get(cid, "—") if scn else "—"
+                        override_rows.append(row)
+
+                    if override_rows:
+                        st.dataframe(
+                            override_rows,
+                            use_container_width=True,
+                            hide_index=True,
+                            height=min(len(override_rows) * 35 + 38, 250),
+                        )
+
+                    # ECharts 可视化对比
+                    chart_data = {"metrics": metrics_data, "scenarios": all_scenarios_in_comp}
+                    html = render_compare_html(json.dumps(chart_data, ensure_ascii=False))
+                    components.html(html, height=500, scrolling=True)
+                else:
+                    st.info("所选场景无参数覆盖差异")
+            else:
+                st.info("未找到关键指标")
+        else:
+            st.info("选择至少一个对比场景后显示差异")
+
+    # ── Tab 3: Impact chain ──────────────────────────────────────────────
+    with r_tabs[2]:
         if recalc_result and working_graph:
             changed_ids = [c.cell_id for c in recalc_result.changed_cells]
             if changed_ids:
@@ -717,8 +738,8 @@ with results_col:
         else:
             st.info("重算后显示影响链")
 
-    # ── Tab 3: History ───────────────────────────────────────────────────
-    with r_tabs[2]:
+    # ── Tab 4: History ───────────────────────────────────────────────────
+    with r_tabs[3]:
         if ws.history:
             sorted_hist = sorted(ws.history, key=lambda r: r.timestamp, reverse=True)[:100]
 
@@ -761,8 +782,8 @@ with results_col:
         else:
             st.info("暂无修改记录")
 
-    # ── Tab 4: Recalc settings ───────────────────────────────────────────
-    with r_tabs[3]:
+    # ── Tab 5: Recalc settings ───────────────────────────────────────────
+    with r_tabs[4]:
         st.caption("循环依赖迭代求值参数（Excel 模型中存在 F9→F10→F42→F38→F9 循环引用时生效）")
 
         new_max_iter = st.number_input(
@@ -789,3 +810,77 @@ with results_col:
             st.toast(f"已更新：迭代={new_max_iter}, 容差={new_tol:.0e}", icon="⚙️")
 
         st.caption(f"当前：迭代 {ws.recalc_max_iter} 次，容差 {ws.recalc_tol:.0e}")
+
+    # ── Tab 6: Batch edit ──────────────────────────────────────────────
+    with r_tabs[5]:
+        st.subheader("批量修改")
+
+        batch_mode = st.radio(
+            "操作类型",
+            ["统一设值", "百分比调整", "增量调整"],
+            horizontal=True,
+            key="batch_mode",
+        )
+
+        # 选中的 cell 列表
+        batch_search = st.text_input("搜索 Cell ID / Indicator", placeholder="输入后回车添加", label_visibility="collapsed", key="batch_search")
+        if batch_search:
+            matches = []
+            kw = batch_search.lower()
+            for cid, info in cell_lookup.items():
+                if kw in cid.lower() or kw in info.get("Indicator 名称", "").lower() or kw in info.get("Table 名称", "").lower():
+                    matches.append(f"{cid} — {info.get('Indicator 名称', '')} (当前值: {info.get('当前值', '')})")
+
+            if matches:
+                st.caption(f"找到 {len(matches)} 个匹配：")
+                for m in matches[:10]:
+                    if st.button(m, key=f"batch_add_{m.split(' ')[0]}", use_container_width=True):
+                        selected = st.session_state.get("batch_selected", [])
+                        if m.split(" ")[0] not in selected:
+                            selected.append(m.split(" ")[0])
+                            st.session_state["batch_selected"] = selected
+
+        # 已选列表
+        batch_selected = st.session_state.get("batch_selected", [])
+        if batch_selected:
+            st.caption(f"已选 {len(batch_selected)} 个参数：")
+            st.write(", ".join(batch_selected[:20]) + ("…" if len(batch_selected) > 20 else ""))
+
+            # 操作值
+            val_col, apply_col = st.columns([2, 1])
+            with val_col:
+                if batch_mode == "统一设值":
+                    batch_val = st.number_input("目标值", key="batch_val")
+                elif batch_mode == "百分比调整":
+                    batch_val = st.number_input("调整百分比 (%)", value=0.0, step=1.0, key="batch_val")
+                else:
+                    batch_val = st.number_input("增量值", value=0.0, step=1.0, key="batch_val")
+
+            with apply_col:
+                if st.button("应用到选中", type="primary", use_container_width=True, key="batch_apply"):
+                    pending_key = f"pending_{ws.active_scenario}"
+                    gp = st.session_state.get(pending_key, {})
+                    for cid in batch_selected:
+                        info = cell_lookup.get(cid, {})
+                        old_val = info.get("当前值", 0)
+                        try:
+                            if batch_mode == "统一设值":
+                                gp[cid] = batch_val
+                            elif batch_mode == "百分比调整":
+                                gp[cid] = float(old_val) * (1 + batch_val / 100)
+                            else:
+                                gp[cid] = float(old_val) + batch_val
+                        except (ValueError, TypeError):
+                            gp[cid] = batch_val
+                    st.session_state[pending_key] = gp
+                    ws.pending_edits = gp
+                    save_workspace(ws)
+                    st.toast(f"已批量修改 {len(batch_selected)} 个参数", icon="✅")
+                    st.session_state["batch_selected"] = []
+                    st.rerun()
+
+            if st.button("清空已选", use_container_width=True, key="batch_clear_sel"):
+                st.session_state["batch_selected"] = []
+                st.rerun()
+        else:
+            st.info("请先搜索并添加参数")
