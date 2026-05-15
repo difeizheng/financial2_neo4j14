@@ -374,6 +374,13 @@ with tab_sensitivity:
     ]
     _DATE_TIME_KEYWORDS = {"年", "月", "日", "期", "时间", "date", "time", "year"}
 
+    # Business keyword filter toggle (default: on)
+    use_keyword_filter = st.toggle(
+        "仅显示业务参数",
+        value=True,
+        help="关闭后显示所有数值型非公式单元格，由用户自行判断",
+    )
+
     param_options: dict[str, str] = {}  # display -> cell_id
     for cid, cell in graph.cells.items():
         if cell.formula_raw:
@@ -394,9 +401,16 @@ with tab_sensitivity:
                         float(sv)
                     except (TypeError, ValueError):
                         continue
-                if any(kw in name for kw in param_keywords):
-                    label = f"{name} ({cid})"
-                    param_options[label] = cid
+        else:
+            name = ""
+
+        # Business keyword filter — toggleable
+        if use_keyword_filter:
+            if not any(kw in name for kw in param_keywords):
+                continue
+
+        label = f"{name} ({cid})" if name else cid
+        param_options[label] = cid
 
     # ── Controls ─────────────────────────────────────────────────────
     col_mode1, col_mode2 = st.columns(2)
