@@ -137,9 +137,10 @@ snap_b_values = st.session_state.get("snap_b_values", {})
 snap_a_values = st.session_state.get("snap_a_values", {})
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_metrics, tab_matrix, tab_prop, tab_export = st.tabs([
+tab_metrics, tab_matrix, tab_detail, tab_prop, tab_export = st.tabs([
     "关键指标对比",
     "变化矩阵",
+    "变化明细",
     "传播图",
     "导出",
 ])
@@ -389,6 +390,67 @@ with tab_matrix:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Tab 3: Propagation graph
+# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# Tab 3: Change detail (per-cell)
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_detail:
+    all_sheets = sorted({c.get("sheet", "") for c in diff.changed_cells if c.get("sheet")})
+
+    st.caption(f"共 {len(diff.changed_cells)} 条变化")
+
+    col_f1, col_f2 = st.columns(2)
+    with col_f1:
+        selected_sheets = st.multiselect("按 Sheet 筛选", all_sheets, default=[], key="detail_sheets")
+    with col_f2:
+        search_kw = st.text_input("搜索", placeholder="Cell ID / Sheet / Indicator / 值", key="detail_search")
+
+    filtered = diff.changed_cells
+    if selected_sheets:
+        filtered = [c for c in filtered if c.get("sheet") in selected_sheets]
+    if search_kw:
+        kw = search_kw.lower()
+        filtered = [
+            c for c in filtered
+            if kw in c["id"].lower()
+            or kw in c.get("sheet", "").lower()
+            or kw in c.get("indicator_name", "").lower()
+            or kw in str(c.get("old", "")).lower()
+            or kw in str(c.get("new", "")).lower()
+        ]
+
+    if not filtered:
+        st.info("无匹配的变化单元格")
+    else:
+        rows = [
+            {
+                "Cell ID": c["id"],
+                "Sheet": c.get("sheet", ""),
+                "旧值": c.get("old"),
+                "新值": c.get("new"),
+                "变化量": round(c.get("change_magnitude", 0), 6),
+                "方向": "↑ 增加" if c.get("direction") == "increase" else "↓ 减少",
+                "公式": c.get("formula") or "",
+                "Indicator": c.get("indicator_name", ""),
+            }
+            for c in filtered
+        ]
+        st.dataframe(rows, use_container_width=True, height=600,
+                     column_config={
+                         "Cell ID": st.column_config.TextColumn("Cell ID", width="medium"),
+                         "Sheet": st.column_config.TextColumn("Sheet", width="small"),
+                         "旧值": st.column_config.NumberColumn("旧值", width="small"),
+                         "新值": st.column_config.NumberColumn("新值", width="small"),
+                         "变化量": st.column_config.NumberColumn("变化量", width="small"),
+                         "方向": st.column_config.TextColumn("方向", width="small"),
+                         "公式": st.column_config.TextColumn("公式", width="medium"),
+                         "Indicator": st.column_config.TextColumn("Indicator", width="medium"),
+                     })
+        if search_kw or selected_sheets:
+            st.caption(f"筛选结果：{len(rows)} / {len(diff.changed_cells)} 条")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Tab 4: Propagation graph
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_prop:
     if not diff.changed_cells:
