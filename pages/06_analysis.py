@@ -687,7 +687,16 @@ if has_result or scn_list or be_result:
                 project_name=task.filename,
                 sensitivity_result=sens,
                 scenarios=scn_list,
-                break_even_results=[be_result] if be_result else None,
+                break_even_results=[
+                    {
+                        "param_name": be_result.param_name,
+                        "metric_label": be_result.metric_label,
+                        "threshold": be_result.threshold,
+                        "found": be_result.found,
+                        "break_even_value": be_result.break_even_value,
+                        "break_even_pct": be_result.break_even_pct,
+                    }
+                ] if be_result else None,
             )
             with open(tmp.name, "rb") as f:
                 st.download_button(
