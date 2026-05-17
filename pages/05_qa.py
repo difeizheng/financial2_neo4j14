@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from financial_kg.storage.json_store import load_graph
 from financial_kg.storage.task_db import TaskDB
 from financial_kg.llm import QAEngine
+from financial_kg.llm.whatif_engine import detect_what_if, answer_what_if, WhatIfAnswer
 from financial_kg.models.graph import FinancialGraph
 from financial_kg.engine.derived_metrics import compute_derived_metrics, serialize_metrics, deserialize_metrics
 from financial_kg.config import (
@@ -133,6 +134,12 @@ _QUICK_QUESTIONS = {
         "全期净现金流是多少？",
         "经营活动现金流入是多少？",
         "投资活动现金流出是多少？",
+    ],
+    "假设分析": [
+        "如果售电电价提高10%，IRR会变成多少？",
+        "如果贷款利率降低5%，净现值变化多大？",
+        "如果EPC合同额增加10%，IRR会变成多少？",
+        "如果资本金比例降低5%，偿债能力变化多大？",
     ],
     "自定义": [],
 }
@@ -360,6 +367,13 @@ def _try_derived_metrics_answer(
                                 {"name": "毛利率", "value": f"{margin:.2f}%", "unit": "%", "match_reason": "computed"},
                             ],
                             "chart_data": [],
+                            "breakdown_data": {
+                                "main": {"name": "毛利率", "value": margin},
+                                "parts": [
+                                    {"name": "营业收入", "value": rev_f},
+                                    {"name": "营业成本", "value": cost_f},
+                                ],
+                            },
                             "confidence": 80,
                             "sources": [
                                 {"name": revenue_ind.name, "sheet": revenue_ind.sheet, "value": f"{rev_f:,.2f}", "unit": revenue_ind.unit or "", "score": 8.0, "indicator_id": revenue_ind.id},
@@ -396,6 +410,13 @@ def _try_derived_metrics_answer(
                                 {"name": "净利率", "value": f"{net_margin:.2f}%", "unit": "%", "match_reason": "computed"},
                             ],
                             "chart_data": [],
+                            "breakdown_data": {
+                                "main": {"name": "净利率", "value": net_margin},
+                                "parts": [
+                                    {"name": "净利润", "value": profit_f},
+                                    {"name": "营业收入", "value": rev_f},
+                                ],
+                            },
                             "confidence": 80,
                             "sources": [
                                 {"name": net_profit_ind.name, "sheet": net_profit_ind.sheet, "value": f"{profit_f:,.2f}", "unit": net_profit_ind.unit or "", "score": 8.0, "indicator_id": net_profit_ind.id},
@@ -514,6 +535,60 @@ def _build_structured_answer(question: str, state: dict) -> dict:
     return result
 
 
+def _render_whatif_answer(answer: WhatIfAnswer) -> dict:
+    """Convert WhatIfAnswer to structured answer dict for rendering."""
+    metrics = []
+    waterfall_data = []
+
+    for m in answer.metrics:
+        if m.after is None:
+            continue
+        delta_str = ""
+        if m.delta is not None:
+            if m.unit == "%":
+                delta_str = f"{m.delta * 100:+.2f}pp"
+            elif m.unit == "年":
+                delta_str = f"{m.delta:+.2f}年"
+            else:
+                delta_str = f"{m.delta:+,.2f}"
+        value_str = ""
+        if m.unit == "%":
+            value_str = f"{m.after * 100:.2f}%"
+        elif m.unit == "年":
+            value_str = f"{m.after:.2f}年"
+        elif isinstance(m.after, float) and abs(m.after) >= 1000:
+            value_str = f"{m.after:,.2f}"
+        else:
+            value_str = f"{m.after:.2f}"
+
+        metrics.append({
+            "name": m.name,
+            "value": value_str,
+            "unit": delta_str if delta_str else m.unit,
+            "match_reason": "what_if",
+        })
+        waterfall_data.append({
+            "name": m.name, "before": m.before,
+            "after": m.after, "delta": m.delta, "unit": m.unit,
+        })
+
+    return {
+        "text": answer.text,
+        "metrics": metrics,
+        "chart_data": [],
+        "waterfall_data": waterfall_data,
+        "confidence": answer.confidence,
+        "sources": [{
+            "name": answer.param_name,
+            "sheet": "参数输入",
+            "value": f"{answer.param_before:,.2f} → {answer.param_after:,.2f}",
+            "unit": "",
+            "score": 8.0,
+            "indicator_id": "",
+        }],
+    }
+
+
 def _render_structured_answer(data: dict):
     """Render a structured answer with metrics, charts, tables, and text."""
     text = data.get("text", "")
@@ -542,6 +617,26 @@ def _render_structured_answer(data: dict):
         chart_names = ", ".join(d["name"] for d in chart_data)
         with st.expander(f"📊 数据趋势（{len(chart_data)} 个指标）", expanded=True):
             html = render_time_series_html(chart_data, title=chart_names[:50])
+            components.html(html, height=350, scrolling=False)
+
+    # Waterfall chart (what-if answers)
+    waterfall_data = data.get("waterfall_data", [])
+    if waterfall_data:
+        import streamlit.components.v1 as components
+        from financial_kg.viz.qa_chart import render_waterfall_html
+
+        with st.expander("📊 指标变化瀑布图", expanded=True):
+            html = render_waterfall_html(waterfall_data, title="参数变化 → 指标影响")
+            components.html(html, height=400, scrolling=False)
+
+    # Breakdown donut chart (aggregation answers)
+    breakdown_data = data.get("breakdown_data")
+    if breakdown_data:
+        import streamlit.components.v1 as components
+        from financial_kg.viz.qa_chart import render_breakdown_donut_html
+
+        with st.expander("📊 指标构成分析", expanded=True):
+            html = render_breakdown_donut_html(breakdown_data, title="成本/收入构成")
             components.html(html, height=350, scrolling=False)
 
     # Time series table
@@ -634,32 +729,41 @@ if question:
             # Direct answer from pre-computed metrics — skip LLM
             structured = derived_answer
         else:
-            # ── Step 2: Fall back to LLM + retrieval ────────────────────────
-            state = {"full_answer": "", "retrieval": None, "cypher": None, "structured": None}
+            # ── Step 1.5: Try what-if question detection ────────────────────
+            whatif_parsed = detect_what_if(question)
+            whatif_answer = None
+            if whatif_parsed:
+                whatif_answer = answer_what_if(graph, question)
 
-            def _stream():
-                for event_type, data in engine.ask_stream(
-                    question,
-                    chat_history=chat_history,
-                    top_k=top_k,
-                ):
-                    if event_type == "retrieval":
-                        state["retrieval"] = data
-                    elif event_type == "cypher":
-                        state["cypher"] = data
-                    elif event_type == "chunk":
-                        state["full_answer"] += data
-                        yield data
-                    elif event_type in ("answer", "error"):
-                        state["full_answer"] = data
-                        yield data
+            if whatif_answer:
+                structured = _render_whatif_answer(whatif_answer)
+            else:
+                # ── Step 2: Fall back to LLM + retrieval ────────────────────────
+                state = {"full_answer": "", "retrieval": None, "cypher": None, "structured": None}
 
-            answer_text = st.write_stream(_stream())
-            state["full_answer"] = answer_text
+                def _stream():
+                    for event_type, data in engine.ask_stream(
+                        question,
+                        chat_history=chat_history,
+                        top_k=top_k,
+                    ):
+                        if event_type == "retrieval":
+                            state["retrieval"] = data
+                        elif event_type == "cypher":
+                            state["cypher"] = data
+                        elif event_type == "chunk":
+                            state["full_answer"] += data
+                            yield data
+                        elif event_type in ("answer", "error"):
+                            state["full_answer"] = data
+                            yield data
 
-            # Build structured answer from retrieval + text
-            structured = _build_structured_answer(question, state)
-            state["structured"] = structured
+                answer_text = st.write_stream(_stream())
+                state["full_answer"] = answer_text
+
+                # Build structured answer from retrieval + text
+                structured = _build_structured_answer(question, state)
+                state["structured"] = structured
 
     # Save user question + structured answer to history
     # Note: quick question / follow-up buttons already appended user message
@@ -675,6 +779,16 @@ if question:
         "content": structured,
     })
     _persist_chat()
+
+    # Persist to qa_answers table for comparison
+    if isinstance(structured, dict):
+        db.save_qa_answer(
+            task_id=task.id,
+            question=question,
+            answer_data=structured,
+            confidence=structured.get("confidence", 0),
+        )
+
     st.rerun()
 
 # ── Clear button ──────────────────────────────────────────────────────────────
@@ -699,6 +813,161 @@ if chat_history and chat_history[-1]["role"] == "assistant":
                         _persist_chat()
                         st.session_state["qa_auto_question"] = sq
                         st.rerun()
+
+# ── History Comparison ──────────────────────────────────────────────────────
+answers_list = db.list_qa_answers(task.id, limit=30)
+
+if len(answers_list) >= 2:
+    with st.expander("历史对比", expanded=False):
+        st.caption("选择两个历史问答进行对比分析")
+
+        col_a, col_b, col_action = st.columns([5, 5, 2])
+        with col_a:
+            opts_a = [f"[{a['id']}] {a['question'][:50]} ({a['created_at'][:16]})" for a in answers_list]
+            sel_a = st.selectbox("选择问答 A", opts_a, key="qa_cmp_a")
+        with col_b:
+            opts_b = [f"[{a['id']}] {a['question'][:50]} ({a['created_at'][:16]})" for a in answers_list]
+            idx_b = min(1, len(opts_b) - 1)
+            sel_b = st.selectbox("选择问答 B", opts_b, index=idx_b, key="qa_cmp_b")
+        with col_action:
+            st.write("")
+            st.write("")
+            do_compare = st.button("对比", type="primary", use_container_width=True)
+
+        if do_compare:
+            idx_a = opts_a.index(sel_a)
+            idx_b = opts_b.index(sel_b)
+            ans_a = answers_list[idx_a]
+            ans_b = answers_list[idx_b]
+
+            st.divider()
+            col_left, col_right = st.columns(2)
+            with col_left:
+                st.markdown(f"**问答 A** — {ans_a['question']}")
+                st.caption(f"时间: {ans_a['created_at']} | 置信度: {ans_a['confidence']}%")
+                _render_structured_answer(ans_a["answer_data"])
+            with col_right:
+                st.markdown(f"**问答 B** — {ans_b['question']}")
+                st.caption(f"时间: {ans_b['created_at']} | 置信度: {ans_b['confidence']}%")
+                _render_structured_answer(ans_b["answer_data"])
+
+            # Metric comparison table
+            metrics_a = ans_a["answer_data"].get("metrics", [])
+            metrics_b = ans_b["answer_data"].get("metrics", [])
+            if metrics_a and metrics_b:
+                st.divider()
+                st.subheader("指标对比")
+                comp_rows = []
+                for ma, mb in zip(metrics_a[:5], metrics_b[:5]):
+                    comp_rows.append({
+                        "指标": ma["name"], "A值": ma["value"], "B值": mb["value"],
+                        "A置信": ans_a["confidence"], "B置信": ans_b["confidence"],
+                    })
+                st.dataframe(comp_rows, use_container_width=True)
+
+# ── Batch Q&A ──────────────────────────────────────────────────────────────
+with st.expander("批量问答", expanded=False):
+    st.caption("上传包含问题列表的 Excel 文件，批量处理后导出结果")
+
+    uploaded_file = st.file_uploader(
+        "上传问题 Excel", type=["xlsx"],
+        help="A列为问题文本，第一行为表头",
+    )
+
+    if uploaded_file:
+        import tempfile as _tmp
+        from financial_kg.engine.batch_qa import (
+            read_questions_from_excel,
+            process_batch_questions,
+            export_batch_results_excel,
+        )
+
+        with _tmp.NamedTemporaryFile(suffix=".xlsx", delete=False) as tf:
+            tf.write(uploaded_file.getbuffer())
+            tmp_path = tf.name
+
+        try:
+            questions = read_questions_from_excel(tmp_path)
+            st.info(f"检测到 {len(questions)} 个问题")
+
+            with st.expander("预览问题列表", expanded=False):
+                for i, q in enumerate(questions[:10], 1):
+                    st.text(f"{i}. {q}")
+                if len(questions) > 10:
+                    st.text(f"... 共 {len(questions)} 个问题")
+
+            if st.button("开始批量处理", type="primary"):
+                from financial_kg.llm.whatif_engine import answer_what_if as _aw
+
+                def _derived_fn(q_text, _dm, _graph):
+                    return _try_derived_metrics_answer(q_text, _dm, _graph)
+
+                def _whatif_fn(_graph, q_text):
+                    return answer_what_if(_graph, q_text)
+
+                def _llm_fn(q_text):
+                    state = {"full_answer": "", "retrieval": None}
+                    for et, ed in engine.ask_stream(q_text, chat_history=[], top_k=top_k):
+                        if et == "retrieval":
+                            state["retrieval"] = ed
+                        elif et in ("chunk", "answer", "error"):
+                            state["full_answer"] = ed
+                    return _build_structured_answer(q_text, state)
+
+                with st.spinner(f"处理 {len(questions)} 个问题..."):
+                    results = process_batch_questions(
+                        graph, questions, _derived_fn, _whatif_fn, _llm_fn,
+                    )
+
+                ok = len([r for r in results if not r.error])
+                fail = len([r for r in results if r.error])
+                st.success(f"完成！成功 {ok} / 失败 {fail}")
+
+                export_path = os.path.join(task.output_dir, f"{task.id}_batch_qa.xlsx")
+                export_batch_results_excel(results, export_path)
+
+                with open(export_path, "rb") as f:
+                    st.download_button(
+                        "下载批量问答结果",
+                        data=f,
+                        file_name=f"{task.filename.rsplit('.', 1)[0]}_批量问答.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+
+                # Save batch results to qa_answers table
+                for r in results:
+                    if not r.error and r.answer_text:
+                        db.save_qa_answer(
+                            task_id=task.id, question=r.question,
+                            answer_data={
+                                "text": r.answer_text, "metrics": r.metrics,
+                                "chart_data": [], "confidence": r.confidence,
+                                "sources": r.sources,
+                            },
+                            confidence=r.confidence,
+                        )
+        finally:
+            os.unlink(tmp_path)
+
+# ── Export QA History ─────────────────────────────────────────────────────
+st.divider()
+exp_col1, exp_col2 = st.columns([3, 1])
+with exp_col1:
+    st.markdown("#### 导出问答历史")
+    st.caption("导出所有问答记录到 Excel，含问答汇总、指标明细、数据来源三个工作表。")
+with exp_col2:
+    if st.button("导出问答历史", type="secondary", use_container_width=True):
+        export_path = os.path.join(task.output_dir, f"{task.id}_qa_history.xlsx")
+        with st.spinner("导出中..."):
+            db.export_qa_history_excel(task.id, export_path)
+
+        with open(export_path, "rb") as f:
+            st.download_button(
+                "下载问答历史 Excel",
+                data=f,
+                file_name=f"{task.filename.rsplit('.', 1)[0]}_qa_history.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
 
 # ── Export Financial Report ──────────────────────────────────────────────────
 st.divider()

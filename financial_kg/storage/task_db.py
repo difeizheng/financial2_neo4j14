@@ -93,6 +93,17 @@ class TaskDB:
                     FOREIGN KEY (task_id) REFERENCES tasks(id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_sensitivity_task ON sensitivity_history(task_id);
+                CREATE TABLE IF NOT EXISTS qa_answers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    question TEXT NOT NULL,
+                    answer_data TEXT NOT NULL DEFAULT '{}',
+                    confidence INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (task_id) REFERENCES tasks(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_qa_answers_task ON qa_answers(task_id);
+                CREATE INDEX IF NOT EXISTS idx_qa_answers_time ON qa_answers(created_at);
             """)
 
     # ── Tasks ────────────────────────────────────────────────────────────────
@@ -274,6 +285,148 @@ class TaskDB:
     def delete_sensitivity(self, record_id: int) -> None:
         with self._conn() as conn:
             conn.execute("DELETE FROM sensitivity_history WHERE id=?", (record_id,))
+
+    # ── QA Answers (granular, for comparison) ────────────────────────────────
+
+    def save_qa_answer(
+        self,
+        task_id: str,
+        question: str,
+        answer_data: dict,
+        confidence: int = 0,
+    ) -> int:
+        """Save a single QA answer, return answer_id."""
+        now = datetime.now().isoformat()
+        with self._conn() as conn:
+            cur = conn.execute(
+                "INSERT INTO qa_answers (task_id, question, answer_data, confidence, created_at) VALUES (?,?,?,?,?)",
+                (task_id, question, json.dumps(answer_data, ensure_ascii=False), confidence, now),
+            )
+            return cur.lastrowid
+
+    def list_qa_answers(self, task_id: str, limit: int = 50) -> list[dict]:
+        """List QA answers for a task, newest first."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT id, question, answer_data, confidence, created_at FROM qa_answers WHERE task_id=? ORDER BY created_at DESC LIMIT ?",
+                (task_id, limit),
+            ).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "question": r["question"],
+                "answer_data": json.loads(r["answer_data"]),
+                "confidence": r["confidence"],
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+
+    def get_qa_answer(self, answer_id: int) -> Optional[dict]:
+        """Get a single QA answer by ID."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT id, task_id, question, answer_data, confidence, created_at FROM qa_answers WHERE id=?",
+                (answer_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row["id"],
+            "task_id": row["task_id"],
+            "question": row["question"],
+            "answer_data": json.loads(row["answer_data"]),
+            "confidence": row["confidence"],
+            "created_at": row["created_at"],
+        }
+
+    def delete_qa_answer(self, answer_id: int) -> None:
+        """Delete a single QA answer."""
+        with self._conn() as conn:
+            conn.execute("DELETE FROM qa_answers WHERE id=?", (answer_id,))
+
+    def clear_qa_answers(self, task_id: str) -> None:
+        """Delete all QA answers for a task."""
+        with self._conn() as conn:
+            conn.execute("DELETE FROM qa_answers WHERE task_id=?", (task_id,))
+
+    def export_qa_history_excel(
+        self,
+        task_id: str,
+        output_path: str,
+    ) -> str:
+        """Export QA history to Excel with 3 sheets: Summary, Metrics, Sources."""
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill
+
+        answers = self.list_qa_answers(task_id, limit=200)
+
+        wb = openpyxl.Workbook()
+        header_fill = PatternFill(start_color="1976D2", end_color="1976D2", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF")
+
+        # Sheet 1: Summary
+        ws1 = wb.active
+        ws1.title = "问答汇总"
+        headers = ["ID", "问题", "回答摘要", "置信度", "时间"]
+        for col_idx, h in enumerate(headers, 1):
+            cell = ws1.cell(row=1, column=col_idx, value=h)
+            cell.fill = header_fill
+            cell.font = header_font
+
+        for row_idx, a in enumerate(answers, 2):
+            answer_text = a["answer_data"].get("text", "")[:200] if a["answer_data"] else ""
+            ws1.cell(row=row_idx, column=1, value=a["id"])
+            ws1.cell(row=row_idx, column=2, value=a["question"])
+            ws1.cell(row=row_idx, column=3, value=answer_text)
+            ws1.cell(row=row_idx, column=4, value=a["confidence"])
+            ws1.cell(row=row_idx, column=5, value=a["created_at"][:19])
+
+        ws1.column_dimensions["A"].width = 8
+        ws1.column_dimensions["B"].width = 40
+        ws1.column_dimensions["C"].width = 60
+        ws1.column_dimensions["D"].width = 10
+        ws1.column_dimensions["E"].width = 20
+
+        # Sheet 2: Metrics
+        ws2 = wb.create_sheet("指标明细")
+        m_headers = ["问答ID", "指标名称", "值", "单位", "匹配原因"]
+        for col_idx, h in enumerate(m_headers, 1):
+            cell = ws2.cell(row=1, column=col_idx, value=h)
+            cell.fill = header_fill
+            cell.font = header_font
+
+        row_idx = 2
+        for a in answers:
+            for m in a["answer_data"].get("metrics", []):
+                ws2.cell(row=row_idx, column=1, value=a["id"])
+                ws2.cell(row=row_idx, column=2, value=m.get("name", ""))
+                ws2.cell(row=row_idx, column=3, value=m.get("value", ""))
+                ws2.cell(row=row_idx, column=4, value=m.get("unit", ""))
+                ws2.cell(row=row_idx, column=5, value=m.get("match_reason", ""))
+                row_idx += 1
+
+        # Sheet 3: Sources
+        ws3 = wb.create_sheet("数据来源")
+        s_headers = ["问答ID", "来源名称", "Sheet", "值", "单位", "评分"]
+        for col_idx, h in enumerate(s_headers, 1):
+            cell = ws3.cell(row=1, column=col_idx, value=h)
+            cell.fill = header_fill
+            cell.font = header_font
+
+        row_idx = 2
+        for a in answers:
+            for s in a["answer_data"].get("sources", []):
+                ws3.cell(row=row_idx, column=1, value=a["id"])
+                ws3.cell(row=row_idx, column=2, value=s.get("name", ""))
+                ws3.cell(row=row_idx, column=3, value=s.get("sheet", ""))
+                ws3.cell(row=row_idx, column=4, value=s.get("value", ""))
+                ws3.cell(row=row_idx, column=5, value=s.get("unit", ""))
+                ws3.cell(row=row_idx, column=6, value=s.get("score", 0))
+                row_idx += 1
+
+        wb.save(output_path)
+        return output_path
 
     # ── Delete ─────────────────────────────────────────────────────────────────
 
