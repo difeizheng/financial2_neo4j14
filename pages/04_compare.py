@@ -141,9 +141,7 @@ if st.button("执行对比", type="primary", use_container_width=True):
 
 # ── Show diff results ─────────────────────────────────────────────────────────
 diff = st.session_state.get("diff")
-if diff is None or st.session_state.get("diff_task_id") != task.id:
-    st.info("选择两个快照后点击「执行对比」显示差异")
-    st.stop()
+_has_diff = diff is not None and st.session_state.get("diff_task_id") == task.id
 
 snap_a_name = st.session_state.get("snap_a_name", "A")
 snap_b_name = st.session_state.get("snap_b_name", "B")
@@ -151,23 +149,24 @@ snap_b_values = st.session_state.get("snap_b_values", {})
 snap_a_values = st.session_state.get("snap_a_values", {})
 
 # ── Excel target file choice (used by both detail & propagation tabs) ──
-_orig_path = find_original_excel(task.id, task.output_dir)
-_recalc_path = st.session_state.get("recalc_excel_path")
-_target_opts = {}
-if _orig_path and os.path.exists(_orig_path):
-    _target_opts["原始文件"] = _orig_path
-if _recalc_path and os.path.exists(_recalc_path):
-    _target_opts[f"场景文件（{snap_b_name}）"] = _recalc_path
+if _has_diff:
+    _orig_path = find_original_excel(task.id, task.output_dir)
+    _recalc_path = st.session_state.get("recalc_excel_path")
+    _target_opts = {}
+    if _orig_path and os.path.exists(_orig_path):
+        _target_opts["原始文件"] = _orig_path
+    if _recalc_path and os.path.exists(_recalc_path):
+        _target_opts[f"场景文件（{snap_b_name}）"] = _recalc_path
 
-if len(_target_opts) > 1:
-    _target_label = st.radio(
-        "Excel 定位目标", list(_target_opts.keys()), horizontal=True, key="excel_target",
-    )
-    st.session_state["excel_locate_path"] = _target_opts[_target_label]
-elif len(_target_opts) == 1:
-    st.session_state["excel_locate_path"] = list(_target_opts.values())[0]
-else:
-    st.session_state.pop("excel_locate_path", None)
+    if len(_target_opts) > 1:
+        _target_label = st.radio(
+            "Excel 定位目标", list(_target_opts.keys()), horizontal=True, key="excel_target",
+        )
+        st.session_state["excel_locate_path"] = _target_opts[_target_label]
+    elif len(_target_opts) == 1:
+        st.session_state["excel_locate_path"] = list(_target_opts.values())[0]
+    else:
+        st.session_state.pop("excel_locate_path", None)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tab_metrics, tab_matrix, tab_detail, tab_prop, tab_export = st.tabs([
@@ -177,6 +176,11 @@ tab_metrics, tab_matrix, tab_detail, tab_prop, tab_export = st.tabs([
     "传播图",
     "导出",
 ])
+
+if not _has_diff:
+    with tab_metrics:
+        st.info("选择两个快照后点击「执行对比」显示差异")
+    st.stop()
 
 # ── Helper: Excel locate via win32com ──────────────────────────────────────────
 
