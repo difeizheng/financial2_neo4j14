@@ -436,142 +436,76 @@ with tab_detail:
     if not filtered:
         st.info("无匹配的变化单元格")
     else:
-        rows = [
-            {
-                "Cell ID": c["id"],
-                "Sheet": c.get("sheet", ""),
-                "旧值": c.get("old"),
-                "新值": c.get("new"),
-                "变化量": round(c.get("change_magnitude", 0), 6),
-                "方向": "↑ 增加" if c.get("direction") == "increase" else "↓ 减少",
-                "公式": c.get("formula") or "",
-                "Indicator": c.get("indicator_name", ""),
-            }
-            for c in filtered
-        ]
-        st.dataframe(rows, use_container_width=True, height=600,
-                     column_config={
-                         "Cell ID": st.column_config.TextColumn("Cell ID", width="medium"),
-                         "Sheet": st.column_config.TextColumn("Sheet", width="small"),
-                         "旧值": st.column_config.NumberColumn("旧值", width="small"),
-                         "新值": st.column_config.NumberColumn("新值", width="small"),
-                         "变化量": st.column_config.NumberColumn("变化量", width="small"),
-                         "方向": st.column_config.TextColumn("方向", width="small"),
-                         "公式": st.column_config.TextColumn("公式", width="medium"),
-                         "Indicator": st.column_config.TextColumn("Indicator", width="medium"),
-                     },
-                     selection_mode="single-row",
-                     key="detail_table")
-        if search_kw or selected_sheets:
-            st.caption(f"筛选结果：{len(rows)} / {len(diff.changed_cells)} 条")
+        # Build HTML table with clickable "定位" links
+        def _cell_to_ref(cid):
+            parts = cid.rsplit("_", 2)
+            if len(parts) != 3:
+                return cid
+            sheet, row, col = parts
+            ref = f"{col}{row}"
+            if sheet:
+                ref = f"{sheet}!{ref}"
+            return ref
 
-        # ── Excel locate for selected row ──
-        sel = st.session_state.get("detail_table", {})
-        if sel and isinstance(sel, dict) and "selected_rows" in sel and sel["selected_rows"]:
-            idx = sel["selected_rows"][0]
-            sel_cell = filtered[idx]
-            cell_ref = sel_cell["sheet"] + "!" + sel_cell["id"].rsplit("_", 1)[1] + sel_cell["id"].rsplit("_", 2)[1]
+        html_rows = ""
+        for c in filtered:
+            ref = _cell_to_ref(c["id"])
+            old_v = c.get("old", "")
+            new_v = c.get("new", "")
+            chg = round(c.get("change_magnitude", 0), 6)
+            direction = "↑" if c.get("direction") == "increase" else "↓"
+            ind_name = c.get("indicator_name", "") or ""
+            formula = c.get("formula", "") or ""
+            # Escape for HTML
+            ind_name = ind_name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            formula = formula.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            html_rows += (
+                f'<tr>'
+                f'<td style="font-size:11px;font-family:monospace">{c["id"]}</td>'
+                f'<td style="font-size:11px">{c.get("sheet", "")}</td>'
+                f'<td style="font-size:11px;text-align:right">{old_v}</td>'
+                f'<td style="font-size:11px;text-align:right">{new_v}</td>'
+                f'<td style="font-size:11px;text-align:right">{chg}</td>'
+                f'<td style="font-size:11px">{direction}</td>'
+                f'<td style="font-size:11px;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{formula}</td>'
+                f'<td style="font-size:11px">{ind_name}</td>'
+                f'<td style="font-size:11px"><button class="loc-btn" onclick="locRef(this.getAttribute(\'data-ref\'))" data-ref="{ref}">定位</button></td>'
+                f'</tr>\n'
+            )
 
-            st.divider()
-            st.caption(f"选中：{sel_cell['id']}  ({sel_cell.get('indicator_name', '')})  {sel_cell.get('old')} → {sel_cell.get('new')}")
-
-            # Build Excel reference
-            col_part = sel_cell["id"].rsplit("_", 1)[-1]
-            row_part = sel_cell["id"].rsplit("_", 2)[1]
-            excel_ref = f"{sel_cell['sheet']}!{col_part}{row_part}"
-
-            _recalc_loc = st.session_state.get("recalc_excel_path")
-            _orig_loc = find_original_excel(task.id, task.output_dir)
-            _loc_path = None
-
-            if _recalc_loc and os.path.exists(_recalc_loc):
-                _loc_path = _recalc_loc
-                snap_n = st.session_state.get("snap_b_name", "B")
-                st.caption(f"重算文件：{_loc_path}（快照「{snap_n}」）")
-            elif _orig_loc and os.path.exists(_orig_loc):
-                _loc_path = _orig_loc
-                st.caption(f"原始文件：{_loc_path}")
-
-            if _loc_path:
-                if st.button("在 Excel 中定位此单元格", key="detail_locate_btn", type="primary"):
-                    try:
-                        import win32com.client
-                        import pythoncom
-                        pythoncom.CoInitialize()
-                        try:
-                            addr = col_part + row_part
-                            addr = addr.replace("$", "")
-                            abs_path = os.path.abspath(_loc_path)
-
-                            xl = None
-                            for prog_id in ["ket.Application", "Excel.Application"]:
-                                try:
-                                    xl = win32com.client.GetActiveObject(prog_id)
-                                    break
-                                except Exception:
-                                    pass
-                            if xl is None:
-                                for prog_id in ["ket.Application", "Excel.Application"]:
-                                    try:
-                                        xl = win32com.client.Dispatch(prog_id)
-                                        break
-                                    except Exception:
-                                        continue
-                            if xl is None:
-                                raise RuntimeError("未找到 WPS 或 Office Excel")
-
-                            xl.Visible = True
-                            wb = None
-                            count = xl.Workbooks.Count
-                            for i in range(1, count + 1):
-                                try:
-                                    b = xl.Workbooks(i)
-                                    if os.path.abspath(b.FullName) == abs_path:
-                                        wb = b
-                                        break
-                                except Exception:
-                                    continue
-                            if wb is None:
-                                wb = xl.Workbooks.Open(abs_path)
-
-                            try:
-                                xl.Iteration = True
-                                xl.MaxIterations = 1000
-                                xl.MaxChange = 1e-6
-                            except Exception:
-                                pass
-                            try:
-                                wb.EnableIteration = True
-                            except Exception:
-                                pass
-                            try:
-                                wb.RefreshAll()
-                                wb.Calculate()
-                            except Exception:
-                                pass
-
-                            if sel_cell["sheet"]:
-                                try:
-                                    ws = wb.Sheets(sel_cell["sheet"])
-                                except Exception:
-                                    ws = wb.ActiveSheet
-                            else:
-                                ws = wb.ActiveSheet
-                            ws.Activate()
-                            try:
-                                rng = ws.Range(addr)
-                                rng.Select()
-                                rng.Interior.Color = 0xFFFF00
-                                rng.Font.Bold = True
-                                st.success(f"已定位到 {excel_ref}，黄色高亮（Ctrl+Z 撤销）")
-                            except Exception:
-                                st.warning(f"无法定位到 {addr}")
-                        finally:
-                            pythoncom.CoUninitialize()
-                    except ImportError:
-                        st.error("需要安装 pywin32：pip install pywin32")
-                    except Exception as e:
-                        st.error(f"打开 Excel 失败：{e}")
+        table_html = f"""
+        <style>
+        .detail-tbl {{ width: 100%; border-collapse: collapse; font-size: 11px; }}
+        .detail-tbl th {{ background: #1e1e2e; color: #89b4fa; padding: 6px 8px; text-align: left; position: sticky; top: 0; }}
+        .detail-tbl td {{ padding: 4px 8px; border-bottom: 1px solid #2a3050; }}
+        .detail-tbl tr:hover {{ background: rgba(137,180,250,0.05); }}
+        .loc-btn {{ background: #45475a; color: #cdd6f4; border: none; padding: 2px 10px; border-radius: 3px; font-size: 10px; cursor: pointer; }}
+        .loc-btn:hover {{ background: #89b4fa; color: #1e1e2e; }}
+        </style>
+        <table class="detail-tbl">
+        <thead>
+        <tr>
+        <th>Cell ID</th><th>Sheet</th><th>旧值</th><th>新值</th><th>变化量</th><th>方向</th><th>公式</th><th>Indicator</th><th>定位</th>
+        </tr>
+        </thead>
+        <tbody>
+        {html_rows}
+        </tbody>
+        </table>
+        <script>
+        function locRef(ref) {{
+          var input = window.parent.document.querySelector('input[aria-label="Excel 定位引用"]');
+          if (!input) input = window.parent.document.querySelector('input[placeholder*="Excel定位"]');
+          if (input) {{
+            var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            nativeInputValueSetter.call(input, ref);
+            input.dispatchEvent(new Event('input', {{bubbles: true}}));
+            input.scrollIntoView({{behavior: 'smooth', block: 'center'}});
+          }}
+        }}
+        </script>
+        """
+        components.html(table_html, height=600, scrolling=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Tab 4: Propagation graph
