@@ -81,6 +81,9 @@ def render_propagation_html(
   .badge-indicator {{ background: #42A5F5; color: #fff; }}
   .section-title {{ font-size: 11px; color: #6c7086; margin: 8px 0 4px; border-top: 1px solid #2a3050; padding-top: 6px; }}
   .change-arrow {{ color: #6c7086; margin: 0 4px; }}
+  .copy-btn {{ background: #45475a; color: #cdd6f4; border: none; padding: 1px 7px; border-radius: 3px; font-size: 10px; cursor: pointer; margin-left: 4px; flex-shrink: 0; }}
+  .copy-btn:hover {{ background: #585b70; }}
+  .copy-btn.copied {{ background: #a6e3a1; color: #1e1e2e; }}
 </style>
 </head>
 <body>
@@ -448,6 +451,19 @@ function shortLabel(id) {
   return parts.length > 1 ? parts.slice(1).join('_') : id;
 }
 
+function parseCellId(cellId) {
+  var i2 = cellId.lastIndexOf('_');
+  if (i2 === -1) return null;
+  var col = cellId.substring(i2 + 1);
+  var rest = cellId.substring(0, i2);
+  var i1 = rest.lastIndexOf('_');
+  if (i1 === -1) return null;
+  var row = rest.substring(i1 + 1);
+  var sheet = rest.substring(0, i1);
+  if (!/^\d+$/.test(row) || !/^[A-Z]+$/.test(col.toUpperCase())) return null;
+  return {sheet: sheet, row: row, col: col.toUpperCase(), ref: sheet + '!' + col.toUpperCase() + row};
+}
+
 function formatVal(v) {
   if (v == null) return '-';
   var n = Number(v);
@@ -545,6 +561,12 @@ function drillInto(nodeId) {
   } else {
     // ── Cell node (root / changed / downstream) ──
     html += detailRow('Cell ID', escHtml(node.id));
+    var pc = parseCellId(node.id);
+    if (pc) {
+      html += '<div class="drow"><span class="dlabel">Excel定位</span><span class="dvalue">' +
+              escHtml(pc.ref) + '</span>' +
+              '<button class="copy-btn" data-ref="' + escHtml(pc.ref) + '">复制</button></div>';
+    }
     html += detailRow('表页', escHtml(node.sheet));
     html += detailRow('传播深度', String(node.depth));
 
@@ -633,8 +655,18 @@ chart.on('click', function(params) {
   drillInto(node.id);
 });
 
-// Make cell list items clickable (event delegation)
+// Make cell list items & copy buttons clickable (event delegation)
 document.getElementById('detail-content').addEventListener('click', function(ev) {
+  var copyBtn = ev.target.closest('.copy-btn');
+  if (copyBtn) {
+    var ref = copyBtn.getAttribute('data-ref');
+    navigator.clipboard.writeText(ref).then(function() {
+      copyBtn.textContent = '已复制';
+      copyBtn.classList.add('copied');
+      setTimeout(function() { copyBtn.textContent = '复制'; copyBtn.classList.remove('copied'); }, 1500);
+    });
+    return;
+  }
   var row = ev.target.closest('.drow[data-nid]');
   if (row) drillInto(row.getAttribute('data-nid'));
 });

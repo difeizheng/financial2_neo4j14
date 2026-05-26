@@ -513,6 +513,55 @@ with tab_prop:
             st.warning(f"图谱已截断至 {st.session_state['prop_nodes']} 个节点")
         components.html(st.session_state["prop_html"], height=780, scrolling=False)
 
+        # ── Excel locate section ──
+        st.divider()
+        _excel_path = find_original_excel(task.id, task.output_dir)
+        if _excel_path and os.path.exists(_excel_path):
+            st.caption(f"原始文件：{_excel_path}")
+            _loc_ref = st.text_input(
+                "Excel 定位引用",
+                placeholder="如：参数输入表!I250（在传播图中点击节点可复制引用）",
+                key="prop_excel_locate_ref",
+            )
+            if st.button("在 Excel 中定位", key="prop_excel_locate_btn", disabled=not _loc_ref):
+                try:
+                    import win32com.client
+                    ref = _loc_ref.strip()
+                    if "!" in ref:
+                        sheet_name, addr = ref.split("!", 1)
+                    else:
+                        sheet_name, addr = None, ref
+                    addr = addr.replace("$", "")
+                    xl = win32com.client.Dispatch("Excel.Application")
+                    xl.Visible = True
+                    wb = None
+                    for b in xl.Workbooks:
+                        if os.path.abspath(b.FullName) == os.path.abspath(_excel_path):
+                            wb = b
+                            break
+                    if wb is None:
+                        wb = xl.Workbooks.Open(os.path.abspath(_excel_path))
+                    if sheet_name:
+                        try:
+                            ws = wb.Sheets(sheet_name)
+                        except Exception:
+                            st.warning(f"未找到工作表「{sheet_name}」，已打开文件但无法定位")
+                            ws = wb.ActiveSheet
+                    else:
+                        ws = wb.ActiveSheet
+                    ws.Activate()
+                    try:
+                        ws.Range(addr).Select()
+                        st.success(f"已定位到 {ref}")
+                    except Exception:
+                        st.warning(f"无法定位到 {addr}，已打开文件并激活工作表")
+                except ImportError:
+                    st.error("需要安装 pywin32：pip install pywin32")
+                except Exception as e:
+                    st.error(f"打开 Excel 失败：{e}")
+        else:
+            st.caption("未找到原始 Excel 文件，Excel 定位功能不可用")
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Tab 4: Export
 # ══════════════════════════════════════════════════════════════════════════════
