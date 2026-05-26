@@ -112,10 +112,23 @@ if st.button("执行对比", type="primary", use_container_width=True):
         st.warning("请选择两个不同的快照")
         st.stop()
 
-    with st.spinner("对比中..."):
+    original_path = find_original_excel(task.id, task.output_dir)
+    formula_cell_ids = {cid for cid, cell in graph.cells.items() if cell.formula_raw}
+
+    with st.spinner("对比并生成重算 Excel..."):
         snap_a = load_snapshot(rec_a.filepath)
         snap_b = load_snapshot(rec_b.filepath)
         diff = diff_snapshots(snap_a, snap_b, graph)
+
+        # Auto-generate recalculated Excel from original + snap_b values
+        recalc_excel_path = None
+        if original_path:
+            safe_name = rec_b.name.replace("/", "_").replace("\\", "_").replace(":", "_")
+            recalc_excel_path = os.path.join(task.output_dir, f"{task.id}_recalc_{safe_name}.xlsx")
+            try:
+                export_modified_excel(original_path, snap_b.values, recalc_excel_path, formula_cell_ids=formula_cell_ids)
+            except Exception:
+                recalc_excel_path = None
 
     st.session_state["diff"] = diff
     st.session_state["diff_task_id"] = task.id
@@ -123,6 +136,7 @@ if st.button("执行对比", type="primary", use_container_width=True):
     st.session_state["snap_b_values"] = snap_b.values
     st.session_state["snap_a_name"] = rec_a.name
     st.session_state["snap_b_name"] = rec_b.name
+    st.session_state["recalc_excel_path"] = recalc_excel_path
     st.session_state.pop("prop_html", None)
 
 # ── Show diff results ─────────────────────────────────────────────────────────
@@ -515,9 +529,19 @@ with tab_prop:
 
         # ── Excel locate section ──
         st.divider()
-        _excel_path = find_original_excel(task.id, task.output_dir)
-        if _excel_path and os.path.exists(_excel_path):
-            st.caption(f"原始文件：{_excel_path}")
+        _recalc_path = st.session_state.get("recalc_excel_path")
+        _orig_path = find_original_excel(task.id, task.output_dir)
+        _excel_path = None
+
+        if _recalc_path and os.path.exists(_recalc_path):
+            _excel_path = _recalc_path
+            snap_b_name = st.session_state.get("snap_b_name", "B")
+            st.caption(f"重算文件：{_excel_path}（对应快照「{snap_b_name}」）")
+        elif _orig_path and os.path.exists(_orig_path):
+            _excel_path = _orig_path
+            st.caption(f"原始文件：{_excel_path}（无重算文件，使用原始数据）")
+
+        if _excel_path:
             _loc_ref = st.text_input(
                 "Excel 定位引用",
                 placeholder="如：参数输入表!I250（在传播图中点击节点可复制引用）",
