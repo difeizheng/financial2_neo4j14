@@ -121,6 +121,11 @@ def build_propagation_data(
             "value_new": None,
             "formula": None,
             "indicator_name": ind.name,
+            "unit": ind.unit,
+            "display_value": ind.display_value,
+            "summary_value": str(ind.summary_value) if ind.summary_value is not None else None,
+            "category_str": ind.category,
+            "subcategory": ind.subcategory,
             "symbolSize": _SYMBOL_SIZES[_CAT_INDICATOR],
         })
         node_ids.add(iid)

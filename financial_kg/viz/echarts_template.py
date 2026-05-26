@@ -55,6 +55,19 @@ def render_propagation_html(
     border-radius: 6px; padding: 5px 10px; font-size: 11px; color: #fab387;
     display: none;
   }}
+  #detail-panel {{
+    position: absolute; bottom: 10px; right: 12px; z-index: 20;
+    background: rgba(20,24,36,0.95); border: 1px solid #2a3050;
+    border-radius: 8px; padding: 12px 14px; color: #cdd6f4;
+    font-size: 12px; min-width: 260px; max-width: 320px;
+    display: none; overflow-y: auto; max-height: 360px;
+  }}
+  #detail-panel h4 {{ margin: 0 0 8px; color: #89b4fa; font-size: 13px; border-bottom: 1px solid #2a3050; padding-bottom: 6px; }}
+  .drow {{ display: flex; gap: 6px; margin: 4px 0; }}
+  .dlabel {{ color: #6c7086; min-width: 70px; flex-shrink: 0; }}
+  .dvalue {{ color: #cdd6f4; flex: 1; word-break: break-all; }}
+  .dvalue.changed {{ color: #a6e3a1; }}
+  #detail-close {{ float: right; cursor: pointer; color: #6c7086; font-size: 14px; line-height: 1; }}
 </style>
 </head>
 <body>
@@ -79,6 +92,11 @@ def render_propagation_html(
   </div>
   <div id="stats">节点: 0 | 边: 0</div>
   <div id="warn">&#9888; 图谱已截断</div>
+  <div id="detail-panel">
+    <span id="detail-close">&#x2715;</span>
+    <h4>下游指标详情</h4>
+    <div id="detail-content"></div>
+  </div>
 </div>
 <script src="{echarts_cdn}"></script>
 <script>
@@ -289,6 +307,68 @@ document.getElementById('btn-fs').addEventListener('click', function() {
 });
 document.addEventListener('fullscreenchange', function() {
   setTimeout(function() { chart.resize(); }, 100);
+});
+
+// Detail panel: click on Indicator node
+var selectedNodeId = null;
+chart.on('click', function(params) {
+  if (params.dataType !== 'node') return;
+  var node = params.data;
+  if (!node || node.category !== 3) {
+    document.getElementById('detail-panel').style.display = 'none';
+    selectedNodeId = null;
+    return;
+  }
+  selectedNodeId = node.id;
+
+  // Find direct downstream cells (edges where this node is the target)
+  var downstreamCells = [];
+  allEdges.forEach(function(e) {
+    if (e.target === selectedNodeId) downstreamCells.push(e.source);
+  });
+
+  var html = '<div class="drow"><span class="dlabel">名称</span><span class="dvalue">' + escHtml(node.indicator_name || node.name) + '</span></div>';
+  if (node.unit) html += '<div class="drow"><span class="dlabel">单位</span><span class="dvalue">' + escHtml(node.unit) + '</span></div>';
+  if (node.category_str) html += '<div class="drow"><span class="dlabel">类别</span><span class="dvalue">' + escHtml(node.category_str) + '</span></div>';
+  if (node.subcategory) html += '<div class="drow"><span class="dlabel">子类别</span><span class="dvalue">' + escHtml(node.subcategory) + '</span></div>';
+  if (node.display_value) html += '<div class="drow"><span class="dlabel">数值</span><span class="dvalue changed">' + escHtml(node.display_value) + '</span></div>';
+  if (node.summary_value != null) html += '<div class="drow"><span class="dlabel">汇总值</span><span class="dvalue">' + escHtml(node.summary_value) + '</span></div>';
+  html += '<div class="drow"><span class="dlabel">深度</span><span class="dvalue">' + node.depth + '</span></div>';
+  html += '<div class="drow"><span class="dlabel">表页</span><span class="dvalue">' + escHtml(node.sheet) + '</span></div>';
+
+  if (downstreamCells.length > 0) {
+    html += '<div style="margin-top:8px;font-size:11px;color:#6c7086;">下游单元格 (' + downstreamCells.length + ')：</div>';
+    downstreamCells.slice(0, 6).forEach(function(cid) {
+      var cn = allNodes[nodeIndex[cid]];
+      if (!cn) return;
+      var parts = cn.id.split('_');
+      var lbl = parts.length > 1 ? parts.slice(1).join('_') : cn.id;
+      html += '<div class="drow"><span class="dlabel">' + escHtml(lbl.substring(0, 20)) + '</span>';
+      if (cn.value_old !== null && cn.value_new !== null) {
+        var changed = Math.abs(cn.value_new - cn.value_old) > 1e-9;
+        html += '<span class="dvalue' + (changed ? ' changed' : '') + '">' + escHtml(String(cn.value_new)) + '</span>';
+      } else {
+        html += '<span class="dvalue">' + escHtml(cn.value_new != null ? String(cn.value_new) : '-') + '</span>';
+      }
+      html += '</div>';
+    });
+    if (downstreamCells.length > 6) {
+      html += '<div class="drow"><span class="dlabel">...</span><span class="dvalue">+' + (downstreamCells.length - 6) + ' 更多</span></div>';
+    }
+  }
+
+  document.getElementById('detail-content').innerHTML = html;
+  document.getElementById('detail-panel').style.display = 'block';
+});
+
+function escHtml(s) {
+  if (s == null) return '-';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+document.getElementById('detail-close').addEventListener('click', function() {
+  document.getElementById('detail-panel').style.display = 'none';
+  selectedNodeId = null;
 });
 
 window.addEventListener('resize', function() { chart.resize(); });
