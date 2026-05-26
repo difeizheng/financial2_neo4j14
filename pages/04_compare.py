@@ -535,15 +535,35 @@ with tab_prop:
                         else:
                             sheet_name, addr = None, ref
                         addr = addr.replace("$", "")
-                        xl = win32com.client.Dispatch("Excel.Application")
+                        abs_path = os.path.abspath(_excel_path)
+
+                        # Try to attach to existing Excel instance
+                        xl = None
+                        try:
+                            xl = win32com.client.GetActiveObject("Excel.Application")
+                        except Exception:
+                            pass
+
+                        if xl is None:
+                            xl = win32com.client.Dispatch("Excel.Application")
+
                         xl.Visible = True
+
+                        # Find workbook by full name using index-based iteration
                         wb = None
-                        for b in xl.Workbooks:
-                            if os.path.abspath(b.FullName) == os.path.abspath(_excel_path):
-                                wb = b
-                                break
+                        count = xl.Workbooks.Count
+                        for i in range(1, count + 1):
+                            try:
+                                b = xl.Workbooks(i)
+                                if os.path.abspath(b.FullName) == abs_path:
+                                    wb = b
+                                    break
+                            except Exception:
+                                continue
+
                         if wb is None:
-                            wb = xl.Workbooks.Open(os.path.abspath(_excel_path))
+                            wb = xl.Workbooks.Open(abs_path)
+
                         if sheet_name:
                             try:
                                 ws = wb.Sheets(sheet_name)
