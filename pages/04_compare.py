@@ -561,15 +561,25 @@ with tab_prop:
                         addr = addr.replace("$", "")
                         abs_path = os.path.abspath(_excel_path)
 
-                        # Try to attach to existing Excel instance
+                        # Try WPS first, then Office Excel
                         xl = None
-                        try:
-                            xl = win32com.client.GetActiveObject("Excel.Application")
-                        except Exception:
-                            pass
+                        for prog_id in ["ket.Application", "Excel.Application"]:
+                            try:
+                                xl = win32com.client.GetActiveObject(prog_id)
+                                break
+                            except Exception:
+                                pass
 
                         if xl is None:
-                            xl = win32com.client.Dispatch("Excel.Application")
+                            for prog_id in ["ket.Application", "Excel.Application"]:
+                                try:
+                                    xl = win32com.client.Dispatch(prog_id)
+                                    break
+                                except Exception:
+                                    continue
+
+                        if xl is None:
+                            raise RuntimeError("未找到 WPS 或 Office Excel")
 
                         xl.Visible = True
 
