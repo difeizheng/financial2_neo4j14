@@ -463,6 +463,128 @@ with tab_detail:
         if search_kw or selected_sheets:
             st.caption(f"筛选结果：{len(rows)} / {len(diff.changed_cells)} 条")
 
+        # ── Excel locate from detail list ──
+        st.divider()
+        detail_loc_cols = st.columns([4, 1, 1])
+        with detail_loc_cols[0]:
+            detail_cell_options = {
+                f"{c['id']}  ({c['sheet']})  {c['old']} → {c['new']}": c["id"]
+                for c in filtered[:500]
+            }
+            detail_selected = st.selectbox("选择要校验的单元格", list(detail_cell_options.keys()), key="detail_excel_select")
+        with detail_loc_cols[1]:
+            _detail_locate_btn = st.button("在 Excel 中定位", key="detail_excel_locate_btn", use_container_width=True)
+        with detail_loc_cols[2]:
+            if _detail_locate_btn and detail_selected and detail_selected in detail_cell_options:
+                _detail_cid = detail_cell_options[detail_selected]
+                _cell = graph.cells.get(_detail_cid)
+                _sheet_name = _cell.sheet if _cell else None
+                _col = _cell.col if _cell else None
+                _row = _cell.row if _cell else None
+                if _col and _row:
+                    _detail_ref = f"{_sheet_name}!{_col}{_row}"
+                else:
+                    _detail_ref = _detail_cid
+                st.session_state["detail_locate_ref"] = _detail_ref
+
+        # Execute locate if session state set
+        if st.session_state.get("detail_locate_ref"):
+            _d_ref = st.session_state["detail_locate_ref"]
+            st.session_state["detail_locate_ref"] = None  # consume once
+
+            _d_rec_path = st.session_state.get("recalc_excel_path")
+            _d_orig_path = find_original_excel(task.id, task.output_dir)
+            _d_excel_path = None
+
+            if _d_rec_path and os.path.exists(_d_rec_path):
+                _d_excel_path = _d_rec_path
+            elif _d_orig_path and os.path.exists(_d_orig_path):
+                _d_excel_path = _d_orig_path
+
+            if _d_excel_path:
+                try:
+                    import win32com.client
+                    import pythoncom
+                    pythoncom.CoInitialize()
+                    try:
+                        ref = _d_ref.strip()
+                        if "!" in ref:
+                            d_sheet, d_addr = ref.split("!", 1)
+                        else:
+                            d_sheet, d_addr = None, ref
+                        d_addr = d_addr.replace("$", "")
+                        d_abs = os.path.abspath(_d_excel_path)
+
+                        xl = None
+                        for prog_id in ["ket.Application", "Excel.Application"]:
+                            try:
+                                xl = win32com.client.GetActiveObject(prog_id)
+                                break
+                            except Exception:
+                                pass
+                        if xl is None:
+                            for prog_id in ["ket.Application", "Excel.Application"]:
+                                try:
+                                    xl = win32com.client.Dispatch(prog_id)
+                                    break
+                                except Exception:
+                                    continue
+                        if xl is None:
+                            raise RuntimeError("未找到 WPS 或 Office Excel")
+
+                        xl.Visible = True
+                        xl.Iteration = True
+                        xl.MaxIterations = 1000
+                        xl.MaxChange = 1e-6
+
+                        wb = None
+                        count = xl.Workbooks.Count
+                        for i in range(1, count + 1):
+                            try:
+                                b = xl.Workbooks(i)
+                                if os.path.abspath(b.FullName) == d_abs:
+                                    wb = b
+                                    break
+                            except Exception:
+                                continue
+                        if wb is None:
+                            wb = xl.Workbooks.Open(d_abs)
+
+                        try:
+                            wb.EnableIteration = True
+                        except Exception:
+                            pass
+                        try:
+                            wb.RefreshAll()
+                            wb.Calculate()
+                        except Exception:
+                            pass
+
+                        if d_sheet:
+                            try:
+                                ws = wb.Sheets(d_sheet)
+                            except Exception:
+                                ws = wb.ActiveSheet
+                        else:
+                            ws = wb.ActiveSheet
+                        ws.Activate()
+                        try:
+                            rng = ws.Range(d_addr)
+                            rng.Select()
+                            rng.Interior.Color = 0xFFFF00
+                            rng.Font.Bold = True
+                            st.success(f"已定位到 {_d_ref}")
+                        except Exception:
+                            st.warning(f"无法定位到 {d_addr}，已打开文件")
+                    finally:
+                        pythoncom.CoUninitialize()
+                except ImportError:
+                    st.error("需要安装 pywin32：pip install pywin32")
+                except Exception as e:
+                    st.error(f"打开 Excel 失败：{e}")
+            else:
+                st.caption("未找到 Excel 文件")
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Tab 4: Propagation graph
 # ══════════════════════════════════════════════════════════════════════════════
@@ -582,10 +704,6 @@ with tab_prop:
                             raise RuntimeError("未找到 WPS 或 Office Excel")
 
                         xl.Visible = True
-                        # Enable iterative calculation for circular references
-                        xl.Iteration = True
-                        xl.MaxIterations = 1000
-                        xl.MaxChange = 1e-6
 
                         # Find workbook by full name using index-based iteration
                         wb = None
@@ -601,6 +719,26 @@ with tab_prop:
 
                         if wb is None:
                             wb = xl.Workbooks.Open(abs_path)
+
+                        # Enable iterative calculation (set AFTER workbook open for WPS compatibility)
+                        try:
+                            # App-level (Office Excel)
+                            xl.Iteration = True
+                            xl.MaxIterations = 1000
+                            xl.MaxChange = 1e-6
+                        except Exception:
+                            pass
+                        try:
+                            # Workbook-level (WPS)
+                            wb.EnableIteration = True
+                        except Exception:
+                            pass
+                        # Recalculate to resolve circular refs
+                        try:
+                            wb.RefreshAll()
+                            wb.Calculate()
+                        except Exception:
+                            pass
 
                         if sheet_name:
                             try:
