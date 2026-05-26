@@ -494,8 +494,8 @@ with tab_detail:
         </table>
         <script>
         function locRef(ref) {{
-          var input = window.parent.document.querySelector('input[aria-label="Excel 定位引用"]');
-          if (!input) input = window.parent.document.querySelector('input[placeholder*="Excel定位"]');
+          var input = document.querySelector('input[aria-label="Excel 定位引用"]');
+          if (!input) input = document.querySelector('input[placeholder*="Excel定位"]');
           if (input) {{
             var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
             nativeInputValueSetter.call(input, ref);
@@ -505,7 +505,7 @@ with tab_detail:
         }}
         </script>
         """
-        components.html(table_html, height=600, scrolling=True)
+        st.markdown(table_html, unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Tab 4: Propagation graph
