@@ -526,35 +526,40 @@ with tab_prop:
             if st.button("在 Excel 中定位", key="prop_excel_locate_btn", disabled=not _loc_ref):
                 try:
                     import win32com.client
-                    ref = _loc_ref.strip()
-                    if "!" in ref:
-                        sheet_name, addr = ref.split("!", 1)
-                    else:
-                        sheet_name, addr = None, ref
-                    addr = addr.replace("$", "")
-                    xl = win32com.client.Dispatch("Excel.Application")
-                    xl.Visible = True
-                    wb = None
-                    for b in xl.Workbooks:
-                        if os.path.abspath(b.FullName) == os.path.abspath(_excel_path):
-                            wb = b
-                            break
-                    if wb is None:
-                        wb = xl.Workbooks.Open(os.path.abspath(_excel_path))
-                    if sheet_name:
-                        try:
-                            ws = wb.Sheets(sheet_name)
-                        except Exception:
-                            st.warning(f"未找到工作表「{sheet_name}」，已打开文件但无法定位")
-                            ws = wb.ActiveSheet
-                    else:
-                        ws = wb.ActiveSheet
-                    ws.Activate()
+                    import pythoncom
+                    pythoncom.CoInitialize()
                     try:
-                        ws.Range(addr).Select()
-                        st.success(f"已定位到 {ref}")
-                    except Exception:
-                        st.warning(f"无法定位到 {addr}，已打开文件并激活工作表")
+                        ref = _loc_ref.strip()
+                        if "!" in ref:
+                            sheet_name, addr = ref.split("!", 1)
+                        else:
+                            sheet_name, addr = None, ref
+                        addr = addr.replace("$", "")
+                        xl = win32com.client.Dispatch("Excel.Application")
+                        xl.Visible = True
+                        wb = None
+                        for b in xl.Workbooks:
+                            if os.path.abspath(b.FullName) == os.path.abspath(_excel_path):
+                                wb = b
+                                break
+                        if wb is None:
+                            wb = xl.Workbooks.Open(os.path.abspath(_excel_path))
+                        if sheet_name:
+                            try:
+                                ws = wb.Sheets(sheet_name)
+                            except Exception:
+                                st.warning(f"未找到工作表「{sheet_name}」，已打开文件但无法定位")
+                                ws = wb.ActiveSheet
+                        else:
+                            ws = wb.ActiveSheet
+                        ws.Activate()
+                        try:
+                            ws.Range(addr).Select()
+                            st.success(f"已定位到 {ref}")
+                        except Exception:
+                            st.warning(f"无法定位到 {addr}，已打开文件并激活工作表")
+                    finally:
+                        pythoncom.CoUninitialize()
                 except ImportError:
                     st.error("需要安装 pywin32：pip install pywin32")
                 except Exception as e:
