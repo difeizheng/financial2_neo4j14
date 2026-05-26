@@ -84,6 +84,12 @@ def build_propagation_data(
             cat = _CAT_DOWNSTREAM
 
         old_v, new_v = old_new.get(cid, (None, None))
+        # Downstream cells not in diff: fill current value so nodes aren't blank
+        if old_v is None and new_v is None and cell and cell.value is not None:
+            cv = cell.value
+            if isinstance(cv, (int, float)):
+                old_v = cv
+                new_v = cv
         ind_name = None
         if cell and cell.indicator_id:
             ind = graph.indicators.get(cell.indicator_id)

@@ -57,17 +57,30 @@ def render_propagation_html(
   }}
   #detail-panel {{
     position: absolute; bottom: 10px; right: 12px; z-index: 20;
-    background: rgba(20,24,36,0.95); border: 1px solid #2a3050;
+    background: rgba(20,24,36,0.96); border: 1px solid #2a3050;
     border-radius: 8px; padding: 12px 14px; color: #cdd6f4;
-    font-size: 12px; min-width: 260px; max-width: 320px;
-    display: none; overflow-y: auto; max-height: 360px;
+    font-size: 12px; min-width: 280px; max-width: 370px;
+    display: none; overflow-y: auto; max-height: 520px;
   }}
   #detail-panel h4 {{ margin: 0 0 8px; color: #89b4fa; font-size: 13px; border-bottom: 1px solid #2a3050; padding-bottom: 6px; }}
-  .drow {{ display: flex; gap: 6px; margin: 4px 0; }}
+  .drow {{ display: flex; gap: 6px; margin: 3px 0; }}
   .dlabel {{ color: #6c7086; min-width: 70px; flex-shrink: 0; }}
   .dvalue {{ color: #cdd6f4; flex: 1; word-break: break-all; }}
   .dvalue.changed {{ color: #a6e3a1; }}
+  .dvalue.negative {{ color: #f38ba8; }}
   #detail-close {{ float: right; cursor: pointer; color: #6c7086; font-size: 14px; line-height: 1; }}
+  #breadcrumb {{ margin: 0 0 8px; font-size: 10px; color: #6c7086; line-height: 1.7; word-break: break-all; }}
+  #breadcrumb .bp {{ color: #89b4fa; cursor: pointer; }}
+  #breadcrumb .bp:hover {{ text-decoration: underline; }}
+  #breadcrumb .bp.current {{ color: #f9e2af; cursor: default; font-weight: 600; }}
+  #breadcrumb .sep {{ color: #45475a; margin: 0 2px; }}
+  .badge {{ display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; margin-right: 4px; vertical-align: middle; }}
+  .badge-root {{ background: #EF5350; color: #fff; }}
+  .badge-changed {{ background: #FFA726; color: #1e1e2e; }}
+  .badge-downstream {{ background: #78909C; color: #fff; }}
+  .badge-indicator {{ background: #42A5F5; color: #fff; }}
+  .section-title {{ font-size: 11px; color: #6c7086; margin: 8px 0 4px; border-top: 1px solid #2a3050; padding-top: 6px; }}
+  .change-arrow {{ color: #6c7086; margin: 0 4px; }}
 </style>
 </head>
 <body>
@@ -94,7 +107,8 @@ def render_propagation_html(
   <div id="warn">&#9888; 图谱已截断</div>
   <div id="detail-panel">
     <span id="detail-close">&#x2715;</span>
-    <h4>下游指标详情</h4>
+    <h4 id="detail-title">节点详情</h4>
+    <div id="breadcrumb"></div>
     <div id="detail-content"></div>
   </div>
 </div>
@@ -123,10 +137,86 @@ var displayDepth = 20;
 var nodeIndex = {};
 allNodes.forEach(function(n, i) { nodeIndex[n.id] = i; });
 
+// ── Drill-down state ──
+var drillState = {
+  selectedId: null,
+  pathNodes: new Set(),
+  neighborNodes: new Set(),
+  pathEdges: new Set(),
+  path: [],
+};
+
+function findShortestPath(startId, endId) {
+  if (startId === endId) return {path: [startId], edges: []};
+  var adj = {};
+  allEdges.forEach(function(e) {
+    if (!adj[e.source]) adj[e.source] = [];
+    adj[e.source].push({to: e.target, key: e.source + '->' + e.target});
+  });
+  var visited = {};
+  var parent = {};
+  var parentEdge = {};
+  var queue = [startId];
+  visited[startId] = true;
+  while (queue.length > 0) {
+    var curr = queue.shift();
+    var nbrs = adj[curr] || [];
+    for (var i = 0; i < nbrs.length; i++) {
+      var next = nbrs[i].to;
+      if (!visited[next]) {
+        visited[next] = true;
+        parent[next] = curr;
+        parentEdge[next] = nbrs[i].key;
+        if (next === endId) {
+          var p = [endId], es = [parentEdge[endId]], c = endId;
+          while (parent[c]) { c = parent[c]; p.unshift(c); if (parent[c]) es.unshift(parentEdge[c]); }
+          return {path: p, edges: es};
+        }
+        queue.push(next);
+      }
+    }
+  }
+  return null;
+}
+
+function getNeighborIds(nodeId) {
+  var nb = new Set();
+  allEdges.forEach(function(e) {
+    if (e.source === nodeId) nb.add(e.target);
+    if (e.target === nodeId) nb.add(e.source);
+  });
+  nb.delete(nodeId);
+  return nb;
+}
+
 function buildDisplayNodes(litSet, depthLimit) {
   return allNodes.map(function(n) {
     var hidden = n.depth > depthLimit;
     var isLit = litSet.has(n.id) || n.id === rootId;
+    if (drillState.selectedId && !hidden) {
+      var isSel = n.id === drillState.selectedId;
+      var isPath = drillState.pathNodes.has(n.id);
+      var isNb = drillState.neighborNodes.has(n.id);
+      var opacity, size, showLabel, bc, bw;
+      if (isSel) {
+        opacity = 1; size = Math.max(n.symbolSize * 1.5, 22); showLabel = true;
+        bc = '#f9e2af'; bw = 3;
+      } else if (isPath) {
+        opacity = 1; size = n.symbolSize * 1.2; showLabel = true;
+        bc = '#a6e3a1'; bw = 2;
+      } else if (isNb) {
+        opacity = 0.45; size = n.symbolSize; showLabel = false;
+        bc = undefined; bw = 0;
+      } else {
+        opacity = 0.06; size = 3; showLabel = false;
+        bc = undefined; bw = 0;
+      }
+      return Object.assign({}, n, {
+        symbolSize: size,
+        itemStyle: {opacity: opacity, borderColor: bc, borderWidth: bw},
+        label: {show: showLabel},
+      });
+    }
     return Object.assign({}, n, {
       symbolSize: hidden ? 0 : (isLit ? n.symbolSize : 4),
       itemStyle: {
@@ -145,6 +235,23 @@ function buildDisplayEdges(litSet, depthLimit) {
     var srcDepth = srcNode ? srcNode.depth : 0;
     var tgtDepth = tgtNode ? tgtNode.depth : 0;
     var hidden = srcDepth > depthLimit || tgtDepth > depthLimit;
+    if (drillState.selectedId && !hidden) {
+      var ek = e.source + '->' + e.target;
+      var isPE = drillState.pathEdges.has(ek);
+      var touchSel = e.source === drillState.selectedId || e.target === drillState.selectedId;
+      var bothPath = drillState.pathNodes.has(e.source) && drillState.pathNodes.has(e.target);
+      var op, w, c;
+      if (isPE) {
+        op = 1; w = 3; c = '#a6e3a1';
+      } else if (touchSel) {
+        op = 0.35; w = 1; c = undefined;
+      } else if (bothPath) {
+        op = 0.25; w = 1; c = undefined;
+      } else {
+        op = 0.03; w = 0.4; c = undefined;
+      }
+      return Object.assign({}, e, {lineStyle: {opacity: op, width: w, color: c}});
+    }
     var isLit = litSet.has(e.target) || e.target === rootId;
     return Object.assign({}, e, {
       lineStyle: {
@@ -267,6 +374,12 @@ document.getElementById('btn-reset').addEventListener('click', function() {
   document.getElementById('btn-play').innerHTML = '&#9654; 播放';
   currentAnimDepth = 0;
   litNodes = new Set([rootId]);
+  drillState.selectedId = null;
+  drillState.pathNodes = new Set();
+  drillState.neighborNodes = new Set();
+  drillState.pathEdges = new Set();
+  drillState.path = [];
+  document.getElementById('detail-panel').style.display = 'none';
   chart.setOption({
     series: [{
       data: buildDisplayNodes(litNodes, displayDepth),
@@ -309,66 +422,225 @@ document.addEventListener('fullscreenchange', function() {
   setTimeout(function() { chart.resize(); }, 100);
 });
 
-// Detail panel: click on Indicator node
-var selectedNodeId = null;
-chart.on('click', function(params) {
-  if (params.dataType !== 'node') return;
-  var node = params.data;
-  if (!node || node.category !== 3) {
-    document.getElementById('detail-panel').style.display = 'none';
-    selectedNodeId = null;
-    return;
-  }
-  selectedNodeId = node.id;
-
-  // Find direct downstream cells (edges where this node is the target)
-  var downstreamCells = [];
-  allEdges.forEach(function(e) {
-    if (e.target === selectedNodeId) downstreamCells.push(e.source);
+// ── Drill-down: click on ANY node ──
+function clearDrillDown() {
+  drillState.selectedId = null;
+  drillState.pathNodes = new Set();
+  drillState.neighborNodes = new Set();
+  drillState.pathEdges = new Set();
+  drillState.path = [];
+  document.getElementById('detail-panel').style.display = 'none';
+  chart.setOption({
+    series: [{
+      data: buildDisplayNodes(litNodes, displayDepth),
+      links: buildDisplayEdges(litNodes, displayDepth),
+    }],
   });
-
-  var html = '<div class="drow"><span class="dlabel">名称</span><span class="dvalue">' + escHtml(node.indicator_name || node.name) + '</span></div>';
-  if (node.unit) html += '<div class="drow"><span class="dlabel">单位</span><span class="dvalue">' + escHtml(node.unit) + '</span></div>';
-  if (node.category_str) html += '<div class="drow"><span class="dlabel">类别</span><span class="dvalue">' + escHtml(node.category_str) + '</span></div>';
-  if (node.subcategory) html += '<div class="drow"><span class="dlabel">子类别</span><span class="dvalue">' + escHtml(node.subcategory) + '</span></div>';
-  if (node.display_value) html += '<div class="drow"><span class="dlabel">数值</span><span class="dvalue changed">' + escHtml(node.display_value) + '</span></div>';
-  if (node.summary_value != null) html += '<div class="drow"><span class="dlabel">汇总值</span><span class="dvalue">' + escHtml(node.summary_value) + '</span></div>';
-  html += '<div class="drow"><span class="dlabel">深度</span><span class="dvalue">' + node.depth + '</span></div>';
-  html += '<div class="drow"><span class="dlabel">表页</span><span class="dvalue">' + escHtml(node.sheet) + '</span></div>';
-
-  if (downstreamCells.length > 0) {
-    html += '<div style="margin-top:8px;font-size:11px;color:#6c7086;">下游单元格 (' + downstreamCells.length + ')：</div>';
-    downstreamCells.slice(0, 6).forEach(function(cid) {
-      var cn = allNodes[nodeIndex[cid]];
-      if (!cn) return;
-      var parts = cn.id.split('_');
-      var lbl = parts.length > 1 ? parts.slice(1).join('_') : cn.id;
-      html += '<div class="drow"><span class="dlabel">' + escHtml(lbl.substring(0, 20)) + '</span>';
-      if (cn.value_old !== null && cn.value_new !== null) {
-        var changed = Math.abs(cn.value_new - cn.value_old) > 1e-9;
-        html += '<span class="dvalue' + (changed ? ' changed' : '') + '">' + escHtml(String(cn.value_new)) + '</span>';
-      } else {
-        html += '<span class="dvalue">' + escHtml(cn.value_new != null ? String(cn.value_new) : '-') + '</span>';
-      }
-      html += '</div>';
-    });
-    if (downstreamCells.length > 6) {
-      html += '<div class="drow"><span class="dlabel">...</span><span class="dvalue">+' + (downstreamCells.length - 6) + ' 更多</span></div>';
-    }
-  }
-
-  document.getElementById('detail-content').innerHTML = html;
-  document.getElementById('detail-panel').style.display = 'block';
-});
+}
 
 function escHtml(s) {
   if (s == null) return '-';
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
+function shortLabel(id) {
+  var parts = id.split('_');
+  return parts.length > 1 ? parts.slice(1).join('_') : id;
+}
+
+function formatVal(v) {
+  if (v == null) return '-';
+  var n = Number(v);
+  if (isNaN(n)) return String(v);
+  if (Math.abs(n) < 0.005 && n !== 0) return n.toExponential(2);
+  if (Math.abs(n) >= 1e6) return n.toLocaleString('zh-CN', {maximumFractionDigits: 0});
+  return n.toLocaleString('zh-CN', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+}
+
+function drillInto(nodeId) {
+  var node = allNodes[nodeIndex[nodeId]];
+  if (!node) return;
+
+  drillState.selectedId = nodeId;
+  drillState.path = [];
+  drillState.pathNodes = new Set();
+  drillState.pathEdges = new Set();
+  drillState.neighborNodes = getNeighborIds(nodeId);
+
+  var result = findShortestPath(rootId, nodeId);
+  if (result) {
+    drillState.path = result.path;
+    result.path.forEach(function(id) { drillState.pathNodes.add(id); });
+    result.edges.forEach(function(ek) { drillState.pathEdges.add(ek); });
+  } else {
+    drillState.path = [nodeId];
+    drillState.pathNodes.add(nodeId);
+  }
+
+  // Re-render with highlighting
+  chart.setOption({
+    series: [{
+      data: buildDisplayNodes(litNodes, displayDepth),
+      links: buildDisplayEdges(litNodes, displayDepth),
+    }],
+  });
+
+  // Build breadcrumb
+  var bcHtml = '';
+  drillState.path.forEach(function(pid, idx) {
+    var pn = allNodes[nodeIndex[pid]];
+    var lbl = pn ? (pn.indicator_name ? pn.indicator_name.substring(0, 12) : shortLabel(pid)) : shortLabel(pid);
+    if (idx > 0) bcHtml += '<span class="sep">→</span>';
+    if (pid === nodeId) {
+      bcHtml += '<span class="bp current">' + escHtml(lbl) + '</span>';
+    } else {
+      bcHtml += '<span class="bp" data-nid="' + escHtml(pid) + '">' + escHtml(lbl) + '</span>';
+    }
+  });
+  document.getElementById('breadcrumb').innerHTML = bcHtml;
+
+  // Make breadcrumb items clickable
+  document.querySelectorAll('#breadcrumb .bp:not(.current)').forEach(function(el) {
+    el.addEventListener('click', function() {
+      drillInto(el.getAttribute('data-nid'));
+    });
+  });
+
+  // Build detail content based on node type
+  var catNames = ['起点', '直接变化', '下游传播', '指标'];
+  var catBadges = ['badge-root', 'badge-changed', 'badge-downstream', 'badge-indicator'];
+  var html = '';
+
+  // Title badge
+  document.getElementById('detail-title').innerHTML =
+    '<span class="badge ' + catBadges[node.category] + '">' + catNames[node.category] + '</span> ' +
+    (node.category === 3 ? escHtml(node.indicator_name || node.name) : escHtml(shortLabel(node.id)));
+
+  if (node.category === 3) {
+    // ── Indicator node ──
+    html += detailRow('名称', escHtml(node.indicator_name || node.name));
+    if (node.unit) html += detailRow('单位', escHtml(node.unit));
+    if (node.category_str) html += detailRow('类别', escHtml(node.category_str));
+    if (node.subcategory) html += detailRow('子类别', escHtml(node.subcategory));
+    if (node.display_value) html += detailRow('当前值', '<span class="dvalue changed">' + escHtml(node.display_value) + '</span>');
+    if (node.summary_value != null) html += detailRow('汇总值', escHtml(node.summary_value));
+    html += detailRow('表页', escHtml(node.sheet));
+    html += detailRow('传播深度', String(node.depth));
+
+    // Connected cells
+    var upCells = [], downCells = [];
+    allEdges.forEach(function(e) {
+      if (e.target === nodeId && nodeIndex[e.source] !== undefined) upCells.push(e.source);
+      if (e.source === nodeId && nodeIndex[e.target] !== undefined) downCells.push(e.target);
+    });
+    if (upCells.length > 0) {
+      html += '<div class="section-title">上游单元格 (' + upCells.length + ')</div>';
+      html += buildCellList(upCells, 8);
+    }
+    if (downCells.length > 0) {
+      html += '<div class="section-title">下游影响 (' + downCells.length + ')</div>';
+      html += buildCellList(downCells, 8);
+    }
+
+  } else {
+    // ── Cell node (root / changed / downstream) ──
+    html += detailRow('Cell ID', escHtml(node.id));
+    html += detailRow('表页', escHtml(node.sheet));
+    html += detailRow('传播深度', String(node.depth));
+
+    // Value change
+    if (node.value_old != null || node.value_new != null) {
+      html += '<div class="section-title">数值变化</div>';
+      var oldV = node.value_old, newV = node.value_new;
+      html += detailRow('旧值', formatVal(oldV));
+      html += detailRow('新值', '<span class="dvalue changed">' + formatVal(newV) + '</span>');
+      if (oldV != null && newV != null) {
+        var diff = Number(newV) - Number(oldV);
+        var pct = Number(oldV) !== 0 ? (diff / Math.abs(Number(oldV)) * 100) : null;
+        var cls = diff > 0 ? 'changed' : (diff < 0 ? 'negative' : '');
+        html += detailRow('变化量', '<span class="dvalue ' + cls + '">' + (diff >= 0 ? '+' : '') + formatVal(diff) + '</span>');
+        if (pct != null && isFinite(pct)) {
+          html += detailRow('变化率', '<span class="dvalue ' + cls + '">' + (pct >= 0 ? '+' : '') + pct.toFixed(1) + '%</span>');
+        }
+      }
+    }
+
+    // Formula
+    if (node.formula) {
+      html += '<div class="section-title">公式</div>';
+      html += '<div style="font-size:11px;color:#a6adc8;word-break:break-all;margin:2px 0;">' + escHtml(node.formula) + '</div>';
+    }
+
+    // Indicator
+    if (node.indicator_name) {
+      html += '<div class="section-title">所属指标</div>';
+      html += detailRow('指标名', escHtml(node.indicator_name));
+    }
+
+    // Neighbors
+    var upstream = [], downstream = [];
+    allEdges.forEach(function(e) {
+      if (e.target === nodeId && nodeIndex[e.source] !== undefined) upstream.push(e.source);
+      if (e.source === nodeId && nodeIndex[e.target] !== undefined) downstream.push(e.target);
+    });
+    if (upstream.length > 0) {
+      html += '<div class="section-title">上游依赖 (' + upstream.length + ')</div>';
+      html += buildCellList(upstream, 6);
+    }
+    if (downstream.length > 0) {
+      html += '<div class="section-title">下游影响 (' + downstream.length + ')</div>';
+      html += buildCellList(downstream, 6);
+    }
+  }
+
+  document.getElementById('detail-content').innerHTML = html;
+  document.getElementById('detail-panel').style.display = 'block';
+}
+
+function detailRow(label, valueHtml) {
+  return '<div class="drow"><span class="dlabel">' + label + '</span><span class="dvalue">' + valueHtml + '</span></div>';
+}
+
+function buildCellList(cellIds, max) {
+  var h = '';
+  cellIds.slice(0, max).forEach(function(cid) {
+    var cn = allNodes[nodeIndex[cid]];
+    if (!cn) return;
+    var lbl = shortLabel(cid);
+    h += '<div class="drow" style="cursor:pointer" data-nid="' + escHtml(cid) + '">';
+    h += '<span class="dlabel" style="min-width:50px">' + escHtml(lbl.substring(0, 18)) + '</span>';
+    if (cn.value_old != null && cn.value_new != null) {
+      var ch = Math.abs(Number(cn.value_new) - Number(cn.value_old)) > 1e-9;
+      h += '<span class="dvalue' + (ch ? ' changed' : '') + '">' + formatVal(cn.value_new) + '</span>';
+    } else {
+      h += '<span class="dvalue">' + formatVal(cn.value_new) + '</span>';
+    }
+    h += '</div>';
+  });
+  if (cellIds.length > max) {
+    h += '<div class="drow"><span class="dlabel">...</span><span class="dvalue">+' + (cellIds.length - max) + ' 更多</span></div>';
+  }
+  return h;
+}
+
+chart.on('click', function(params) {
+  if (params.dataType !== 'node') {
+    clearDrillDown();
+    return;
+  }
+  var node = params.data;
+  if (!node) { clearDrillDown(); return; }
+  drillInto(node.id);
+});
+
+// Make cell list items clickable (event delegation)
+document.getElementById('detail-content').addEventListener('click', function(ev) {
+  var row = ev.target.closest('.drow[data-nid]');
+  if (row) drillInto(row.getAttribute('data-nid'));
+});
+
 document.getElementById('detail-close').addEventListener('click', function() {
-  document.getElementById('detail-panel').style.display = 'none';
-  selectedNodeId = null;
+  clearDrillDown();
 });
 
 window.addEventListener('resize', function() { chart.resize(); });
