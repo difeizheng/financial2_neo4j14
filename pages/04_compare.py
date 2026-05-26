@@ -574,8 +574,12 @@ with tab_prop:
                             ws = wb.ActiveSheet
                         ws.Activate()
                         try:
-                            ws.Range(addr).Select()
-                            st.success(f"已定位到 {ref}")
+                            rng = ws.Range(addr)
+                            rng.Select()
+                            # Highlight for visibility in large sheets
+                            rng.Interior.Color = 0xFFFF00  # yellow
+                            rng.Font.Bold = True
+                            st.success(f"已定位到 {ref}，已标记黄色高亮（Ctrl+Z 撤销）")
                         except Exception:
                             st.warning(f"无法定位到 {addr}，已打开文件并激活工作表")
                     finally:
