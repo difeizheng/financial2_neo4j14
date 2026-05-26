@@ -139,48 +139,53 @@ if st.button("执行对比", type="primary", use_container_width=True):
     st.session_state["recalc_excel_path"] = recalc_excel_path
     st.session_state.pop("prop_html", None)
 
-# ── Show diff results ─────────────────────────────────────────────────────────
-diff = st.session_state.get("diff")
-_has_diff = diff is not None and st.session_state.get("diff_task_id") == task.id
+# ══════════════════════════════════════════════════════════════════════════════
+# Fragment: tab area — isolated rerun so tab state survives widget interactions
+# ══════════════════════════════════════════════════════════════════════════════
 
-snap_a_name = st.session_state.get("snap_a_name", "A")
-snap_b_name = st.session_state.get("snap_b_name", "B")
-snap_b_values = st.session_state.get("snap_b_values", {})
-snap_a_values = st.session_state.get("snap_a_values", {})
+@st.fragment
+def _render_compare_tabs(graph, task_id: str, task_output_dir: str, task_filename: str):
+    diff = st.session_state.get("diff")
+    _has_diff = diff is not None and st.session_state.get("diff_task_id") == task_id
 
-# ── Excel target file choice (used by both detail & propagation tabs) ──
-if _has_diff:
-    _orig_path = find_original_excel(task.id, task.output_dir)
-    _recalc_path = st.session_state.get("recalc_excel_path")
-    _target_opts = {}
-    if _orig_path and os.path.exists(_orig_path):
-        _target_opts["原始文件"] = _orig_path
-    if _recalc_path and os.path.exists(_recalc_path):
-        _target_opts[f"场景文件（{snap_b_name}）"] = _recalc_path
+    snap_a_name = st.session_state.get("snap_a_name", "A")
+    snap_b_name = st.session_state.get("snap_b_name", "B")
+    snap_b_values = st.session_state.get("snap_b_values", {})
+    snap_a_values = st.session_state.get("snap_a_values", {})
 
-    if len(_target_opts) > 1:
-        _target_label = st.radio(
-            "Excel 定位目标", list(_target_opts.keys()), horizontal=True, key="excel_target",
-        )
-        st.session_state["excel_locate_path"] = _target_opts[_target_label]
-    elif len(_target_opts) == 1:
-        st.session_state["excel_locate_path"] = list(_target_opts.values())[0]
-    else:
-        st.session_state.pop("excel_locate_path", None)
+    # ── Excel target file choice ──
+    if _has_diff:
+        _orig_path = find_original_excel(task_id, task_output_dir)
+        _recalc_path = st.session_state.get("recalc_excel_path")
+        _target_opts = {}
+        if _orig_path and os.path.exists(_orig_path):
+            _target_opts["原始文件"] = _orig_path
+        if _recalc_path and os.path.exists(_recalc_path):
+            _target_opts[f"场景文件（{snap_b_name}）"] = _recalc_path
 
-# ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_metrics, tab_matrix, tab_detail, tab_prop, tab_export = st.tabs([
-    "关键指标对比",
-    "变化矩阵",
-    "变化明细",
-    "传播图",
-    "导出",
-])
+        if len(_target_opts) > 1:
+            _target_label = st.radio(
+                "Excel 定位目标", list(_target_opts.keys()), horizontal=True, key="excel_target",
+            )
+            st.session_state["excel_locate_path"] = _target_opts[_target_label]
+        elif len(_target_opts) == 1:
+            st.session_state["excel_locate_path"] = list(_target_opts.values())[0]
+        else:
+            st.session_state.pop("excel_locate_path", None)
 
-if not _has_diff:
-    with tab_metrics:
-        st.info("选择两个快照后点击「执行对比」显示差异")
-    st.stop()
+    # ── Tabs ──────────────────────────────────────────────────────────────────
+    tab_metrics, tab_matrix, tab_detail, tab_prop, tab_export = st.tabs([
+        "关键指标对比",
+        "变化矩阵",
+        "变化明细",
+        "传播图",
+        "导出",
+    ])
+
+    if not _has_diff:
+        with tab_metrics:
+            st.info("选择两个快照后点击「执行对比」显示差异")
+        return
 
 # ── Helper: Excel locate via win32com ──────────────────────────────────────────
 
@@ -640,83 +645,81 @@ with tab_detail:
 with tab_prop:
     if not diff.changed_cells:
         st.info("无变化单元格，无法生成传播图")
-        st.stop()
-
-    # Default: show top 5 cells by magnitude
-    sorted_by_mag = sorted(diff.changed_cells, key=lambda c: c.get("change_magnitude", 0), reverse=True)
-    top5 = sorted_by_mag[:5]
-
-    st.caption("默认显示变化最大的 5 个单元格作为传播起点，也可搜索自定义起点")
-
-    # Quick picks
-    quick_cells = st.columns(min(len(top5), 5))
-    for i, c in enumerate(top5):
-        with quick_cells[i]:
-            cid_short = c["id"][:20] + ("…" if len(c["id"]) > 20 else "")
-            mag = c.get("change_magnitude", 0)
-            if st.button(f"{cid_short}\nΔ={mag:.2f}", use_container_width=True, key=f"qc_{c['id']}"):
-                st.session_state["prop_root"] = c["id"]
-
-    # Search
-    cell_search = st.text_input("搜索传播起点", placeholder="输入 Cell ID、Sheet 名或值...", label_visibility="collapsed")
-    if cell_search:
-        kw = cell_search.lower()
-        candidates = [
-            c for c in diff.changed_cells
-            if kw in c["id"].lower()
-            or kw in c.get("sheet", "").lower()
-            or kw in str(c.get("old", "")).lower()
-            or kw in str(c.get("new", "")).lower()
-        ]
     else:
-        candidates = diff.changed_cells
+        sorted_by_mag = sorted(diff.changed_cells, key=lambda c: c.get("change_magnitude", 0), reverse=True)
+        top5 = sorted_by_mag[:5]
 
-    root_id = st.session_state.get("prop_root", top5[0]["id"] if top5 else diff.changed_cells[0]["id"])
+        st.caption("默认显示变化最大的 5 个单元格作为传播起点，也可搜索自定义起点")
 
-    if cell_search and candidates:
-        cell_options = {
-            f"{c['id']}  ({c['sheet']})  {c['old']} → {c['new']}": c["id"]
-            for c in candidates[:500]
-        }
-        if cell_options:
-            selected_label_prop = st.selectbox("选择传播起点", list(cell_options.keys()))
-            root_id = cell_options[selected_label_prop]
+        # Quick picks
+        quick_cells = st.columns(min(len(top5), 5))
+        for i, c in enumerate(top5):
+            with quick_cells[i]:
+                cid_short = c["id"][:20] + ("…" if len(c["id"]) > 20 else "")
+                mag = c.get("change_magnitude", 0)
+                if st.button(f"{cid_short}\nΔ={mag:.2f}", use_container_width=True, key=f"qc_{c['id']}"):
+                    st.session_state["prop_root"] = c["id"]
 
-    max_depth = st.slider("传播深度", 1, 15, 8)
-    max_nodes = st.slider("最大节点数", 100, 2000, 500, 100)
-
-    if st.button("生成传播图", type="primary"):
-        with st.spinner("构建传播图..."):
-            data = build_propagation_data(graph, diff, root_id, max_depth, max_nodes)
-            html = render_propagation_html(json.dumps(data, ensure_ascii=False, default=str))
-        st.session_state["prop_html"] = html
-        st.session_state["prop_truncated"] = data["stats"]["truncated"]
-        st.session_state["prop_nodes"] = data["stats"]["total_nodes"]
-
-    if "prop_html" in st.session_state:
-        if st.session_state.get("prop_truncated"):
-            st.warning(f"图谱已截断至 {st.session_state['prop_nodes']} 个节点")
-        components.html(st.session_state["prop_html"], height=780, scrolling=False)
-
-        # ── Excel locate section ──
-        st.divider()
-        _prop_excel_path = st.session_state.get("excel_locate_path")
-        if _prop_excel_path:
-            _loc_ref = st.text_input(
-                "Excel 定位引用",
-                placeholder="如：参数输入表!I250（在传播图中点击节点可复制引用）",
-                key="prop_excel_locate_ref",
-            )
-            if st.button("在 Excel 中定位", key="prop_excel_locate_btn", disabled=not _loc_ref):
-                _do_excel_locate(_prop_excel_path, _loc_ref.strip())
+        # Search
+        cell_search = st.text_input("搜索传播起点", placeholder="输入 Cell ID、Sheet 名或值...", label_visibility="collapsed")
+        if cell_search:
+            kw = cell_search.lower()
+            candidates = [
+                c for c in diff.changed_cells
+                if kw in c["id"].lower()
+                or kw in c.get("sheet", "").lower()
+                or kw in str(c.get("old", "")).lower()
+                or kw in str(c.get("new", "")).lower()
+            ]
         else:
-            st.caption("未找到 Excel 文件，Excel 定位功能不可用")
+            candidates = diff.changed_cells
+
+        root_id = st.session_state.get("prop_root", top5[0]["id"] if top5 else diff.changed_cells[0]["id"])
+
+        if cell_search and candidates:
+            cell_options = {
+                f"{c['id']}  ({c['sheet']})  {c['old']} → {c['new']}": c["id"]
+                for c in candidates[:500]
+            }
+            if cell_options:
+                selected_label_prop = st.selectbox("选择传播起点", list(cell_options.keys()))
+                root_id = cell_options[selected_label_prop]
+
+        max_depth = st.slider("传播深度", 1, 15, 8)
+        max_nodes = st.slider("最大节点数", 100, 2000, 500, 100)
+
+        if st.button("生成传播图", type="primary"):
+            with st.spinner("构建传播图..."):
+                data = build_propagation_data(graph, diff, root_id, max_depth, max_nodes)
+                html = render_propagation_html(json.dumps(data, ensure_ascii=False, default=str))
+            st.session_state["prop_html"] = html
+            st.session_state["prop_truncated"] = data["stats"]["truncated"]
+            st.session_state["prop_nodes"] = data["stats"]["total_nodes"]
+
+        if "prop_html" in st.session_state:
+            if st.session_state.get("prop_truncated"):
+                st.warning(f"图谱已截断至 {st.session_state['prop_nodes']} 个节点")
+            components.html(st.session_state["prop_html"], height=780, scrolling=False)
+
+            # ── Excel locate section ──
+            st.divider()
+            _prop_excel_path = st.session_state.get("excel_locate_path")
+            if _prop_excel_path:
+                _loc_ref = st.text_input(
+                    "Excel 定位引用",
+                    placeholder="如：参数输入表!I250（在传播图中点击节点可复制引用）",
+                    key="prop_excel_locate_ref",
+                )
+                if st.button("在 Excel 中定位", key="prop_excel_locate_btn", disabled=not _loc_ref):
+                    _do_excel_locate(_prop_excel_path, _loc_ref.strip())
+            else:
+                st.caption("未找到 Excel 文件，Excel 定位功能不可用")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Tab 4: Export
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_export:
-    original_path = find_original_excel(task.id, task.output_dir)
+    original_path = find_original_excel(task_id, task_output_dir)
     has_original = original_path is not None
 
     if has_original:
@@ -747,7 +750,7 @@ with tab_export:
             tmp_orig_path = tmp_orig.name
 
         suffix = "_with_formulas" if keep_formulas else "_modified"
-        out_path = os.path.join(task.output_dir, f"{task.id}{suffix}.xlsx")
+        out_path = os.path.join(task_output_dir, f"{task_id}{suffix}.xlsx")
 
         with st.spinner("导出中..."):
             if keep_formulas:
@@ -760,7 +763,7 @@ with tab_export:
             st.download_button(
                 f"下载 {suffix}.xlsx",
                 data=f,
-                file_name=f"{task.filename.rsplit('.', 1)[0]}{suffix}.xlsx",
+                file_name=f"{task_filename.rsplit('.', 1)[0]}{suffix}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key=f"dl_export{suffix}",
             )
@@ -771,7 +774,7 @@ with tab_export:
     st.subheader("导出差异报告")
 
     if st.button("导出差异报告", type="secondary", use_container_width=True):
-        report_path = os.path.join(task.output_dir, f"{task.id}_diff_report.xlsx")
+        report_path = os.path.join(task_output_dir, f"{task_id}_diff_report.xlsx")
         with st.spinner("生成中..."):
             export_diff_report_excel(diff, graph, report_path)
 
@@ -779,7 +782,10 @@ with tab_export:
             st.download_button(
                 "下载差异报告",
                 data=f,
-                file_name=f"{task.filename.rsplit('.', 1)[0]}_diff_report.xlsx",
+                file_name=f"{task_filename.rsplit('.', 1)[0]}_diff_report.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="dl_diff_report",
             )
+
+# ── Invoke fragment ──────────────────────────────────────────────────────────
+_render_compare_tabs(graph, task.id, task.output_dir, task.filename)
