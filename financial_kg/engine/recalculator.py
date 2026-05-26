@@ -28,6 +28,7 @@ causing 11-hour runtimes at 23 ms/cell.  This rewrite:
 Expected runtime for 20 K cells × 23 ms: ~8 min for one full pass vs 11 hrs.
 """
 from __future__ import annotations
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -35,7 +36,7 @@ import networkx as nx
 
 from financial_kg.models.graph import FinancialGraph
 from financial_kg.engine.dependency import downstream_cells
-from financial_kg.engine.evaluator import evaluate_cell
+from financial_kg.engine.evaluator import evaluate_cell, enable_perf_stats, get_perf_stats
 
 
 @dataclass
@@ -51,6 +52,7 @@ class RecalcResult:
     changed_cells: list[CellChange] = field(default_factory=list)
     error_cells: list[str] = field(default_factory=list)
     scc_iterations: int = 0
+    perf: dict[str, float] = field(default_factory=dict)
 
     @property
     def affected_count(self) -> int:
@@ -62,6 +64,7 @@ def recalculate(
     updates: dict[str, Any],
     max_iter: int = 100,
     tol: float = 1e-9,
+    profile: bool = False,
 ) -> RecalcResult:
     """Apply updates and propagate through the dependency graph.
 
@@ -75,6 +78,11 @@ def recalculate(
         RecalcResult with all cells that changed value.
     """
     result = RecalcResult()
+
+    if profile:
+        enable_perf_stats(True)
+
+    t_start = time.perf_counter()
 
     # NOTE: clear_formula_cache() deliberately removed.  Compiled formulas are
     # static; clearing the cache on every call was the main performance killer.
@@ -92,14 +100,19 @@ def recalculate(
             )
 
     # ── 2. Find downstream cells (topological order) ──────────────────────────
+    t_downstream = time.perf_counter()
     affected: list[str] = downstream_cells(graph, updates.keys())
+    t_downstream = time.perf_counter() - t_downstream
+
     if not affected:
         _sync_indicators(graph, result.changed_cells)
+        _finalize_perf(result, t_start, t_downstream, profile)
         return result
 
     affected_set = set(affected)
 
     # ── 3. Partition into cyclic vs acyclic cells ─────────────────────────────
+    t_partition = time.perf_counter()
     g = graph.cell_graph
     subgraph = g.subgraph(affected_set | set(updates.keys()))
 
@@ -147,7 +160,29 @@ def recalculate(
 
     # ── 6. Sync Indicator layer ───────────────────────────────────────────────
     _sync_indicators(graph, result.changed_cells)
+    _finalize_perf(result, t_start, t_downstream, profile)
     return result
+
+
+def _finalize_perf(result: RecalcResult, t_start: float, t_downstream: float, profile: bool) -> None:
+    if not profile:
+        return
+    elapsed = time.perf_counter() - t_start
+    ev_stats = get_perf_stats()
+    result.perf = {
+        "total_s": round(elapsed, 3),
+        "downstream_s": round(t_downstream, 3),
+        "affected": result.affected_count,
+        "scc_iters": result.scc_iterations,
+        "eval_count": int(ev_stats.get("count", 0)),
+        "fast_hits": int(ev_stats.get("fast_hits", 0)),
+        "fast_pct": round(ev_stats.get("fast_hits", 0) / max(ev_stats.get("count", 1), 1) * 100, 1),
+        "build_plan_s": round(ev_stats.get("build_plan", 0), 3),
+        "build_input_s": round(ev_stats.get("build_input", 0), 3),
+        "eval_func_s": round(ev_stats.get("eval_func", 0), 3),
+        "fast_path_s": round(ev_stats.get("fast_path", 0), 3),
+    }
+    enable_perf_stats(False)
 
 
 def _converge_sccs(
@@ -161,32 +196,44 @@ def _converge_sccs(
 ) -> int:
     """Iteratively converge cyclic SCCs, then re-evaluate non-cyclic dependents.
 
-    Uses a single unified alternating loop instead of the original three
-    separate loop bodies (first convergence, outer range(10), final pass).
+    Uses precise dirty tracking: only cyclic cells whose inputs changed are
+    re-evaluated each iteration, and only acyclic cells downstream of changed
+    cyclic cells are re-evaluated (not the full acyclic set).
 
     Returns the total number of SCC iterations performed.
     """
-    sorted_cyclic = sorted(cyclic_cells)
+    acyclic_set = set(acyclic_affected)
     total_scc_iters = 0
 
+    # Pre-compute: which acyclic cells directly depend on each cyclic cell
+    # Edge direction: add_edge(A, B) = "A depends on B"
+    # So acyclic cells depending on cyclic cell X are predecessors of X.
+    cyclic_to_acyclic: dict[str, set[str]] = {}
+    for cyc_id in cyclic_cells:
+        deps = set()
+        for pred in g.predecessors(cyc_id):
+            if pred in acyclic_set:
+                deps.add(pred)
+        if deps:
+            cyclic_to_acyclic[cyc_id] = deps
+
     # Outer loop: alternate between SCC convergence and non-cyclic re-eval.
-    # Terminates when neither changes anything.
     for _outer in range(max_iter):
         # ── 5a. Converge the SCC with dirty tracking ──────────────────────────
-        dirty: set[str] = set(cyclic_cells)  # start fully dirty
+        dirty: set[str] = set(cyclic_cells)
+        changed_cyclic: set[str] = set()  # track which cyclic cells actually changed
 
         iter_count = 0
+        max_delta = 0.0
         for iter_count in range(1, max_iter + 1):
             if not dirty:
                 break
 
             max_delta = 0.0
             next_dirty: set[str] = set()
+            iter_changed: set[str] = set()
 
-            for cell_id in sorted_cyclic:
-                if cell_id not in dirty:
-                    continue
-
+            for cell_id in sorted(dirty):
                 cell = graph.cells.get(cell_id)
                 if cell is None or not cell.formula_raw:
                     continue
@@ -204,20 +251,43 @@ def _converge_sccs(
                 max_delta = max(max_delta, delta)
 
                 if delta > tol:
+                    iter_changed.add(cell_id)
                     for succ in g.successors(cell_id):
                         if succ in cyclic_cells:
                             next_dirty.add(succ)
 
             dirty = next_dirty
+            changed_cyclic.update(iter_changed)
             if max_delta <= tol:
                 break
 
         total_scc_iters += iter_count
 
-        # ── 5b. Re-evaluate non-cyclic cells that depend on converged SCCs ────
-        # Do this exactly once per outer iteration; track whether anything changed.
+        # ── 5b. Re-evaluate only acyclic cells affected by changed cyclic cells ─
+        # Collect acyclic cells that depend on any cyclic cell that actually changed
+        triggered: set[str] = set()
+        for cyc_id in changed_cyclic:
+            triggered.update(cyclic_to_acyclic.get(cyc_id, set()))
+
+        if not triggered:
+            if max_delta <= tol:
+                break
+            continue
+
+        # BFS from triggered cells through acyclic subgraph
+        nc_dirty = set(triggered)
+        nc_queue = list(triggered)
+        while nc_queue:
+            nid = nc_queue.pop()
+            for pred in g.predecessors(nid):
+                if pred in acyclic_set and pred not in nc_dirty:
+                    nc_dirty.add(pred)
+                    nc_queue.append(pred)
+
         nc_changed = False
         for cell_id in acyclic_affected:
+            if cell_id not in nc_dirty:
+                continue
             cell = graph.cells.get(cell_id)
             if cell is None or not cell.formula_raw:
                 continue
@@ -234,8 +304,7 @@ def _converge_sccs(
                     CellChange(cell_id, old_val, new_val, cell.formula_raw)
                 )
 
-        # If neither the SCC nor the non-cyclic cells changed, we're done.
-        if not nc_changed and max_delta <= tol:  # type: ignore[possibly-undefined]
+        if not nc_changed and max_delta <= tol:
             break
 
     return total_scc_iters
