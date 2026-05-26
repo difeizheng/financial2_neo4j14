@@ -582,6 +582,10 @@ with tab_prop:
                             raise RuntimeError("未找到 WPS 或 Office Excel")
 
                         xl.Visible = True
+                        # Enable iterative calculation for circular references
+                        xl.Iteration = True
+                        xl.MaxIterations = 1000
+                        xl.MaxChange = 1e-6
 
                         # Find workbook by full name using index-based iteration
                         wb = None
