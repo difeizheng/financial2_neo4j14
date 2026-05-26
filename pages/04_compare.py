@@ -150,6 +150,25 @@ snap_b_name = st.session_state.get("snap_b_name", "B")
 snap_b_values = st.session_state.get("snap_b_values", {})
 snap_a_values = st.session_state.get("snap_a_values", {})
 
+# ── Excel target file choice (used by both detail & propagation tabs) ──
+_orig_path = find_original_excel(task.id, task.output_dir)
+_recalc_path = st.session_state.get("recalc_excel_path")
+_target_opts = {}
+if _orig_path and os.path.exists(_orig_path):
+    _target_opts["原始文件"] = _orig_path
+if _recalc_path and os.path.exists(_recalc_path):
+    _target_opts[f"场景文件（{snap_b_name}）"] = _recalc_path
+
+if len(_target_opts) > 1:
+    _target_label = st.radio(
+        "Excel 定位目标", list(_target_opts.keys()), horizontal=True, key="excel_target",
+    )
+    st.session_state["excel_locate_path"] = _target_opts[_target_label]
+elif len(_target_opts) == 1:
+    st.session_state["excel_locate_path"] = list(_target_opts.values())[0]
+else:
+    st.session_state.pop("excel_locate_path", None)
+
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tab_metrics, tab_matrix, tab_detail, tab_prop, tab_export = st.tabs([
     "关键指标对比",
@@ -158,6 +177,98 @@ tab_metrics, tab_matrix, tab_detail, tab_prop, tab_export = st.tabs([
     "传播图",
     "导出",
 ])
+
+# ── Helper: Excel locate via win32com ──────────────────────────────────────────
+
+def _do_excel_locate(excel_path: str, ref: str) -> None:
+    """Open Excel/WPS and navigate to the specified cell reference."""
+    try:
+        import win32com.client
+        import pythoncom
+        pythoncom.CoInitialize()
+        try:
+            if "!" in ref:
+                sheet_name, addr = ref.split("!", 1)
+            else:
+                sheet_name, addr = None, ref
+            addr = addr.replace("$", "")
+            abs_path = os.path.abspath(excel_path)
+
+            xl = None
+            for prog_id in ["ket.Application", "Excel.Application"]:
+                try:
+                    xl = win32com.client.GetActiveObject(prog_id)
+                    break
+                except Exception:
+                    pass
+
+            if xl is None:
+                for prog_id in ["ket.Application", "Excel.Application"]:
+                    try:
+                        xl = win32com.client.Dispatch(prog_id)
+                        break
+                    except Exception:
+                        continue
+
+            if xl is None:
+                raise RuntimeError("未找到 WPS 或 Office Excel")
+
+            xl.Visible = True
+
+            wb = None
+            count = xl.Workbooks.Count
+            for i in range(1, count + 1):
+                try:
+                    b = xl.Workbooks(i)
+                    if os.path.abspath(b.FullName) == abs_path:
+                        wb = b
+                        break
+                except Exception:
+                    continue
+
+            if wb is None:
+                wb = xl.Workbooks.Open(abs_path)
+
+            try:
+                xl.Iteration = True
+                xl.MaxIterations = 1000
+                xl.MaxChange = 1e-6
+            except Exception:
+                pass
+            try:
+                wb.EnableIteration = True
+            except Exception:
+                pass
+            try:
+                wb.RefreshAll()
+                wb.Calculate()
+            except Exception:
+                pass
+
+            if sheet_name:
+                try:
+                    ws = wb.Sheets(sheet_name)
+                except Exception:
+                    st.warning(f"未找到工作表「{sheet_name}」，已打开文件但无法定位")
+                    ws = wb.ActiveSheet
+            else:
+                ws = wb.ActiveSheet
+            ws.Activate()
+            try:
+                rng = ws.Range(addr)
+                rng.Select()
+                rng.Interior.Color = 0xFFFF00
+                rng.Font.Bold = True
+                st.success(f"已定位到 {ref}，已标记黄色高亮（Ctrl+Z 撤销）")
+            except Exception:
+                st.warning(f"无法定位到 {addr}，已打开文件并激活工作表")
+        finally:
+            pythoncom.CoUninitialize()
+    except ImportError:
+        st.error("需要安装 pywin32：pip install pywin32")
+    except Exception as e:
+        st.error(f"打开 Excel 失败：{e}")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Tab 1: Key metrics comparison
@@ -436,7 +547,8 @@ with tab_detail:
     if not filtered:
         st.info("无匹配的变化单元格")
     else:
-        # Build HTML table with clickable "定位" links
+        import pandas as pd
+
         def _cell_to_ref(cid):
             parts = cid.rsplit("_", 2)
             if len(parts) != 3:
@@ -447,65 +559,76 @@ with tab_detail:
                 ref = f"{sheet}!{ref}"
             return ref
 
-        html_rows = ""
+        rows = []
         for c in filtered:
-            ref = _cell_to_ref(c["id"])
-            old_v = c.get("old", "")
-            new_v = c.get("new", "")
-            chg = round(c.get("change_magnitude", 0), 6)
-            direction = "↑" if c.get("direction") == "increase" else "↓"
-            ind_name = c.get("indicator_name", "") or ""
-            formula = c.get("formula", "") or ""
-            # Escape for HTML
-            ind_name = ind_name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            formula = formula.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            html_rows += (
-                f'<tr>'
-                f'<td style="font-size:11px;font-family:monospace">{c["id"]}</td>'
-                f'<td style="font-size:11px">{c.get("sheet", "")}</td>'
-                f'<td style="font-size:11px;text-align:right">{old_v}</td>'
-                f'<td style="font-size:11px;text-align:right">{new_v}</td>'
-                f'<td style="font-size:11px;text-align:right">{chg}</td>'
-                f'<td style="font-size:11px">{direction}</td>'
-                f'<td style="font-size:11px;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{formula}</td>'
-                f'<td style="font-size:11px">{ind_name}</td>'
-                f'<td style="font-size:11px"><button class="loc-btn" onclick="locRef(this.getAttribute(\'data-ref\'))" data-ref="{ref}">定位</button></td>'
-                f'</tr>\n'
-            )
+            rows.append({
+                "Cell ID": c["id"],
+                "Sheet": c.get("sheet", ""),
+                "旧值": c.get("old", ""),
+                "新值": c.get("new", ""),
+                "变化量": round(c.get("change_magnitude", 0), 6),
+                "方向": "↑" if c.get("direction") == "increase" else "↓",
+                "公式": c.get("formula", "") or "",
+                "Indicator": c.get("indicator_name", "") or "",
+            })
+        detail_df = pd.DataFrame(rows)
 
-        table_html = f"""
-        <style>
-        .detail-tbl {{ width: 100%; border-collapse: collapse; font-size: 11px; }}
-        .detail-tbl th {{ background: #1e1e2e; color: #89b4fa; padding: 6px 8px; text-align: left; position: sticky; top: 0; }}
-        .detail-tbl td {{ padding: 4px 8px; border-bottom: 1px solid #2a3050; }}
-        .detail-tbl tr:hover {{ background: rgba(137,180,250,0.05); }}
-        .loc-btn {{ background: #45475a; color: #cdd6f4; border: none; padding: 2px 10px; border-radius: 3px; font-size: 10px; cursor: pointer; }}
-        .loc-btn:hover {{ background: #89b4fa; color: #1e1e2e; }}
-        </style>
-        <table class="detail-tbl">
-        <thead>
-        <tr>
-        <th>Cell ID</th><th>Sheet</th><th>旧值</th><th>新值</th><th>变化量</th><th>方向</th><th>公式</th><th>Indicator</th><th>定位</th>
-        </tr>
-        </thead>
-        <tbody>
-        {html_rows}
-        </tbody>
-        </table>
-        <script>
-        function locRef(ref) {{
-          var input = document.querySelector('input[aria-label="Excel 定位引用"]');
-          if (!input) input = document.querySelector('input[placeholder*="Excel定位"]');
-          if (input) {{
-            var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-            nativeInputValueSetter.call(input, ref);
-            input.dispatchEvent(new Event('input', {{bubbles: true}}));
-            input.scrollIntoView({{behavior: 'smooth', block: 'center'}});
-          }}
-        }}
-        </script>
-        """
-        st.markdown(table_html, unsafe_allow_html=True)
+        event = st.dataframe(
+            detail_df,
+            use_container_width=True,
+            hide_index=True,
+            height=600,
+            on_select="rerun",
+            selection_mode="single-row",
+            key="detail_table_select",
+            column_config={
+                "Cell ID": st.column_config.TextColumn("Cell ID", width="medium"),
+                "公式": st.column_config.TextColumn("公式", width="large"),
+                "Indicator": st.column_config.TextColumn("Indicator", width="medium"),
+            },
+        )
+
+        # Excel locate on selected row — click a row to locate directly
+        selected_rows = event.selection.get("rows", [])
+        _last_locate_id = st.session_state.get("detail_last_locate_id", "")
+        if selected_rows:
+            idx = selected_rows[0]
+            if idx < len(filtered):
+                selected_cell = filtered[idx]
+                cell_id = selected_cell["id"]
+                ref = _cell_to_ref(cell_id)
+
+                # Remember for propagation button
+                st.session_state["detail_selected_id"] = cell_id
+                st.session_state["detail_selected_ref"] = ref
+
+                # Auto Excel locate on new selection
+                if cell_id != _last_locate_id:
+                    st.session_state["detail_last_locate_id"] = cell_id
+                    _detail_excel_path = st.session_state.get("excel_locate_path")
+                    if _detail_excel_path:
+                        _do_excel_locate(_detail_excel_path, ref)
+
+        # Propagation graph button for selected cell
+        _sel_id = st.session_state.get("detail_selected_id")
+        _sel_ref = st.session_state.get("detail_selected_ref")
+        if _sel_id:
+            st.divider()
+            pc1, pc2 = st.columns([4, 1])
+            with pc1:
+                st.markdown(f"已选中：**{_sel_ref}**")
+            with pc2:
+                if st.button("查看传播图", key="detail_prop_btn", use_container_width=True):
+                    with st.spinner("构建传播图..."):
+                        data = build_propagation_data(graph, diff, _sel_id, 8, 500)
+                        html = render_propagation_html(
+                            json.dumps(data, ensure_ascii=False, default=str)
+                        )
+                    st.session_state["prop_html"] = html
+                    st.session_state["prop_root"] = _sel_id
+                    st.session_state["prop_truncated"] = data["stats"]["truncated"]
+                    st.session_state["prop_nodes"] = data["stats"]["total_nodes"]
+                    st.success(f"传播图已生成，请点击上方「传播图」标签页查看")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Tab 4: Propagation graph
@@ -573,121 +696,17 @@ with tab_prop:
 
         # ── Excel locate section ──
         st.divider()
-        _recalc_path = st.session_state.get("recalc_excel_path")
-        _orig_path = find_original_excel(task.id, task.output_dir)
-        _excel_path = None
-
-        if _recalc_path and os.path.exists(_recalc_path):
-            _excel_path = _recalc_path
-            snap_b_name = st.session_state.get("snap_b_name", "B")
-            st.caption(f"重算文件：{_excel_path}（对应快照「{snap_b_name}」）")
-        elif _orig_path and os.path.exists(_orig_path):
-            _excel_path = _orig_path
-            st.caption(f"原始文件：{_excel_path}（无重算文件，使用原始数据）")
-
-        if _excel_path:
+        _prop_excel_path = st.session_state.get("excel_locate_path")
+        if _prop_excel_path:
             _loc_ref = st.text_input(
                 "Excel 定位引用",
                 placeholder="如：参数输入表!I250（在传播图中点击节点可复制引用）",
                 key="prop_excel_locate_ref",
             )
             if st.button("在 Excel 中定位", key="prop_excel_locate_btn", disabled=not _loc_ref):
-                try:
-                    import win32com.client
-                    import pythoncom
-                    pythoncom.CoInitialize()
-                    try:
-                        ref = _loc_ref.strip()
-                        if "!" in ref:
-                            sheet_name, addr = ref.split("!", 1)
-                        else:
-                            sheet_name, addr = None, ref
-                        addr = addr.replace("$", "")
-                        abs_path = os.path.abspath(_excel_path)
-
-                        # Try WPS first, then Office Excel
-                        xl = None
-                        for prog_id in ["ket.Application", "Excel.Application"]:
-                            try:
-                                xl = win32com.client.GetActiveObject(prog_id)
-                                break
-                            except Exception:
-                                pass
-
-                        if xl is None:
-                            for prog_id in ["ket.Application", "Excel.Application"]:
-                                try:
-                                    xl = win32com.client.Dispatch(prog_id)
-                                    break
-                                except Exception:
-                                    continue
-
-                        if xl is None:
-                            raise RuntimeError("未找到 WPS 或 Office Excel")
-
-                        xl.Visible = True
-
-                        # Find workbook by full name using index-based iteration
-                        wb = None
-                        count = xl.Workbooks.Count
-                        for i in range(1, count + 1):
-                            try:
-                                b = xl.Workbooks(i)
-                                if os.path.abspath(b.FullName) == abs_path:
-                                    wb = b
-                                    break
-                            except Exception:
-                                continue
-
-                        if wb is None:
-                            wb = xl.Workbooks.Open(abs_path)
-
-                        # Enable iterative calculation (set AFTER workbook open for WPS compatibility)
-                        try:
-                            # App-level (Office Excel)
-                            xl.Iteration = True
-                            xl.MaxIterations = 1000
-                            xl.MaxChange = 1e-6
-                        except Exception:
-                            pass
-                        try:
-                            # Workbook-level (WPS)
-                            wb.EnableIteration = True
-                        except Exception:
-                            pass
-                        # Recalculate to resolve circular refs
-                        try:
-                            wb.RefreshAll()
-                            wb.Calculate()
-                        except Exception:
-                            pass
-
-                        if sheet_name:
-                            try:
-                                ws = wb.Sheets(sheet_name)
-                            except Exception:
-                                st.warning(f"未找到工作表「{sheet_name}」，已打开文件但无法定位")
-                                ws = wb.ActiveSheet
-                        else:
-                            ws = wb.ActiveSheet
-                        ws.Activate()
-                        try:
-                            rng = ws.Range(addr)
-                            rng.Select()
-                            # Highlight for visibility in large sheets
-                            rng.Interior.Color = 0xFFFF00  # yellow
-                            rng.Font.Bold = True
-                            st.success(f"已定位到 {ref}，已标记黄色高亮（Ctrl+Z 撤销）")
-                        except Exception:
-                            st.warning(f"无法定位到 {addr}，已打开文件并激活工作表")
-                    finally:
-                        pythoncom.CoUninitialize()
-                except ImportError:
-                    st.error("需要安装 pywin32：pip install pywin32")
-                except Exception as e:
-                    st.error(f"打开 Excel 失败：{e}")
+                _do_excel_locate(_prop_excel_path, _loc_ref.strip())
         else:
-            st.caption("未找到原始 Excel 文件，Excel 定位功能不可用")
+            st.caption("未找到 Excel 文件，Excel 定位功能不可用")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Tab 4: Export

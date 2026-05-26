@@ -655,6 +655,14 @@ chart.on('click', function(params) {
   drillInto(node.id);
 });
 
+// Double-click also triggers drill-down (for draggable nodes in force layout)
+chart.on('dblclick', function(params) {
+  if (params.dataType !== 'node') return;
+  var node = params.data;
+  if (!node) return;
+  drillInto(node.id);
+});
+
 // Make cell list items & copy buttons clickable (event delegation)
 document.getElementById('detail-content').addEventListener('click', function(ev) {
   var copyBtn = ev.target.closest('.copy-btn');
