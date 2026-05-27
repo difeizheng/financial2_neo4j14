@@ -22,7 +22,7 @@ import operator
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import numpy as np
@@ -296,6 +296,33 @@ _RE_SUM_SHEET_RANGE = re.compile(
     r"^=SUM\('?([^!']+)'?!([A-Z]+\$?\d+:[A-Z]+\$?\d+)\)$", re.IGNORECASE
 )
 
+# Additional fast-path patterns (v4.3.0)
+# _REF: matches A1, $A$1, Sheet!A1, '表1'!$A$1
+_REF = r'(?:[\w一-鿝][\w一-鿝]*!)?\$?[A-Z]+\$?\d+'
+_RE_YEAR = re.compile(r'^=YEAR\((' + _REF + r')\)$', re.IGNORECASE)
+_RE_ABS = re.compile(r'^=ABS\((' + _REF + r')\)$', re.IGNORECASE)
+_RE_ROUND = re.compile(r'^=ROUND\((' + _REF + r'),\s*(-?\d+)\)$', re.IGNORECASE)
+_RE_MAX_RANGE = re.compile(r'^=MAX\(([A-Z]+\$?\d+:[A-Z]+\$?\d+)\)$', re.IGNORECASE)
+_RE_MIN_RANGE = re.compile(r'^=MIN\(([A-Z]+\$?\d+:[A-Z]+\$?\d+)\)$', re.IGNORECASE)
+_RE_AVERAGE_RANGE = re.compile(r'^=AVERAGE\(([A-Z]+\$?\d+:[A-Z]+\$?\d+)\)$', re.IGNORECASE)
+# IF: comparison between cell ref and value/ref, then two value/ref branches
+_RE_IF_SIMPLE = re.compile(
+    r'^=IF\((' + _REF + r')([><=!]+)(-?[\d.]+|' + _REF + r'),\s*'
+    r'(-?[\d.]+|' + _REF + r'),\s*'
+    r'(-?[\d.]+|' + _REF + r')\)$',
+    re.IGNORECASE
+)
+
+
+def _excel_serial_to_year(serial: float) -> int | None:
+    """Convert Excel serial date to year. Excel epoch = 1899-12-30."""
+    try:
+        excel_epoch = datetime(1899, 12, 30)
+        dt = excel_epoch + timedelta(days=int(serial))
+        return dt.year
+    except (ValueError, OverflowError):
+        return None
+
 
 def _read_cell_value(ref: str, formula_sheet: str, graph: FinancialGraph) -> Any:
     """Read a single cell value by Excel reference string."""
@@ -310,6 +337,32 @@ def _read_cell_value(ref: str, formula_sheet: str, graph: FinancialGraph) -> Any
     cell_id = _addr_to_cell_id(sheet, addr)
     cell = graph.cells.get(cell_id)
     return cell.value if cell else None
+
+
+def _try_range_agg(
+    formula_raw: str, plan: _InputPlan, graph: FinancialGraph, op: str,
+) -> Any:
+    """Aggregate numeric values from all range inputs in the plan."""
+    vals: list[float] = []
+    if not plan.range_inputs:
+        return _MISS
+    for _, rp in plan.range_inputs:
+        for cid in rp.cell_ids:
+            cell = graph.cells.get(cid)
+            v = _coerce(cell.value if cell else None)
+            if isinstance(v, (int, float)):
+                vals.append(float(v))
+            else:
+                return _MISS  # non-numeric in range → fallback
+    if not vals:
+        return _MISS
+    if op == 'max':
+        return max(vals)
+    elif op == 'min':
+        return min(vals)
+    elif op == 'average':
+        return sum(vals) / len(vals)
+    return _MISS
 
 
 def _try_fast_eval(
@@ -392,6 +445,93 @@ def _try_fast_eval(
                     total += float(v)
             return total
         return _MISS
+
+    # ── YEAR(ref): =YEAR(A1) ──
+    m = _RE_YEAR.match(formula_raw)
+    if m:
+        val = _read_cell_value(m.group(1), formula_sheet, graph)
+        if isinstance(val, (int, float)):
+            year = _excel_serial_to_year(float(val))
+            return year if year else _MISS
+        return _MISS
+
+    # ── ABS(ref): =ABS(A1) ──
+    m = _RE_ABS.match(formula_raw)
+    if m:
+        val = _read_cell_value(m.group(1), formula_sheet, graph)
+        if isinstance(val, (int, float)):
+            return abs(float(val))
+        return _MISS
+
+    # ── ROUND(ref, ndigits): =ROUND(A1, 2) ──
+    m = _RE_ROUND.match(formula_raw)
+    if m:
+        val = _read_cell_value(m.group(1), formula_sheet, graph)
+        if isinstance(val, (int, float)):
+            return round(float(val), int(m.group(2)))
+        return _MISS
+
+    # ── MAX(range): =MAX(A1:B10) ──
+    m = _RE_MAX_RANGE.match(formula_raw)
+    if m:
+        result = _try_range_agg(formula_raw, plan, graph, 'max')
+        if result is not _MISS:
+            return result
+
+    # ── MIN(range): =MIN(A1:B10) ──
+    m = _RE_MIN_RANGE.match(formula_raw)
+    if m:
+        result = _try_range_agg(formula_raw, plan, graph, 'min')
+        if result is not _MISS:
+            return result
+
+    # ── AVERAGE(range): =AVERAGE(A1:B10) ──
+    m = _RE_AVERAGE_RANGE.match(formula_raw)
+    if m:
+        result = _try_range_agg(formula_raw, plan, graph, 'average')
+        if result is not _MISS:
+            return result
+
+    # ── IF simple: =IF(A1>0, B1, 0) ──
+    m = _RE_IF_SIMPLE.match(formula_raw)
+    if m:
+        left_ref = m.group(1)
+        op = m.group(2)
+        right_str = m.group(3)
+        true_val = m.group(4)
+        false_val = m.group(5)
+
+        left = _read_cell_value(left_ref, formula_sheet, graph)
+        if not isinstance(left, (int, float)):
+            return _MISS
+        left = float(left)
+
+        # Right side: literal number or cell ref
+        try:
+            right = float(right_str)
+        except ValueError:
+            right_cell = _read_cell_value(right_str, formula_sheet, graph)
+            if not isinstance(right_cell, (int, float)):
+                return _MISS
+            right = float(right_cell)
+
+        # Comparison
+        _OPS = {'>': lambda a, b: a > b, '<': lambda a, b: a < b,
+                '>=': lambda a, b: a >= b, '<=': lambda a, b: a <= b,
+                '=': lambda a, b: a == b, '<>': lambda a, b: a != b,
+                '!=': lambda a, b: a != b}
+        cmp_fn = _OPS.get(op)
+        if cmp_fn is None:
+            return _MISS
+        cond = cmp_fn(left, right)
+
+        chosen = true_val if cond else false_val
+        try:
+            return float(chosen)
+        except ValueError:
+            return _read_cell_value(chosen, formula_sheet, graph)
+        except ValueError:
+            return _read_cell_value(chosen, formula_sheet, graph)
 
     return _MISS
 
