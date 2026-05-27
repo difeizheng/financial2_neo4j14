@@ -548,7 +548,17 @@ with editor_col:
                 st.session_state[f"rr_{task.id}"] = result
                 st.session_state[f"auto_viz_{task.id}"] = True
                 iter_info = f"，SCC 迭代 {result.scc_iterations} 次" if result.scc_iterations else ""
-                st.toast(f"重算完成：{result.affected_count} 个变化{iter_info}，快照「{snap_name}」已保存（可与「{base_snap_name}」对比）", icon="✅")
+
+                # Show perf info
+                if result.perf:
+                    p = result.perf
+                    st.toast(
+                        f"重算完成：{result.affected_count} 个变化{iter_info} | "
+                        f"总耗时 {p['total_s']:.1f}s | "
+                        f"快速路径命中率 {p['fast_pct']:.0f}% ({p['fast_hits']}/{p['eval_count']})"
+                    )
+                else:
+                    st.toast(f"重算完成：{result.affected_count} 个变化{iter_info}，快照「{snap_name}」已保存（可与「{base_snap_name}」对比）", icon="✅")
                 st.rerun()
 
 # ── Right: Results panel ────────────────────────────────────────────────────
@@ -558,6 +568,21 @@ working_graph = st.session_state.get(f"wg_{task.id}")
 
 with results_col:
     st.subheader("📊 结果面板")
+
+    # ── Perf panel ───────────────────────────────────────────────────────
+    if recalc_result and recalc_result.perf:
+        p = recalc_result.perf
+        with st.expander("⚡ 性能分析", expanded=True):
+            cols = st.columns(4)
+            cols[0].metric("总耗时", f"{p['total_s']:.1f}s")
+            cols[1].metric("受影响cell", str(p['affected']))
+            cols[2].metric("快速路径", f"{p['fast_pct']:.0f}%")
+            cols[3].metric("SCC迭代", str(p['scc_iters']))
+            cols2 = st.columns(4)
+            cols2[0].metric("下游发现", f"{p['downstream_s']:.2f}s")
+            cols2[1].metric("InputPlan构建", f"{p['build_plan_s']:.2f}s")
+            cols2[2].metric("InputMap构建", f"{p['build_input_s']:.2f}s")
+            cols2[3].metric("公式评估", f"{p['eval_func_s']:.2f}s")
 
     r_tabs = st.tabs(["关键指标", "场景对比", "影响链", "修改历史", "重算设置", "批量修改"])
 

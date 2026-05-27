@@ -272,7 +272,18 @@ def apply_and_recalc(
 
     batch_id = str(uuid.uuid4())[:8]
 
-    result = recalculate(graph, updates, max_iter=ws.recalc_max_iter, tol=ws.recalc_tol)
+    result = recalculate(graph, updates, max_iter=ws.recalc_max_iter, tol=ws.recalc_tol, profile=True)
+
+    if result.perf:
+        import logging
+        p = result.perf
+        logging.info(
+            f"[RECALC PERF] total={p['total_s']:.1f}s | "
+            f"affected={p['affected']} | fast_hits={p['fast_hits']}/{p['eval_count']} ({p['fast_pct']}%) | "
+            f"downstream={p['downstream_s']:.2f}s | scc_iters={p['scc_iters']} | "
+            f"build_plan={p['build_plan_s']:.2f}s | build_input={p['build_input_s']:.2f}s | "
+            f"eval_func={p['eval_func_s']:.2f}s | fast_path={p['fast_path_s']:.2f}s"
+        )
 
     # Save overrides to scenario
     if scenario:
