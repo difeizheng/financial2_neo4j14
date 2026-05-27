@@ -336,7 +336,7 @@ def _read_cell_value(ref: str, formula_sheet: str, graph: FinancialGraph) -> Any
     addr = addr.replace("$", "")
     cell_id = _addr_to_cell_id(sheet, addr)
     cell = graph.cells.get(cell_id)
-    return cell.value if cell else None
+    return _coerce(cell.value if cell else None)
 
 
 def _try_range_agg(
