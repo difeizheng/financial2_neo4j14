@@ -302,9 +302,14 @@ _REF = r'(?:[\w一-鿝][\w一-鿝]*!)?\$?[A-Z]+\$?\d+'
 _RE_YEAR = re.compile(r'^=YEAR\((' + _REF + r')\)$', re.IGNORECASE)
 _RE_ABS = re.compile(r'^=ABS\((' + _REF + r')\)$', re.IGNORECASE)
 _RE_ROUND = re.compile(r'^=ROUND\((' + _REF + r'),\s*(-?\d+)\)$', re.IGNORECASE)
-_RE_MAX_RANGE = re.compile(r'^=MAX\(([A-Z]+\$?\d+:[A-Z]+\$?\d+)\)$', re.IGNORECASE)
-_RE_MIN_RANGE = re.compile(r'^=MIN\(([A-Z]+\$?\d+:[A-Z]+\$?\d+)\)$', re.IGNORECASE)
-_RE_AVERAGE_RANGE = re.compile(r'^=AVERAGE\(([A-Z]+\$?\d+:[A-Z]+\$?\d+)\)$', re.IGNORECASE)
+# MAX(0, ref-ref): =MAX(0, F65-F75) — common for max-with-zero pattern
+_RE_MAX_ZERO_REF = re.compile(
+    r'^=MAX\(0,\s*(' + _REF + r')-(' + _REF + r')\)$', re.IGNORECASE
+)
+# AVERAGE with quoted sheet prefix: =AVERAGE('表名'!H12:H20)
+_RE_AVERAGE_QUOTED = re.compile(
+    r"^=AVERAGE\('([^']+)'!([A-Z]+\$?\d+:[A-Z]+\$?\d+)\)$", re.IGNORECASE
+)
 # IF: comparison between cell ref and value/ref, then two value/ref branches
 _RE_IF_SIMPLE = re.compile(
     r'^=IF\((' + _REF + r')([><=!]+)(-?[\d.]+|' + _REF + r'),\s*'
@@ -354,6 +359,40 @@ def _try_range_agg(
                 vals.append(float(v))
             else:
                 return _MISS  # non-numeric in range → fallback
+    if not vals:
+        return _MISS
+    if op == 'max':
+        return max(vals)
+    elif op == 'min':
+        return min(vals)
+    elif op == 'average':
+        return sum(vals) / len(vals)
+    return _MISS
+
+
+def _try_range_agg_sheet(
+    sheet_name: str, range_str: str, graph: FinancialGraph, op: str,
+) -> Any:
+    """Aggregate values from an explicit sheet!range reference."""
+    from openpyxl.utils import column_index_from_string, get_column_letter
+    start, end = range_str.split(":", 1)
+    sc_letter, sr = _split_col_row(start)
+    ec_letter, er = _split_col_row(end)
+    sc = column_index_from_string(sc_letter)
+    ec = column_index_from_string(ec_letter)
+    sr, er = int(sr), int(er)
+
+    vals: list[float] = []
+    for r in range(sr, er + 1):
+        for c in range(sc, ec + 1):
+            col = get_column_letter(c)
+            cid = f"{sheet_name}_{r}_{col}"
+            cell = graph.cells.get(cid)
+            v = _coerce(cell.value if cell else None)
+            if isinstance(v, (int, float)):
+                vals.append(float(v))
+            else:
+                return _MISS
     if not vals:
         return _MISS
     if op == 'max':
@@ -471,24 +510,21 @@ def _try_fast_eval(
             return round(float(val), int(m.group(2)))
         return _MISS
 
-    # ── MAX(range): =MAX(A1:B10) ──
-    m = _RE_MAX_RANGE.match(formula_raw)
+    # ── MAX(0, ref-ref): =MAX(0, F65-F75) ──
+    m = _RE_MAX_ZERO_REF.match(formula_raw)
     if m:
-        result = _try_range_agg(formula_raw, plan, graph, 'max')
-        if result is not _MISS:
-            return result
+        a = _read_cell_value(m.group(1), formula_sheet, graph)
+        b = _read_cell_value(m.group(2), formula_sheet, graph)
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            return max(0.0, float(a) - float(b))
+        return _MISS
 
-    # ── MIN(range): =MIN(A1:B10) ──
-    m = _RE_MIN_RANGE.match(formula_raw)
+    # ── AVERAGE('sheet'!range): =AVERAGE('投产&达产比例'!H12:H20) ──
+    m = _RE_AVERAGE_QUOTED.match(formula_raw)
     if m:
-        result = _try_range_agg(formula_raw, plan, graph, 'min')
-        if result is not _MISS:
-            return result
-
-    # ── AVERAGE(range): =AVERAGE(A1:B10) ──
-    m = _RE_AVERAGE_RANGE.match(formula_raw)
-    if m:
-        result = _try_range_agg(formula_raw, plan, graph, 'average')
+        sheet_name = m.group(1)
+        range_str = m.group(2)
+        result = _try_range_agg_sheet(sheet_name, range_str, graph, 'average')
         if result is not _MISS:
             return result
 
