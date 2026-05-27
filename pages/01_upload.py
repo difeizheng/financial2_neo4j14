@@ -213,8 +213,8 @@ def _render_quality_detail(quality: QualityDiagnostics) -> None:
         st.write(f"- 未关联率: {quality.unlinked_ratio:.1%}")
         if quality.has_cycles:
             st.error(f"检测到 {quality.cycle_count} 个循环依赖！")
-            with st.expander(f"循环涉及的 Cell（前 20 个）"):
-                st.write(", ".join(quality.cycle_cells[:20]))
+            st.caption("循环涉及的 Cell（前 20 个）")
+            st.code(", ".join(quality.cycle_cells[:20]))
         else:
             st.success("无循环依赖")
 
