@@ -288,6 +288,11 @@ editor_col, results_col = st.columns([3, 2])
 def _build_param_cells(graph):
     rows = []
     for cid, cell in graph.cells.items():
+        # Skip 参数输入表 C列 and D列
+        if cid.startswith("参数输入表_"):
+            parts = cid.rsplit("_", 2)
+            if len(parts) == 3 and parts[2] in ("C", "D", "G", "H"):
+                continue
         ind_name = ""
         ind_category = ""
         if cell.indicator_id and cell.indicator_id in graph.indicators:
@@ -348,11 +353,39 @@ with editor_col:
         cat = r["类别"] or "未分类"
         category_groups.setdefault(cat, []).append(r)
 
-    # Sort categories, "未分类" at end
+    # Business-ordered category priority (input → calculation → result)
+    _CATEGORY_PRIORITY = [
+        "项目基础参数",
+        "工程计划",
+        "生产技术",
+        "工程概算",
+        "投资",
+        "资金",
+        "融资",
+        "利率",
+        "电价",
+        "收入",
+        "成本",
+        "费用",
+        "税金",
+        "税收",
+        "折旧",
+        "摊销",
+        "利润",
+        "现金流",
+        "财务评价指标",
+        "评价指标",
+    ]
+
+    def _cat_priority(cat: str) -> int:
+        for i, kw in enumerate(_CATEGORY_PRIORITY):
+            if kw in cat:
+                return i
+        return len(_CATEGORY_PRIORITY)  # unmatched at end
+
     sorted_cats = sorted(
         [c for c in category_groups if c != "未分类"],
-        key=lambda c: len(category_groups[c]),
-        reverse=True,
+        key=_cat_priority,
     )
     if "未分类" in category_groups:
         sorted_cats.append("未分类")
