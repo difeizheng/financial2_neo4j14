@@ -189,6 +189,17 @@ def _render_compare_tabs(graph, task_id: str, task_output_dir: str, task_filenam
 
     # ── Helper: Excel locate via win32com ──────────────────────────────────────────
 
+    def _cell_to_ref(cid: str) -> str:
+        """Convert cell ID to Excel reference (e.g. '参数输入表!I250')."""
+        parts = cid.rsplit("_", 2)
+        if len(parts) != 3:
+            return cid
+        sheet, row, col = parts
+        ref = f"{col}{row}"
+        if sheet:
+            ref = f"{sheet}!{ref}"
+        return ref
+
     def _do_excel_locate(excel_path: str, ref: str) -> None:
         """Open Excel/WPS and navigate to the specified cell reference."""
         try:
@@ -277,6 +288,113 @@ def _render_compare_tabs(graph, task_id: str, task_output_dir: str, task_filenam
             st.error("需要安装 pywin32：pip install pywin32")
         except Exception as e:
             st.error(f"打开 Excel 失败：{e}")
+
+    def _do_excel_locate_row(
+        excel_path: str, sheet_name: str, row_num: int, cell_ids: list[str],
+    ) -> None:
+        """Highlight the entire indicator row in Excel."""
+        try:
+            import win32com.client
+            import pythoncom
+            pythoncom.CoInitialize()
+            try:
+                # Extract all columns from cell_ids
+                cols = set()
+                for cid in cell_ids:
+                    parts = cid.rsplit("_", 2)
+                    if len(parts) == 3:
+                        cols.add(parts[2])
+
+                if not cols:
+                    st.warning("无法解析列范围")
+                    return
+
+                # Sort by column index (A=1, Z=26, AA=27, etc.) not alphabetically
+                try:
+                    from openpyxl.utils import column_index_from_string
+                except ImportError:
+                    st.warning("无法导入 openpyxl.utils.column_index_from_string，列排序可能不准")
+                    column_index_from_string = lambda c: c  # fallback: alphabetical sort
+
+                sorted_cols = sorted(cols, key=lambda c: column_index_from_string(c))
+                min_col = sorted_cols[0]
+                max_col = sorted_cols[-1]
+                range_addr = f"{min_col}{row_num}:{max_col}{row_num}"
+
+                abs_path = os.path.abspath(excel_path)
+
+                xl = None
+                for prog_id in ["ket.Application", "Excel.Application"]:
+                    try:
+                        xl = win32com.client.GetActiveObject(prog_id)
+                        break
+                    except Exception:
+                        pass
+
+                if xl is None:
+                    for prog_id in ["ket.Application", "Excel.Application"]:
+                        try:
+                            xl = win32com.client.Dispatch(prog_id)
+                            break
+                        except Exception:
+                            continue
+
+                if xl is None:
+                    raise RuntimeError("未找到 WPS 或 Office Excel")
+
+                xl.Visible = True
+
+                wb = None
+                count = xl.Workbooks.Count
+                for i in range(1, count + 1):
+                    try:
+                        b = xl.Workbooks(i)
+                        if os.path.abspath(b.FullName) == abs_path:
+                            wb = b
+                            break
+                    except Exception:
+                        continue
+
+                if wb is None:
+                    wb = xl.Workbooks.Open(abs_path)
+
+                try:
+                    xl.Iteration = True
+                    xl.MaxIterations = 1000
+                    xl.MaxChange = 1e-6
+                except Exception:
+                    pass
+                try:
+                    wb.EnableIteration = True
+                except Exception:
+                    pass
+                try:
+                    wb.RefreshAll()
+                    wb.Calculate()
+                except Exception:
+                    pass
+
+                try:
+                    ws = wb.Sheets(sheet_name)
+                except Exception:
+                    st.warning(f"未找到工作表「{sheet_name}」")
+                    ws = wb.ActiveSheet
+                ws.Activate()
+
+                rng = ws.Range(range_addr)
+                rng.Select()
+                rng.Interior.Color = 0xFFFF00
+                rng.Font.Bold = True
+                st.success(
+                    f"已选中 {sheet_name} 第 {row_num} 行（{min_col} → {max_col}），"
+                    f"共 {len(cols)} 列，已标记黄色高亮（Ctrl+Z 撤销）"
+                )
+            finally:
+                pythoncom.CoUninitialize()
+        except ImportError as e:
+            st.error(f"pywin32 未安装或导入失败：{e}")
+        except Exception as e:
+            st.error(f"打开 Excel 失败：{type(e).__name__}: {e}")
 
 
     # ══════════════════════════════════════════════════════════════════════════════
@@ -439,8 +557,9 @@ def _render_compare_tabs(graph, task_id: str, task_output_dir: str, task_filenam
     with tab_matrix:
         st.subheader("变化矩阵")
 
-        # Build matrix data: rows = indicators, columns = cells with old/new/delta
+        # Build matrix data: rows = indicators, columns = old/new/delta
         matrix_data = []
+        mat_sheet_set: set[str] = set()
         for ind_entry in diff.affected_indicators:
             ind_id = ind_entry.get("id") if isinstance(ind_entry, dict) else ind_entry
             ind = graph.indicators.get(ind_id)
@@ -467,30 +586,82 @@ def _render_compare_tabs(graph, task_id: str, task_output_dir: str, task_filenam
 
             va = _safe_float(old_summary)
             vb = _safe_float(new_summary)
+
+            # Row number from indicator.row
+            row_num = ind.row if hasattr(ind, "row") and ind.row is not None else None
+
+            # Collect sheets for this indicator's changed cells
+            ind_sheets = {c.get("sheet", "") for c in changed_cells_for_ind if c.get("sheet")}
+            mat_sheet_set |= ind_sheets
+
             matrix_data.append({
                 "Indicator": ind.name or ind_id,
                 f"{snap_a_name}": old_summary,
                 f"{snap_b_name}": new_summary,
                 "变化": (vb - va) if (va is not None and vb is not None) else None,
                 "变化单元格数": len(changed_cells_for_ind),
+                "_row_num": row_num,
+                "_ind_id": ind_id,
+                "_sheet": ind.sheet,
+                "_cell_ids": [c["id"] for c in changed_cells_for_ind],
             })
 
         if matrix_data:
             # Filter bar
-            mat_search = st.text_input("搜索 Indicator", placeholder="输入 Indicator 名称筛选", label_visibility="collapsed")
+            mat_all_sheets = sorted(mat_sheet_set)
+            mat_col1, mat_col2 = st.columns([1, 2])
+            with mat_col1:
+                st.caption("按 Sheet 筛选")
+                mat_selected_sheets = st.multiselect(
+                    "Sheet", mat_all_sheets, default=[],
+                    key="matrix_sheets", label_visibility="collapsed",
+                )
+            with mat_col2:
+                st.caption("按 Indicator 名称搜索")
+                mat_search = st.text_input(
+                    "搜索", placeholder="输入关键词筛选",
+                    key="matrix_search", label_visibility="collapsed",
+                )
 
             filtered_mat = matrix_data
+            if mat_selected_sheets:
+                filtered_mat = [
+                    r for r in filtered_mat
+                    if any(
+                        c.get("sheet") in mat_selected_sheets
+                        for c in diff.changed_cells
+                        if c.get("indicator_name") == (r["Indicator"])
+                    )
+                ]
             if mat_search:
                 kw = mat_search.lower()
                 filtered_mat = [r for r in filtered_mat if kw in r["Indicator"].lower()]
 
             if filtered_mat:
-                st.dataframe(
-                    filtered_mat,
+                import pandas as pd
+
+                mat_rows = []
+                for r in filtered_mat:
+                    mat_rows.append({
+                        "行号": r["_row_num"] if r["_row_num"] is not None else "",
+                        "Indicator": r["Indicator"],
+                        f"{snap_a_name}": r[f"{snap_a_name}"],
+                        f"{snap_b_name}": r[f"{snap_b_name}"],
+                        "变化": r["变化"],
+                        "变化单元格数": r["变化单元格数"],
+                    })
+                mat_df = pd.DataFrame(mat_rows)
+
+                mat_event = st.dataframe(
+                    mat_df,
                     use_container_width=True,
                     hide_index=True,
                     height=600,
+                    on_select="rerun",
+                    selection_mode="single-row",
+                    key="matrix_table_select",
                     column_config={
+                        "行号": st.column_config.NumberColumn("行号", width="small"),
                         "Indicator": st.column_config.TextColumn("Indicator", width="medium"),
                         f"{snap_a_name}": st.column_config.NumberColumn(snap_a_name, width="small"),
                         f"{snap_b_name}": st.column_config.NumberColumn(snap_b_name, width="small"),
@@ -499,6 +670,35 @@ def _render_compare_tabs(graph, task_id: str, task_output_dir: str, task_filenam
                     },
                 )
                 st.caption(f"显示 {len(filtered_mat)} / {len(matrix_data)} 行")
+
+                # Excel locate on selected row — highlight entire indicator row
+                mat_selected_rows = mat_event.selection.get("rows", [])
+                mat_last = st.session_state.get("matrix_last_locate_id", "")
+                if mat_selected_rows:
+                    idx = mat_selected_rows[0]
+                    if idx < len(filtered_mat):
+                        sel = filtered_mat[idx]
+
+                        if sel["_ind_id"] != mat_last:
+                            st.session_state["matrix_last_locate_id"] = sel["_ind_id"]
+                            _mat_excel_path = st.session_state.get("excel_locate_path")
+                            if _mat_excel_path and sel["_row_num"] is not None:
+                                # Get ALL cells in this row from the graph (all columns across all tables)
+                                row_cell_ids = [
+                                    cid for cid, cell in graph.cells.items()
+                                    if cell.sheet == sel["_sheet"] and cell.row == sel["_row_num"]
+                                ]
+                                _do_excel_locate_row(
+                                    _mat_excel_path,
+                                    sel["_sheet"],
+                                    sel["_row_num"],
+                                    row_cell_ids,
+                                )
+
+                            st.caption(
+                                f"已选中：{sel['Indicator']} — "
+                                f"{len(sel['_cell_ids'])} 个变化单元格"
+                            )
             else:
                 st.info("无匹配数据")
         else:
@@ -557,16 +757,6 @@ def _render_compare_tabs(graph, task_id: str, task_output_dir: str, task_filenam
             st.info("无匹配的变化单元格")
         else:
             import pandas as pd
-
-            def _cell_to_ref(cid):
-                parts = cid.rsplit("_", 2)
-                if len(parts) != 3:
-                    return cid
-                sheet, row, col = parts
-                ref = f"{col}{row}"
-                if sheet:
-                    ref = f"{sheet}!{ref}"
-                return ref
 
             rows = []
             for c in filtered:

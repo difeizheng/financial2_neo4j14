@@ -144,8 +144,13 @@ def diff_snapshots(
         ind = graph.indicators.get(ind_id)
         if ind is None:
             continue
-        # Use the value cell (first numeric cell in indicator) as proxy
-        for cid in ind.cell_ids:
+        # Prefer value_cell_id (the primary value column set during indicator build)
+        # then fall back to first numeric cell in ind.cell_ids
+        candidate_ids = []
+        if ind.value_cell_id:
+            candidate_ids.append(ind.value_cell_id)
+        candidate_ids.extend(cid for cid in ind.cell_ids if cid != ind.value_cell_id)
+        for cid in candidate_ids:
             old_v = snap_a.values.get(cid)
             new_v = snap_b.values.get(cid)
             if isinstance(old_v, (int, float)) or isinstance(new_v, (int, float)):
