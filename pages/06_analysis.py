@@ -1305,35 +1305,35 @@ with tab_history:
 
             st.divider()
 
-    # Indicator when a history record is loaded
-    loaded_hint = [k for k in st.session_state.keys() if k.startswith(f"hist_loaded_") and st.session_state[k]]
-    if loaded_hint:
-        last_loaded = loaded_hint[-1]
-        loaded_id = last_loaded.replace(f"hist_loaded_", "")
-        st.success(f"记录 #{loaded_id} 已加载到「敏感性分析」Tab，可查看龙卷风图/蛛网图等完整分析。")
+            # Indicator when a history record is loaded
+            loaded_hint = [k for k in st.session_state.keys() if k.startswith(f"hist_loaded_") and st.session_state[k]]
+            if loaded_hint:
+                last_loaded = loaded_hint[-1]
+                loaded_id = last_loaded.replace(f"hist_loaded_", "")
+                st.success(f"记录 #{loaded_id} 已加载到「敏感性分析」Tab，可查看龙卷风图/蛛网图等完整分析。")
 
-    # Comparison mode toggle
-    comparison_mode = st.toggle("对比模式", key="hist_compare_mode")
+            # Comparison mode toggle
+            comparison_mode = st.toggle("对比模式", key="hist_compare_mode")
 
-    if comparison_mode:
-        st.divider()
-        st.subheader("选择两条历史记录进行对比")
+            if comparison_mode:
+                st.divider()
+                st.subheader("选择两条历史记录进行对比")
 
-        col_h1, col_h2 = st.columns(2)
-        with col_h1:
-            hist_ids_a = {f"[{h['id']}] {h['run_name']} ({h['created_at'][:19]})": h for h in history}
-            sel_a = st.selectbox("记录 A", list(hist_ids_a.keys()), key="hist_sel_a")
-        with col_h2:
-            hist_ids_b = {f"[{h['id']}] {h['run_name']} ({h['created_at'][:19]})": h for h in history}
-            sel_b = st.selectbox("记录 B", list(hist_ids_b.keys()), key="hist_sel_b")
+                col_h1, col_h2 = st.columns(2)
+                with col_h1:
+                    hist_ids_a = {f"[{h['id']}] {h['run_name']} ({h['created_at'][:19]})": h for h in history}
+                    sel_a = st.selectbox("记录 A", list(hist_ids_a.keys()), key="hist_sel_a")
+                with col_h2:
+                    hist_ids_b = {f"[{h['id']}] {h['run_name']} ({h['created_at'][:19]})": h for h in history}
+                    sel_b = st.selectbox("记录 B", list(hist_ids_b.keys()), key="hist_sel_b")
 
-        if sel_a and sel_b:
-            h_a = hist_ids_a[sel_a]
-            h_b = hist_ids_b[sel_b]
+                if sel_a and sel_b:
+                    h_a = hist_ids_a[sel_a]
+                    h_b = hist_ids_b[sel_b]
 
-            # Comparison table
-            st.divider()
-            st.subheader(f"{h_a['run_name']} vs {h_b['run_name']}")
+                    # Comparison table
+                    st.divider()
+                    st.subheader(f"{h_a['run_name']} vs {h_b['run_name']}")
 
             # Base metrics comparison
             base_a = h_a["base_metrics"]
@@ -1394,11 +1394,11 @@ with tab_history:
             if compare_param_rows:
                 st.dataframe(compare_param_rows, use_container_width=True, hide_index=True)
 
-    else:
-        # Single record view
-        st.divider()
-        hist_ids = {f"[{h['id']}] {h['run_name']} ({h['created_at'][:19]})": h for h in history}
-        selected_hist = st.selectbox("查看历史详情", list(hist_ids.keys()), label_visibility="collapsed")
+            else:
+                # Single record view
+                st.divider()
+                hist_ids = {f"[{h['id']}] {h['run_name']} ({h['created_at'][:19]})": h for h in history}
+                selected_hist = st.selectbox("查看历史详情", list(hist_ids.keys()), label_visibility="collapsed")
 
         if selected_hist:
             h = hist_ids[selected_hist]
