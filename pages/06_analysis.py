@@ -152,7 +152,7 @@ all_params = _build_params(task.id, task.output_dir)
 all_categories = sorted(set(r["category"] for r in all_params if r["category"]))
 
 # ── Tabs ─────────────────────────────────────────────────────────────────────
-tab_sensitivity, tab_break_even, tab_scenario, tab_history, tab_export = st.tabs(["敏感性分析", "盈亏平衡", "场景构建", "历史记录", "导出报告"])
+tab_sensitivity, tab_break_even, tab_scenario, tab_monte_carlo, tab_history, tab_export = st.tabs(["敏感性分析", "盈亏平衡", "情景分析", "蒙特卡罗", "历史记录", "导出报告"])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -815,6 +815,286 @@ with tab_scenario:
                 f"<strong>风险等级:</strong> <span style='color:{risk_color};font-weight:bold'>{risk_level}</span><br/>"
                 f"<strong>悲观情景IRR:</strong> {pessimistic_irr * 100:.2f}% "
                 f"<span style='color:{risk_color}'>({irr_delta * 100:+.2f}pp)</span><br/>"
+                f"<strong>评估:</strong> {risk_note}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Tab 4: Monte Carlo Simulation
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_monte_carlo:
+    st.subheader("蒙特卡罗模拟")
+    st.caption("基于概率分布的随机抽样模拟，得到输出指标的概率分布和置信区间")
+
+    # ── Parameter selection ───────────────────────────────────────────────
+    st.divider()
+    st.subheader("选择分析变量")
+
+    col_mc1, col_mc2 = st.columns([2, 3])
+    with col_mc1:
+        mc_cat_filter = st.multiselect("按类别筛选", all_categories, default=[], key="mc_cat")
+    with col_mc2:
+        mc_search_kw = st.text_input("搜索参数", placeholder="Indicator 名称 / Sheet", key="mc_search")
+
+    mc_filtered = all_params
+    if mc_cat_filter:
+        mc_filtered = [r for r in mc_filtered if r["category"] in mc_cat_filter]
+    if mc_search_kw:
+        kw = mc_search_kw.lower()
+        mc_filtered = [r for r in mc_filtered if kw in r["name"].lower() or kw in r["sheet"].lower()]
+
+    mc_param_options = {
+        f"{r['name']} | {r['sheet']} 第{r['row']}行 {r['col']}列 = {r['value']:,.2f}": r
+        for r in mc_filtered
+    }
+
+    if not mc_param_options:
+        st.info("无匹配的参数")
+    else:
+        selected_mc_keys = st.multiselect(
+            "选择变量（建议 2-4 个）",
+            list(mc_param_options.keys()),
+            default=st.session_state.get(f"mc_sel_{task.id}", []),
+            key="mc_multiselect",
+        )
+        st.session_state[f"mc_sel_{task.id}"] = selected_mc_keys
+
+        # ── Distribution configuration ───────────────────────────────────────────
+        if selected_mc_keys:
+            st.divider()
+            st.subheader("设置概率分布")
+
+            iterations = st.slider(
+                "模拟次数",
+                min_value=100,
+                max_value=5000,
+                value=1000,
+                step=100,
+                help="次数越多结果越精确，但耗时更长",
+            )
+
+            dist_configs = []
+            for key in selected_mc_keys:
+                r = mc_param_options[key]
+
+                col_d1, col_d2, col_d3 = st.columns([3, 2, 2])
+                with col_d1:
+                    st.caption(f"{r['name']}")
+                with col_d2:
+                    dist_type = st.selectbox(
+                        "分布类型",
+                        ["正态分布", "均匀分布", "三角分布"],
+                        key=f"mc_dist_type_{r['cell_id']}",
+                        label_visibility="collapsed",
+                    )
+                with col_d3:
+                    if dist_type == "正态分布":
+                        std_val = st.number_input(
+                            "标准差",
+                            value=0.10,
+                            step=0.01,
+                            format="%.2f",
+                            key=f"mc_std_{r['cell_id']}",
+                            help="变动范围约为 ±3σ，如σ=0.1则约±30%",
+                        )
+                        from financial_kg.engine.monte_carlo import DistributionConfig
+                        dist_configs.append((
+                            r["cell_id"],
+                            r["name"],
+                            DistributionConfig(type="normal", params={"mean": 0, "std": std_val}),
+                        ))
+                    elif dist_type == "均匀分布":
+                        min_val = st.number_input("最小", value=-0.15, step=0.01, format="%.2f", key=f"mc_min_{r['cell_id']}")
+                        max_val = st.number_input("最大", value=0.15, step=0.01, format="%.2f", key=f"mc_max_{r['cell_id']}")
+                        dist_configs.append((
+                            r["cell_id"],
+                            r["name"],
+                            DistributionConfig(type="uniform", params={"min": min_val, "max": max_val}),
+                        ))
+                    elif dist_type == "三角分布":
+                        min_val = st.number_input("最小", value=-0.15, step=0.01, format="%.2f", key=f"mc_tri_min_{r['cell_id']}")
+                        mode_val = st.number_input("峰值", value=0.0, step=0.01, format="%.2f", key=f"mc_tri_mode_{r['cell_id']}")
+                        max_val = st.number_input("最大", value=0.15, step="%.2f", key=f"mc_tri_max_{r['cell_id']}")
+                        dist_configs.append((
+                            r["cell_id"],
+                            r["name"],
+                            DistributionConfig(type="triangular", params={"min": min_val, "mode": mode_val, "max": max_val}),
+                        ))
+
+            # ── Run simulation ───────────────────────────────────────────────────
+            st.divider()
+            if st.button("运行蒙特卡罗模拟", type="primary", use_container_width=True):
+                from financial_kg.engine.monte_carlo import run_monte_carlo
+
+                progress_bar = st.progress(0, text=f"模拟中 (0/{iterations})...")
+
+                with st.spinner(f"执行 {iterations} 次模拟..."):
+                    mc_result = run_monte_carlo(
+                        graph=graph,
+                        param_cells=dist_configs,
+                        iterations=iterations,
+                        seed=42,  # Reproducible
+                    )
+
+                progress_bar.empty()
+                st.session_state[f"mc_result_{task.id}"] = mc_result
+                st.toast(f"完成 {iterations} 次模拟")
+                st.rerun()
+
+    # ── Display results ───────────────────────────────────────────────────────
+    mc_result_key = f"mc_result_{task.id}"
+    mc_result = st.session_state.get(mc_result_key)
+
+    if mc_result:
+        from financial_kg.engine.monte_carlo import MonteCarloResult
+        mc: MonteCarloResult = mc_result
+
+        st.divider()
+        st.subheader("模拟结果")
+
+        if st.button("清除结果", type="secondary", key="clear_mc_result"):
+            st.session_state.pop(mc_result_key, None)
+            st.rerun()
+
+        # Base metrics
+        bm = mc.base_metrics
+        st.caption(f"基准: IRR={bm.irr_after_tax * 100:.2f}%, NPV={bm.npv_after_tax:,.0f}")
+
+        # ── Statistics table ───────────────────────────────────────────────────
+        st.subheader("统计指标")
+
+        stats_rows = []
+        METRICS_LABELS = {
+            "irr_after_tax": ("税后IRR", 100, "%"),
+            "npv_after_tax": ("财务净现值", 1, ""),
+            "payback_period": ("投资回收期", 1, "年"),
+        }
+
+        for metric_key, (label, mult, unit) in METRICS_LABELS.items():
+            if metric_key in mc.statistics:
+                s = mc.statistics[metric_key]
+                stats_rows.append({
+                    "指标": label,
+                    "均值": f"{s['mean'] * mult:.2f}{unit}",
+                    "标准差": f"{s['std'] * mult:.2f}{unit}",
+                    "最小值": f"{s['min'] * mult:.2f}{unit}",
+                    "最大值": f"{s['max'] * mult:.2f}{unit}",
+                    "中位数": f"{s['median'] * mult:.2f}{unit}",
+                    "5%分位": f"{s['p5'] * mult:.2f}{unit}",
+                    "95%分位": f"{s['p95'] * mult:.2f}{unit}",
+                })
+
+        if stats_rows:
+            st.dataframe(stats_rows, use_container_width=True, hide_index=True, height=200)
+
+        # ── Probability table ───────────────────────────────────────────────────
+        st.subheader("IRR达标概率")
+
+        if mc.probability_table:
+            st.dataframe(mc.probability_table, use_container_width=True, hide_index=True, height=200)
+
+        # ── Confidence intervals ────────────────────────────────────────────────
+        st.subheader("95%置信区间")
+
+        ci_rows = []
+        for metric_key, (label, mult, unit) in METRICS_LABELS.items():
+            if metric_key in mc.confidence_intervals:
+                ci = mc.confidence_intervals[metric_key]
+                ci_rows.append({
+                    "指标": label,
+                    "下限": f"{ci[0] * mult:.2f}{unit}",
+                    "上限": f"{ci[1] * mult:.2f}{unit}",
+                })
+
+        if ci_rows:
+            st.dataframe(ci_rows, use_container_width=True, hide_index=True, height=150)
+
+        # ── Distribution histogram ──────────────────────────────────────────────
+        st.divider()
+        st.subheader("IRR概率分布")
+
+        if mc.simulations:
+            import json
+
+            irr_values = [s.metrics.irr_after_tax * 100 for s in mc.simulations if s.metrics.irr_after_tax]
+
+            if irr_values:
+                # Build histogram bins
+                min_irr = min(irr_values)
+                max_irr = max(irr_values)
+                bins = 20
+                bin_width = (max_irr - min_irr) / bins
+
+                counts = []
+                bin_labels = []
+                for i in range(bins):
+                    bin_start = min_irr + i * bin_width
+                    bin_end = bin_start + bin_width
+                    count = sum(1 for v in irr_values if bin_start <= v < bin_end)
+                    counts.append(count)
+                    bin_labels.append(f"{bin_start:.1f}")
+
+                chart_option = {
+                    "title": {"text": "IRR概率分布", "left": "center", "textStyle": {"fontSize": 14}},
+                    "tooltip": {"trigger": "axis"},
+                    "xAxis": {"type": "category", "data": bin_labels, "name": "IRR (%)"},
+                    "yAxis": {"type": "value", "name": "频数"},
+                    "series": [{
+                        "name": "频数",
+                        "type": "bar",
+                        "data": counts,
+                        "itemStyle": {"color": "#3b82f6"},
+                    }],
+                }
+
+                chart_html = (
+                    "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                    "<script src='https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js'></script>"
+                    "<style>body{margin:0;font-family:sans-serif;}#chart{width:100%;height:280px;}</style>"
+                    "</head><body><div id='chart'></div>"
+                    "<script>var chart=echarts.init(document.getElementById('chart'));"
+                    "var option=" + json.dumps(chart_option, ensure_ascii=False) + ";"
+                    "chart.setOption(option);window.addEventListener('resize',function(){chart.resize();});"
+                    "</script></body></html>"
+                )
+                st.components.v1.html(chart_html, height=300, scrolling=False)
+
+        # ── Risk assessment ───────────────────────────────────────────────────────
+        st.divider()
+        st.subheader("风险评估")
+
+        if "irr_after_tax" in mc.statistics:
+            stats = mc.statistics["irr_after_tax"]
+            mean_irr = stats["mean"]
+            std_irr = stats["std"]
+            p5_irr = stats["p5"]
+
+            # Risk criteria
+            if p5_irr < 0.04:  # 5th percentile below 4%
+                risk_level = "极高风险"
+                risk_color = "#991b1b"
+                risk_note = "5%分位IRR低于4%，极端情况下项目可能亏损"
+            elif p5_irr < 0.06:  # 5th percentile below 6%
+                risk_level = "高风险"
+                risk_color = "#dc2626"
+                risk_note = "5%分位IRR低于行业基准6%，有较高概率不达标"
+            elif std_irr > 0.02:  # High volatility
+                risk_level = "中风险"
+                risk_color = "#f59e0b"
+                risk_note = f"IRR波动性较大（σ={std_irr * 100:.2f}%），不确定性高"
+            else:
+                risk_level = "低风险"
+                risk_color = "#16a34a"
+                risk_note = "IRR分布集中，波动性小，项目收益稳定"
+
+            st.markdown(
+                f"<div style='padding:12px;background:#f8fafc;border-left:4px solid {risk_color};"
+                f"border-radius:4px;'>"
+                f"<strong>风险等级:</strong> <span style='color:{risk_color};font-weight:bold'>{risk_level}</span><br/>"
+                f"<strong>均值IRR:</strong> {mean_irr * 100:.2f}% (σ={std_irr * 100:.2f}%)<br/>"
+                f"<strong>5%分位IRR:</strong> {p5_irr * 100:.2f}% (极端情况)<br/>"
                 f"<strong>评估:</strong> {risk_note}"
                 f"</div>",
                 unsafe_allow_html=True,
