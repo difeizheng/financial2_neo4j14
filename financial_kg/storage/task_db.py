@@ -93,6 +93,33 @@ class TaskDB:
                     FOREIGN KEY (task_id) REFERENCES tasks(id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_sensitivity_task ON sensitivity_history(task_id);
+                CREATE TABLE IF NOT EXISTS scenario_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    run_name TEXT NOT NULL,
+                    params TEXT NOT NULL DEFAULT '[]',
+                    base_metrics TEXT NOT NULL DEFAULT '{}',
+                    scenarios TEXT NOT NULL DEFAULT '[]',
+                    comparison_table TEXT NOT NULL DEFAULT '[]',
+                    delta_table TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (task_id) REFERENCES tasks(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_scenario_task ON scenario_history(task_id);
+                CREATE TABLE IF NOT EXISTS monte_carlo_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    run_name TEXT NOT NULL,
+                    mode TEXT NOT NULL DEFAULT 'fast',
+                    iterations INTEGER NOT NULL,
+                    params TEXT NOT NULL DEFAULT '[]',
+                    base_irr REAL DEFAULT 0,
+                    statistics TEXT NOT NULL DEFAULT '{}',
+                    probability_table TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (task_id) REFERENCES tasks(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_monte_carlo_task ON monte_carlo_history(task_id);
                 CREATE TABLE IF NOT EXISTS qa_answers (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     task_id TEXT NOT NULL,
@@ -427,6 +454,155 @@ class TaskDB:
 
         wb.save(output_path)
         return output_path
+
+    # ── Scenario History ────────────────────────────────────────────────────────
+
+    def save_scenario(
+        self,
+        task_id: str,
+        run_name: str,
+        params: list[dict],
+        base_metrics: dict,
+        scenarios: list[dict],
+        comparison_table: list[dict],
+        delta_table: list[dict],
+    ) -> int:
+        """Save scenario analysis result, return record_id."""
+        now = datetime.now().isoformat()
+        with self._conn() as conn:
+            cur = conn.execute(
+                "INSERT INTO scenario_history (task_id, run_name, params, base_metrics, scenarios, comparison_table, delta_table, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (task_id, run_name, json.dumps(params, ensure_ascii=False),
+                 json.dumps(base_metrics, ensure_ascii=False),
+                 json.dumps(scenarios, ensure_ascii=False),
+                 json.dumps(comparison_table, ensure_ascii=False),
+                 json.dumps(delta_table, ensure_ascii=False), now),
+            )
+            return cur.lastrowid
+
+    def list_scenario(self, task_id: str) -> list[dict]:
+        """List scenario analysis history for a task."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT id, run_name, params, base_metrics, scenarios, comparison_table, delta_table, created_at "
+                "FROM scenario_history WHERE task_id=? ORDER BY created_at DESC",
+                (task_id,),
+            ).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "run_name": r["run_name"],
+                "params": json.loads(r["params"]),
+                "base_metrics": json.loads(r["base_metrics"]),
+                "scenarios": json.loads(r["scenarios"]),
+                "comparison_table": json.loads(r["comparison_table"]),
+                "delta_table": json.loads(r["delta_table"]),
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+
+    def load_scenario(self, record_id: int) -> Optional[dict]:
+        """Load a single scenario analysis record."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM scenario_history WHERE id=?", (record_id,)
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row["id"],
+            "task_id": row["task_id"],
+            "run_name": row["run_name"],
+            "params": json.loads(row["params"]),
+            "base_metrics": json.loads(row["base_metrics"]),
+            "scenarios": json.loads(row["scenarios"]),
+            "comparison_table": json.loads(row["comparison_table"]),
+            "delta_table": json.loads(row["delta_table"]),
+            "created_at": row["created_at"],
+        }
+
+    def delete_scenario(self, record_id: int) -> None:
+        """Delete a scenario analysis record."""
+        with self._conn() as conn:
+            conn.execute("DELETE FROM scenario_history WHERE id=?", (record_id,))
+
+    # ── Monte Carlo History ────────────────────────────────────────────────────────
+
+    def save_monte_carlo(
+        self,
+        task_id: str,
+        run_name: str,
+        mode: str,
+        iterations: int,
+        params: list[dict],
+        base_irr: float,
+        statistics: dict,
+        probability_table: list[dict],
+    ) -> int:
+        """Save monte carlo result, return record_id."""
+        now = datetime.now().isoformat()
+        with self._conn() as conn:
+            cur = conn.execute(
+                "INSERT INTO monte_carlo_history (task_id, run_name, mode, iterations, params, base_irr, statistics, probability_table, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (task_id, run_name, mode, iterations,
+                 json.dumps(params, ensure_ascii=False),
+                 base_irr,
+                 json.dumps(statistics, ensure_ascii=False),
+                 json.dumps(probability_table, ensure_ascii=False), now),
+            )
+            return cur.lastrowid
+
+    def list_monte_carlo(self, task_id: str) -> list[dict]:
+        """List monte carlo history for a task."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT id, run_name, mode, iterations, params, base_irr, statistics, probability_table, created_at "
+                "FROM monte_carlo_history WHERE task_id=? ORDER BY created_at DESC",
+                (task_id,),
+            ).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "run_name": r["run_name"],
+                "mode": r["mode"],
+                "iterations": r["iterations"],
+                "params": json.loads(r["params"]),
+                "base_irr": r["base_irr"],
+                "statistics": json.loads(r["statistics"]),
+                "probability_table": json.loads(r["probability_table"]),
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+
+    def load_monte_carlo(self, record_id: int) -> Optional[dict]:
+        """Load a single monte carlo record."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM monte_carlo_history WHERE id=?", (record_id,)
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row["id"],
+            "task_id": row["task_id"],
+            "run_name": row["run_name"],
+            "mode": row["mode"],
+            "iterations": row["iterations"],
+            "params": json.loads(row["params"]),
+            "base_irr": row["base_irr"],
+            "statistics": json.loads(row["statistics"]),
+            "probability_table": json.loads(row["probability_table"]),
+            "created_at": row["created_at"],
+        }
+
+    def delete_monte_carlo(self, record_id: int) -> None:
+        """Delete a monte carlo record."""
+        with self._conn() as conn:
+            conn.execute("DELETE FROM monte_carlo_history WHERE id=?", (record_id,))
 
     # ── Delete ─────────────────────────────────────────────────────────────────
 

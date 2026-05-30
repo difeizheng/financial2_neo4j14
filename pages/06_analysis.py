@@ -664,7 +664,33 @@ with tab_scenario:
                     )
 
                 st.session_state[f"scn_result_{task.id}"] = scn_result
-                st.toast("情景分析完成")
+
+                # Save to database
+                params_data = [{"cell_id": c, "name": n, "classification": cls} for c, n, cls in classifications]
+                base_metrics_data = {
+                    k: v for k in ["irr_after_tax", "npv_after_tax", "payback_period", "dscr_avg", "dscr_min"]
+                    if (v := getattr(scn_result.base_metrics, k, None)) is not None
+                }
+                scenarios_data = []
+                for s in scn_result.scenarios:
+                    scenarios_data.append({
+                        "name": s.name,
+                        "param_changes": s.param_changes,
+                        "metrics": {k: v for k in ["irr_after_tax", "npv_after_tax", "payback_period"]
+                                    if (v := getattr(s.metrics, k, None)) is not None},
+                        "changed_cells": s.changed_cells,
+                    })
+                db.save_scenario(
+                    task_id=task.id,
+                    run_name=f"情景分析_{len(classifications)}参数_{time.strftime('%H%M')}",
+                    params=params_data,
+                    base_metrics=base_metrics_data,
+                    scenarios=scenarios_data,
+                    comparison_table=scn_result.comparison_table,
+                    delta_table=scn_result.delta_table,
+                )
+
+                st.toast("情景分析完成并已保存")
                 st.rerun()
 
         # ── Custom scenario mode ───────────────────────────────────────────────
@@ -972,7 +998,22 @@ with tab_monte_carlo:
 
                     st.session_state[f"mc_result_{task.id}"] = mc_result
                     st.session_state[f"mc_mode_{task.id}"] = "fast"
-                    st.toast(f"快速模式完成 {iterations} 次模拟")
+
+                    # Save to database
+                    params_data = [{"name": name, "distribution": {"type": dc.type, "params": dc.params}}
+                                   for name, dc in fast_dists]
+                    db.save_monte_carlo(
+                        task_id=task.id,
+                        run_name=f"蒙特卡罗_快速_{iterations}次_{time.strftime('%H%M')}",
+                        mode="fast",
+                        iterations=iterations,
+                        params=params_data,
+                        base_irr=base_irr,
+                        statistics=mc_result.statistics,
+                        probability_table=mc_result.probability_table,
+                    )
+
+                    st.toast(f"快速模式完成 {iterations} 次模拟并已保存")
                     st.rerun()
 
                 else:
@@ -992,7 +1033,22 @@ with tab_monte_carlo:
                     progress_bar.empty()
                     st.session_state[f"mc_result_{task.id}"] = mc_result
                     st.session_state[f"mc_mode_{task.id}"] = "precise"
-                    st.toast(f"精确模式完成 {iterations} 次模拟")
+
+                    # Save to database
+                    params_data = [{"name": name, "distribution": {"type": dc.type, "params": dc.params}}
+                                   for name, dc in dist_configs]
+                    db.save_monte_carlo(
+                        task_id=task.id,
+                        run_name=f"蒙特卡罗_精确_{iterations}次_{time.strftime('%H%M')}",
+                        mode="precise",
+                        iterations=iterations,
+                        params=params_data,
+                        base_irr=mc_result.base_metrics.irr_after_tax or 0.068,
+                        statistics=mc_result.statistics.get("irr_after_tax", {}),
+                        probability_table=mc_result.probability_table,
+                    )
+
+                    st.toast(f"精确模式完成 {iterations} 次模拟并已保存")
                     st.rerun()
 
     # ── Display results ───────────────────────────────────────────────────────
@@ -1145,6 +1201,101 @@ with tab_monte_carlo:
                 unsafe_allow_html=True,
             )
 
+    # ── Scenario History ───────────────────────────────────────────────────
+    with hist_scenario:
+        scenario_history = db.list_scenario(task.id)
+
+        if not scenario_history:
+            st.info("暂无情景分析历史")
+        else:
+            st.caption(f"共 {len(scenario_history)} 条记录")
+
+            for h in scenario_history:
+                params_str = ", ".join(p.get("name", "")[:15] for p in h["params"][:3])
+                base = h["base_metrics"]
+                irr = base.get("irr_after_tax")
+
+                col_s1, col_s2, col_s3, col_s4, col_s5 = st.columns([1, 3, 2, 2, 1])
+                with col_s1:
+                    st.caption(f"#{h['id']}")
+                with col_s2:
+                    st.caption(h["created_at"][:19])
+                with col_s3:
+                    st.caption(params_str)
+                with col_s4:
+                    st.caption(f"基准IRR={irr * 100:.2f}%" if irr else "—")
+                with col_s5:
+                    if st.button("📊 加载", key=f"load_scn_hist_{h['id']}", use_container_width=True):
+                        # Rebuild ScenarioAnalysisResult from stored data
+                        from financial_kg.engine.scenario_analysis import ScenarioAnalysisResult, ScenarioResult
+                        base_metrics = DerivedMetrics(
+                            irr_after_tax=base.get("irr_after_tax"),
+                            npv_after_tax=base.get("npv_after_tax"),
+                            payback_period=base.get("payback_period"),
+                        )
+                        scenarios = []
+                        for s in h["scenarios"]:
+                            scenarios.append(ScenarioResult(
+                                name=s["name"],
+                                param_changes=s.get("param_changes", {}),
+                                metrics=DerivedMetrics(
+                                    irr_after_tax=s.get("metrics", {}).get("irr_after_tax"),
+                                    npv_after_tax=s.get("metrics", {}).get("npv_after_tax"),
+                                ),
+                                changed_cells=s.get("changed_cells", 0),
+                            ))
+                        rebuilt = ScenarioAnalysisResult(
+                            base_metrics=base_metrics,
+                            scenarios=scenarios,
+                            comparison_table=h["comparison_table"],
+                            delta_table=h["delta_table"],
+                        )
+                        st.session_state[f"scn_result_{task.id}"] = rebuilt
+                        st.toast(f"已加载情景分析 #{h['id']}")
+                        st.rerun()
+
+    # ── Monte Carlo History ───────────────────────────────────────────────────
+    with hist_mc:
+        mc_history = db.list_monte_carlo(task.id)
+
+        if not mc_history:
+            st.info("暂无蒙特卡罗历史")
+        else:
+            st.caption(f"共 {len(mc_history)} 条记录")
+
+            for h in mc_history:
+                stats = h["statistics"]
+                mean_irr = stats.get("mean", 0)
+
+                col_m1, col_m2, col_m3, col_m4, col_m5, col_m6 = st.columns([1, 2, 2, 2, 2, 1])
+                with col_m1:
+                    st.caption(f"#{h['id']}")
+                with col_m2:
+                    st.caption(h["created_at"][:19])
+                with col_m3:
+                    mode_label = "⚡快速" if h["mode"] == "fast" else "🎯精确"
+                    st.caption(f"{mode_label} {h['iterations']}次")
+                with col_m4:
+                    st.caption(f"均值IRR={mean_irr * 100:.2f}%")
+                with col_m5:
+                    std_irr = stats.get("std", 0)
+                    st.caption(f"σ={std_irr * 100:.2f}%")
+                with col_m6:
+                    if st.button("📊 加载", key=f"load_mc_hist_{h['id']}", use_container_width=True):
+                        # Rebuild FastMonteCarloResult from stored data
+                        from financial_kg.engine.monte_carlo_fast import FastMonteCarloResult
+                        rebuilt = FastMonteCarloResult(
+                            base_irr=h["base_irr"],
+                            iterations=h["iterations"],
+                            irr_values=[],  # Not stored, empty
+                            statistics=stats,
+                            probability_table=h["probability_table"],
+                        )
+                        st.session_state[f"mc_result_{task.id}"] = rebuilt
+                        st.session_state[f"mc_mode_{task.id}"] = h["mode"]
+                        st.toast(f"已加载蒙特卡罗 #{h['id']}")
+                        st.rerun()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Tab 5: Export Report
@@ -1204,44 +1355,50 @@ with tab_export:
 # Tab 4: Sensitivity History
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_history:
-    history = db.list_sensitivity(task.id)
+    st.subheader("历史记录")
 
-    if not history:
-        st.info("暂无敏感性分析历史")
-        st.stop()
+    # Sub-tabs for different analysis types
+    hist_sens, hist_scenario, hist_mc = st.tabs(["敏感性分析", "情景分析", "蒙特卡罗"])
 
-    st.subheader("历史分析记录")
+    # ── Sensitivity History ───────────────────────────────────────────────────
+    with hist_sens:
+        history = db.list_sensitivity(task.id)
 
-    # History table with "load to analysis" button
-    for h in history:
-        params_str = ", ".join(p["name"] for p in h["params"][:5])
-        if len(h["params"]) > 5:
-            params_str += f" ... +{len(h['params']) - 5}"
-        base = h["base_metrics"]
-        irr = base.get("irr_after_tax")
+        if not history:
+            st.info("暂无敏感性分析历史")
+        else:
+            st.caption(f"共 {len(history)} 条记录")
 
-        col_t1, col_t2, col_t3, col_t4, col_t5, col_t6, col_t7 = st.columns([1, 3, 3, 2, 2, 2, 1])
-        with col_t1:
-            st.caption(f"#{h['id']}")
-        with col_t2:
-            st.caption(h["created_at"][:19])
-        with col_t3:
-            st.caption(params_str)
-        with col_t4:
-            st.caption(", ".join(f"{p:+.0%}" for p in h["perturbations"]))
-        with col_t5:
-            st.caption(f"{irr * 100:.2f}%" if irr else "—")
-        with col_t6:
-            st.caption(str(len(h["scenarios"])))
-        with col_t7:
-            if st.button("📊 加载", key=f"load_hist_{h['id']}", use_container_width=True, help="加载到敏感性分析Tab查看图表"):
-                rebuilt = _rebuild_result_from_history(h)
-                st.session_state[f"sens_result_{task.id}"] = rebuilt
-                st.session_state[f"hist_loaded_{h['id']}"] = True
-                st.toast(f"已加载记录 #{h['id']}，正在切换到分析视图...")
-                st.rerun()
+            # History table with "load to analysis" button
+            for h in history:
+                params_str = ", ".join(p["name"] for p in h["params"][:5])
+                if len(h["params"]) > 5:
+                    params_str += f" ... +{len(h['params']) - 5}"
+                base = h["base_metrics"]
+                irr = base.get("irr_after_tax")
 
-    st.divider()
+                col_t1, col_t2, col_t3, col_t4, col_t5, col_t6, col_t7 = st.columns([1, 3, 3, 2, 2, 2, 1])
+                with col_t1:
+                    st.caption(f"#{h['id']}")
+                with col_t2:
+                    st.caption(h["created_at"][:19])
+                with col_t3:
+                    st.caption(params_str)
+                with col_t4:
+                    st.caption(", ".join(f"{p:+.0%}" for p in h["perturbations"]))
+                with col_t5:
+                    st.caption(f"{irr * 100:.2f}%" if irr else "—")
+                with col_t6:
+                    st.caption(str(len(h["scenarios"])))
+                with col_t7:
+                    if st.button("📊 加载", key=f"load_hist_{h['id']}", use_container_width=True, help="加载到敏感性分析Tab查看图表"):
+                        rebuilt = _rebuild_result_from_history(h)
+                        st.session_state[f"sens_result_{task.id}"] = rebuilt
+                        st.session_state[f"hist_loaded_{h['id']}"] = True
+                        st.toast(f"已加载记录 #{h['id']}，正在切换到分析视图...")
+                        st.rerun()
+
+            st.divider()
 
     # Indicator when a history record is loaded
     loaded_hint = [k for k in st.session_state.keys() if k.startswith(f"hist_loaded_") and st.session_state[k]]
