@@ -857,18 +857,31 @@ with tab_monte_carlo:
     # ── Mode selector ───────────────────────────────────────────────
     mc_mode = st.radio(
         "计算模式",
-        ["快速模式（敏感性系数近似）", "精确模式（全表重算）"],
+        ["快速模式（敏感性系数近似）", "并行精确模式（多进程）", "精确模式（单进程）"],
         horizontal=True,
         key="mc_mode",
-        help="快速模式1000次仅需1秒，准确度97%；精确模式100次需5-10分钟",
+        help="快速:1秒/1000次; 并行:4进程125分钟/100次; 精确:单进程500分钟/100次",
     )
 
     is_fast_mode = mc_mode == "快速模式（敏感性系数近似）"
+    is_parallel_mode = mc_mode == "并行精确模式（多进程）"
 
     if is_fast_mode:
-        st.info("⚡ 快速模式：使用预计算敏感性系数近似，1000次迭代仅需1秒，准确度约97%")
+        st.info("⚡ 快速模式：敏感性系数近似，1000次仅需1秒，准确度约97%")
+    elif is_parallel_mode:
+        st.info("🚀 并行模式：多进程并行执行，4进程×100次≈125分钟")
+        # Workers configuration
+        workers = st.slider(
+            "进程数量",
+            min_value=1,
+            max_value=16,
+            value=4,
+            step=1,
+            help="建议设置为CPU核心数",
+        )
+        st.caption(f"预计耗时: {iterations * 5 / workers:.1f} 分钟")
     else:
-        st.warning("⚠️ 精确模式：每次迭代需全表重算（3-5分钟），100次约需5-10分钟")
+        st.warning("⚠️ 精确模式：单进程执行，100次约需500分钟")
 
     # ── Parameter selection ───────────────────────────────────────────────
     st.divider()
@@ -1016,8 +1029,64 @@ with tab_monte_carlo:
                     st.toast(f"快速模式完成 {iterations} 次模拟并已保存")
                     st.rerun()
 
+                elif is_parallel_mode:
+                    # Parallel mode: multiprocessing
+                    from financial_kg.engine.monte_carlo_parallel import run_monte_carlo_parallel
+                    from financial_kg.engine.monte_carlo import DistributionConfig
+
+                    # Build distribution configs
+                    parallel_dists = []
+                    for key in selected_mc_keys:
+                        r = mc_param_options[key]
+                        cell_id = r["cell_id"]
+                        param_name = r["name"]
+                        # Get distribution config from UI (reuse existing inputs)
+                        dist_type = st.session_state.get(f"mc_dist_type_{cell_id}", "正态分布")
+                        if dist_type == "正态分布":
+                            std_val = st.session_state.get(f"mc_std_{cell_id}", 0.08)
+                            dc = DistributionConfig(type="normal", params={"mean": 0, "std": std_val})
+                        elif dist_type == "均匀分布":
+                            min_val = st.session_state.get(f"mc_min_{cell_id}", -0.15)
+                            max_val = st.session_state.get(f"mc_max_{cell_id}", 0.15)
+                            dc = DistributionConfig(type="uniform", params={"min": min_val, "max": max_val})
+                        else:
+                            dc = DistributionConfig(type="normal", params={"mean": 0, "std": 0.08})
+                        parallel_dists.append((cell_id, param_name, dc))
+
+                    progress_bar = st.progress(0, text=f"预克隆图谱 (0/{workers})...")
+
+                    with st.spinner(f"并行执行 {iterations} 次（{workers} 进程）..."):
+                        mc_result = run_monte_carlo_parallel(
+                            graph=graph,
+                            param_cells=parallel_dists,
+                            iterations=iterations,
+                            workers=workers,
+                            seed=42,
+                        )
+
+                    progress_bar.empty()
+                    st.session_state[f"mc_result_{task.id}"] = mc_result
+                    st.session_state[f"mc_mode_{task.id}"] = "parallel"
+
+                    # Save to database
+                    params_data = [{"cell_id": c, "name": n, "distribution": {"type": dc.type, "params": dc.params}}
+                                   for c, n, dc in parallel_dists]
+                    db.save_monte_carlo(
+                        task_id=task.id,
+                        run_name=f"蒙特卡罗_并行_{iterations}次_{workers}进程_{time.strftime('%H%M')}",
+                        mode="parallel",
+                        iterations=iterations,
+                        params=params_data,
+                        base_irr=mc_result.base_metrics.irr_after_tax or 0.068,
+                        statistics=mc_result.statistics.get("irr_after_tax", {}),
+                        probability_table=mc_result.probability_table,
+                    )
+
+                    st.toast(f"并行模式完成 {iterations} 次×{workers}进程并已保存")
+                    st.rerun()
+
                 else:
-                    # Precise mode: full recalculation
+                    # Precise mode: single-process full recalculation
                     from financial_kg.engine.monte_carlo import run_monte_carlo
 
                     progress_bar = st.progress(0, text=f"模拟中 (0/{iterations})...")
