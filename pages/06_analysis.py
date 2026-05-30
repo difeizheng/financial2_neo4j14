@@ -869,7 +869,7 @@ with tab_monte_carlo:
     if is_fast_mode:
         st.info("⚡ 快速模式：敏感性系数近似，1000次仅需1秒，准确度约97%")
     elif is_parallel_mode:
-        st.info("🚀 并行模式：多进程并行执行，4进程×100次≈125分钟")
+        st.info("🚀 并行模式：多进程并行执行")
         # Workers configuration
         workers = st.slider(
             "进程数量",
@@ -879,7 +879,6 @@ with tab_monte_carlo:
             step=1,
             help="建议设置为CPU核心数",
         )
-        st.caption(f"预计耗时: {iterations * 5 / workers:.1f} 分钟")
     else:
         st.warning("⚠️ 精确模式：单进程执行，100次约需500分钟")
 
@@ -929,6 +928,10 @@ with tab_monte_carlo:
                 step=100,
                 help="次数越多结果越精确，但耗时更长",
             )
+
+            # Show estimated time for parallel mode
+            if is_parallel_mode:
+                st.caption(f"预计耗时: {iterations * 5 / workers:.1f} 分钟")
 
             dist_configs = []
             for key in selected_mc_keys:
