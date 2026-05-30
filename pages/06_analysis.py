@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+from typing import Any
 
 import streamlit as st
 
@@ -12,13 +13,79 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from financial_kg.storage.json_store import load_graph
 from financial_kg.storage.task_db import TaskDB
 from financial_kg.models.graph import FinancialGraph
-from financial_kg.engine.sensitivity import run_sensitivity, SensitivityResult
+from financial_kg.engine.sensitivity import run_sensitivity, SensitivityResult, SensitivityScenario
 from financial_kg.engine.derived_metrics import DerivedMetrics
 from financial_kg.engine.break_even import find_break_even, BreakEvenResult
+from financial_kg.engine.scenario_analysis import run_scenario_analysis, ScenarioAnalysisResult, classify_parameter
 from financial_kg.viz.tornado_chart import render_tornado_html, render_spider_chart
 
 st.set_page_config(layout="wide")
 st.title("📈 分析模块")
+
+# ── Helper: rebuild SensitivityResult from stored JSON ────────────────────────
+def _rebuild_result_from_history(h: dict) -> SensitivityResult:
+    """Reconstruct a SensitivityResult from SQLite-stored JSON data."""
+    base = h["base_metrics"]
+    base_metrics = DerivedMetrics(
+        irr_after_tax=base.get("irr_after_tax"),
+        irr_before_tax=base.get("irr_before_tax"),
+        npv_after_tax=base.get("npv_after_tax"),
+        npv_before_tax=base.get("npv_before_tax"),
+        payback_period=base.get("payback_period"),
+        dscr_avg=base.get("dscr_avg"),
+        dscr_min=base.get("dscr_min"),
+    )
+    scenarios: list[SensitivityScenario] = []
+    for s in h["scenarios"]:
+        m = s["metrics"]
+        scenario_metrics = DerivedMetrics(
+            irr_after_tax=m.get("irr_after_tax"),
+            irr_before_tax=m.get("irr_before_tax"),
+            npv_after_tax=m.get("npv_after_tax"),
+            npv_before_tax=m.get("npv_before_tax"),
+            payback_period=m.get("payback_period"),
+            dscr_avg=m.get("dscr_avg"),
+            dscr_min=m.get("dscr_min"),
+        )
+        scenarios.append(SensitivityScenario(
+            name=s["name"],
+            param_name=s["param_name"],
+            param_cell_id=s["param_cell_id"],
+            perturbation=s["perturbation"],
+            original_value=s["original_value"],
+            perturbed_value=s["perturbed_value"],
+            metrics=scenario_metrics,
+            snapshot_name=s.get("snapshot_name", ""),
+        ))
+    summary_table = _build_summary_table_from_history(base_metrics, scenarios)
+    return SensitivityResult(
+        base_metrics=base_metrics,
+        scenarios=scenarios,
+        summary_table=summary_table,
+    )
+
+
+def _build_summary_table_from_history(
+    base: DerivedMetrics,
+    scenarios: list[SensitivityScenario],
+) -> list[dict]:
+    """Build summary table from rebuilt scenarios (matches sensitivity module)."""
+    rows: list[dict] = []
+    by_param: dict[str, list[SensitivityScenario]] = {}
+    for s in scenarios:
+        by_param.setdefault(s.param_name, []).append(s)
+    for param_name, param_scenarios in by_param.items():
+        row: dict[str, Any] = {"参数": param_name}
+        for s in sorted(param_scenarios, key=lambda x: x.perturbation):
+            label = f"{s.perturbation:+.0%}"
+            if s.metrics.irr_after_tax is not None and base.irr_after_tax is not None:
+                irr_delta = s.metrics.irr_after_tax - base.irr_after_tax
+                row[label] = f"{s.metrics.irr_after_tax * 100:.2f}% ({irr_delta:+.2f}pp)"
+            else:
+                row[label] = "—"
+        rows.append(row)
+    return rows
+
 
 # ── DB + task selection ─────────────────────────────────────────────────────
 db = TaskDB()
@@ -195,8 +262,33 @@ with tab_sensitivity:
         result_key = f"sens_result_{task.id}"
         result: SensitivityResult | None = st.session_state.get(result_key)
 
+        # Check if loaded from history
+        loaded_hist_keys = [k for k in st.session_state.keys() if k.startswith(f"hist_loaded_") and st.session_state[k]]
+        is_from_history = len(loaded_hist_keys) > 0
+        last_loaded_id = loaded_hist_keys[-1].replace(f"hist_loaded_", "") if loaded_hist_keys else None
+
         if result:
             st.divider()
+
+            # History-loaded banner
+            if is_from_history and last_loaded_id:
+                c_banner1, c_banner2, c_banner3 = st.columns([5, 1, 1])
+                with c_banner1:
+                    st.success(f"已加载历史记录 #{last_loaded_id} — 龙卷风图/蛛网图/排名/汇总均可查看")
+                with c_banner3:
+                    if st.button("清除分析结果", key="clear_sens_result", use_container_width=True):
+                        st.session_state.pop(result_key, None)
+                        for k in loaded_hist_keys:
+                            st.session_state.pop(k, None)
+                        st.rerun()
+            else:
+                # New-run banner with clear option
+                c_clear1, c_clear2 = st.columns([5, 1])
+                with c_clear2:
+                    if st.button("清除结果", key="clear_sens_result_fresh", use_container_width=True):
+                        st.session_state.pop(result_key, None)
+                        st.rerun()
+
             st.subheader("分析结果")
 
             # Base metrics summary
@@ -477,190 +569,256 @@ with tab_break_even:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Tab 3: Scenario Builder
+# Tab 3: Scenario Analysis (Pessimistic/Base/Optimistic)
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_scenario:
-    st.subheader("场景构建")
-    st.caption("同时设置多个参数值，对比不同场景下的关键指标差异")
+    st.subheader("情景分析")
+    st.caption("多变量同时变动，对比悲观/基准/乐观三种情景")
 
-    # Scenario name
-    scenario_name = st.text_input("场景名称", placeholder="如：悲观情景 / 乐观情景 / 基准", key="scn_name")
+    # Mode selector
+    scenario_mode = st.radio(
+        "情景模式",
+        ["标准情景（悲观/基准/乐观）", "自定义情景"],
+        horizontal=True,
+        key="scn_mode",
+    )
 
-    # Parameter selection
-    st.subheader("设置参数")
-    scn_filter = st.multiselect("按类别筛选", all_categories, default=[], key="scn_cat")
-    scn_search = st.text_input("搜索", placeholder="Indicator 名称 / Sheet", key="scn_search")
+    # ── Parameter selection ───────────────────────────────────────────────
+    st.divider()
+    st.subheader("选择分析变量")
+
+    col_f1, col_f2 = st.columns([2, 3])
+    with col_f1:
+        scn_cat_filter = st.multiselect("按类别筛选", all_categories, default=[], key="scn_cat")
+    with col_f2:
+        scn_search_kw = st.text_input("搜索参数", placeholder="Indicator 名称 / Sheet", key="scn_search")
 
     scn_filtered = all_params
-    if scn_filter:
-        scn_filtered = [r for r in scn_filtered if r["category"] in scn_filter]
-    if scn_search:
-        kw = scn_search.lower()
+    if scn_cat_filter:
+        scn_filtered = [r for r in scn_filtered if r["category"] in scn_cat_filter]
+    if scn_search_kw:
+        kw = scn_search_kw.lower()
         scn_filtered = [r for r in scn_filtered if kw in r["name"].lower() or kw in r["sheet"].lower()]
 
-    # Session state for scenario params
-    _key_scn = f"scn_params_{task.id}"
-    if _key_scn not in st.session_state:
-        st.session_state[_key_scn] = {}
-
-    # Add/remove param rows
-    add_row = st.columns([4, 2, 1])
-    with add_row[2]:
-        if st.button("+ 添加参数", use_container_width=True, key="add_param"):
-            pass  # Just trigger rerun
-
-    param_labels_scn = [
-        f"{r['name']} | {r['sheet']} 第{r['row']}行 {r['col']}列 = {r['value']:,.2f}"
+    # Parameter multiselect
+    scn_param_options = {
+        f"{r['name']} | {r['sheet']} 第{r['row']}行 {r['col']}列 = {r['value']:,.2f}": r
         for r in scn_filtered
-    ]
+    }
 
-    # Selected param labels
-    if _key_scn not in st.session_state:
-        st.session_state[_key_scn] = {}
+    if not scn_param_options:
+        st.info("无匹配的参数")
+    else:
+        selected_scn_keys = st.multiselect(
+            "选择变量（建议 2-5 个）",
+            list(scn_param_options.keys()),
+            default=st.session_state.get(f"scn_sel_{task.id}", []),
+            key="scn_multiselect",
+        )
+        st.session_state[f"scn_sel_{task.id}"] = selected_scn_keys
 
-    # Number of param rows
-    num_rows = st.number_input("参数数量", min_value=1, max_value=20, value=3, key="scn_num_rows")
+        # Variable count hint
+        if len(selected_scn_keys) == 1:
+            st.info("已选择单变量。建议选择多个变量进行情景分析。")
+        elif len(selected_scn_keys) > 5:
+            st.warning(f"已选择 {len(selected_scn_keys)} 个变量。建议控制在 5 个以内。")
 
-    st.divider()
+        # ── Variable classification ───────────────────────────────────────────
+        if selected_scn_keys and scenario_mode == "标准情景（悲观/基准/乐观）":
+            st.divider()
+            st.subheader("变量分类设置")
+            st.caption("分类决定悲观/乐观方向：收入类悲观=-10%，成本类悲观=+10%，投资类悲观=+15%")
 
-    # Build param rows
-    scenario_cells = {}
-    for i in range(num_rows):
-        row_key = f"scn_row_{i}"
-        if row_key not in st.session_state:
-            st.session_state[row_key] = param_labels_scn[0] if param_labels_scn else ""
+            classifications = []
+            for key in selected_scn_keys:
+                r = scn_param_options[key]
+                # Auto-classify
+                auto_class = classify_parameter(r["name"])
+                default_idx = {"revenue": 0, "cost": 1, "investment": 2}.get(auto_class, 0)
 
-        col_s1, col_s2, col_s3, col_s4 = st.columns([4, 2, 2, 1])
-        with col_s1:
-            sel = st.selectbox(
-                f"参数 {i+1}",
-                param_labels_scn,
-                index=min(i, len(param_labels_scn) - 1),
-                key=row_key,
-            )
-            if sel in be_param_options:
-                cid = be_param_options[sel]
-                scenario_cells[cid] = {"label": sel}
-        with col_s2:
-            original_val = 0
-            if sel:
-                parts = sel.split(" = ")
-                if len(parts) == 2:
-                    try:
-                        original_val = float(parts[1].replace(",", ""))
-                    except ValueError:
-                        pass
-            new_val = st.number_input("新值", value=original_val, step=0.01, format="%.2f", key=f"scn_val_{i}")
-            if sel:
-                scenario_cells[cid]["new_value"] = new_val
-                scenario_cells[cid]["original"] = original_val
-        with col_s3:
-            if original_val != 0:
-                chg = (new_val - original_val) / original_val if original_val else 0
-                color = "#ef4444" if abs(chg) > 0.1 else "#16a34a" if abs(chg) < 0.05 else "#f59e0b"
-                st.markdown(f"<span style='color:{color}'>变化: {chg:+.1%}</span>", unsafe_allow_html=True)
+                col_c1, col_c2, col_c3 = st.columns([4, 2, 1])
+                with col_c1:
+                    st.caption(f"{r['name']}")
+                with col_c2:
+                    cls = st.selectbox(
+                        "分类",
+                        ["收入类", "成本类", "投资类"],
+                        index=default_idx,
+                        key=f"cls_{r['cell_id']}",
+                        label_visibility="collapsed",
+                    )
+                with col_c3:
+                    cls_map = {"收入类": "revenue", "成本类": "cost", "投资类": "investment"}
+                    classifications.append((r["cell_id"], r["name"], cls_map[cls]))
 
-    # Run scenario
-    if scenario_cells and scenario_name:
-        if st.button("运行场景", type="primary", use_container_width=True):
-            valid_cells = {cid: v["new_value"] for cid, v in scenario_cells.items() if "new_value" in v}
-            if valid_cells:
-                from financial_kg.engine.recalculator import recalculate
-                from financial_kg.engine.derived_metrics import compute_derived_metrics
-                import copy as _copy
+            # ── Run scenario analysis ───────────────────────────────────────────
+            st.divider()
+            if st.button("运行情景分析", type="primary", use_container_width=True, disabled=not selected_scn_keys):
+                from financial_kg.engine.scenario_analysis import run_scenario_analysis
 
-                # Clone graph, apply all changes, recalculate
-                work = FinancialGraph(source_file=graph.source_file)
-                work.cells = {}
-                for cid, cell in graph.cells.items():
-                    cell_copy = _copy.copy(cell)
-                    cell_copy.dependencies = list(cell.dependencies)
-                    cell_copy.dependents = list(cell.dependents)
-                    work.cells[cid] = cell_copy
-                work.indicators = dict(graph.indicators)
-                work.tables = dict(graph.tables)
-                work.cell_graph = graph.cell_graph.copy()
+                with st.spinner("分析悲观/基准/乐观三种情景..."):
+                    scn_result = run_scenario_analysis(
+                        graph=graph,
+                        param_cells=classifications,
+                        preset="standard",
+                    )
 
-                for cid, val in valid_cells.items():
-                    c = work.cells.get(cid)
-                    if c:
-                        c.value = val
-
-                recalc_result = recalculate(work, valid_cells)
-                metrics = compute_derived_metrics(work)
-
-                # Store scenario result
-                scenario_result = {
-                    "name": scenario_name,
-                    "cells": valid_cells,
-                    "metrics": {
-                        k: v for k in ("irr_after_tax", "irr_before_tax", "npv_after_tax",
-                                       "npv_before_tax", "payback_period", "dscr_avg", "dscr_min")
-                        if (v := getattr(metrics, k, None)) is not None
-                    },
-                    "changed_count": len(recalc_result.changed_cells) if recalc_result else 0,
-                }
-
-                # Append to session state scenario list
-                _key_scn_list = f"scn_list_{task.id}"
-                if _key_scn_list not in st.session_state:
-                    st.session_state[_key_scn_list] = []
-                st.session_state[_key_scn_list].append(scenario_result)
-
-                st.toast(f"场景「{scenario_name}」已运行")
+                st.session_state[f"scn_result_{task.id}"] = scn_result
+                st.toast("情景分析完成")
                 st.rerun()
 
-    # Display scenarios
-    _key_scn_list = f"scn_list_{task.id}"
-    scn_list = st.session_state.get(_key_scn_list, [])
+        # ── Custom scenario mode ───────────────────────────────────────────────
+        elif selected_scn_keys and scenario_mode == "自定义情景":
+            st.divider()
+            st.subheader("自定义各情景参数变动")
 
-    if scn_list:
+            custom_scenario_names = st.text_input(
+                "情景名称（逗号分隔）",
+                value="悲观,基准,乐观",
+                key="custom_scn_names",
+            )
+            scn_name_list = [n.strip() for n in custom_scenario_names.split(",") if n.strip()]
+
+            # Build ratio inputs for each scenario
+            custom_ratios: dict[str, dict[str, float]] = {name: {} for name in scn_name_list}
+
+            for key in selected_scn_keys:
+                r = scn_param_options[key]
+                col_r1, col_r2, col_r3 = st.columns([3, 2, 1])
+                with col_r1:
+                    st.caption(f"{r['name']}")
+                with col_r2:
+                    # Ratio input for each scenario
+                    ratios_input = {}
+                    for i, scn_name in enumerate(scn_name_list):
+                        ratio_val = st.number_input(
+                            f"{scn_name}变动%",
+                            value=-0.10 if i == 0 else 0.0 if i == 1 else 0.10,
+                            step=0.01,
+                            format="%.2f",
+                            key=f"ratio_{r['cell_id']}_{i}",
+                            label_visibility="collapsed",
+                        )
+                        custom_ratios[scn_name][r["cell_id"]] = ratio_val
+
+            if st.button("运行自定义情景分析", type="primary", use_container_width=True):
+                from financial_kg.engine.scenario_analysis import run_scenario_analysis
+
+                with st.spinner(f"分析 {len(scn_name_list)} 种情景..."):
+                    scn_result = run_scenario_analysis(
+                        graph=graph,
+                        param_cells=[(r["cell_id"], r["name"], "revenue") for key in selected_scn_keys for r in [scn_param_options[key]]],
+                        preset="custom",
+                        custom_ratios=custom_ratios,
+                    )
+
+                st.session_state[f"scn_result_{task.id}"] = scn_result
+                st.toast("情景分析完成")
+                st.rerun()
+
+    # ── Display results ───────────────────────────────────────────────────────
+    scn_result_key = f"scn_result_{task.id}"
+    scn_result: ScenarioAnalysisResult | None = st.session_state.get(scn_result_key)
+
+    if scn_result:
         st.divider()
-        st.subheader("场景对比")
+        st.subheader("情景分析结果")
 
-        # Clear all button
-        if st.button("清空所有场景", type="secondary", key="clear_scn"):
-            st.session_state[_key_scn_list] = []
+        # Clear button
+        if st.button("清除结果", type="secondary", key="clear_scn_result"):
+            st.session_state.pop(scn_result_key, None)
             st.rerun()
 
+        # Base metrics
+        bm = scn_result.base_metrics
+        st.caption(
+            f"基准: IRR={bm.irr_after_tax * 100:.2f}%, "
+            f"NPV={bm.npv_after_tax:,.0f}, "
+            f"回收期={bm.payback_period or 0:.2f}年"
+        )
+
         # Comparison table
-        compare_data = []
-        # Base scenario
-        base_m = compute_derived_metrics(graph)
-        base_row = {"场景": "基准"}
-        for label, (mkey, mmult, munit, _, _) in METRICS.items():
-            val = getattr(base_m, mkey, None)
-            if val is not None:
-                base_row[label] = f"{val * mmult:.2f}{munit}"
-        compare_data.append(base_row)
+        st.subheader("指标对比")
+        st.dataframe(scn_result.comparison_table, use_container_width=True, hide_index=True, height=200)
 
-        for sc in scn_list:
-            row = {"场景": sc["name"]}
-            for label, (mkey, mmult, munit, _, _) in METRICS.items():
-                val = sc["metrics"].get(mkey)
-                if val is not None:
-                    row[label] = f"{val * mmult:.2f}{munit}"
-            compare_data.append(row)
-
-        st.dataframe(compare_data, use_container_width=True, hide_index=True, height=300)
-
-        # Delta from base
-        st.divider()
+        # Delta table
         st.subheader("与基准差异")
+        st.dataframe(scn_result.delta_table, use_container_width=True, hide_index=True, height=200)
 
-        delta_data = []
-        for sc in scn_list:
-            row = {"场景": sc["name"], "影响单元格数": sc.get("changed_count", 0)}
-            for label, (mkey, mmult, munit, _, _) in METRICS.items():
-                base_val = getattr(base_m, mkey, None)
-                scn_val = sc["metrics"].get(mkey)
-                if base_val is not None and scn_val is not None:
-                    delta = (scn_val - base_val) * mmult
-                    row[label] = f"{delta:+.2f}{munit}"
-            delta_data.append(row)
+        # Visual comparison chart
+        st.divider()
+        st.subheader("对比图表")
 
-        if delta_data:
-            st.dataframe(delta_data, use_container_width=True, hide_index=True, height=250)
+        chart_metric = st.selectbox(
+            "选择指标",
+            list(METRICS.keys()),
+            key="scn_chart_metric",
+        )
+        metric_key, multiplier, unit, _, _ = METRICS[chart_metric]
+
+        # Build ECharts bar chart
+        scenario_names = [s.name for s in scn_result.scenarios]
+        values = [getattr(s.metrics, metric_key, 0) * multiplier for s in scn_result.scenarios]
+
+        import json
+        chart_option = {
+            "title": {"text": f"{chart_metric} 情景对比", "left": "center", "textStyle": {"fontSize": 14}},
+            "tooltip": {"trigger": "axis"},
+            "xAxis": {"type": "category", "data": scenario_names},
+            "yAxis": {"type": "value", "name": chart_metric},
+            "series": [{
+                "name": chart_metric,
+                "type": "bar",
+                "data": values,
+                "itemStyle": {"color": ["#ef4444", "#6b7280", "#16a34a"]},
+                "label": {"show": True, "position": "top", "formatter": "{c}"},
+            }],
+        }
+        chart_html = (
+            "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            "<script src='https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js'></script>"
+            "<style>body{margin:0;font-family:sans-serif;}#chart{width:100%;height:280px;}</style>"
+            "</head><body><div id='chart'></div>"
+            "<script>var chart=echarts.init(document.getElementById('chart'));"
+            "var option=" + json.dumps(chart_option, ensure_ascii=False) + ";"
+            "chart.setOption(option);window.addEventListener('resize',function(){chart.resize();});"
+            "</script></body></html>"
+        )
+        st.components.v1.html(chart_html, height=300, scrolling=False)
+
+        # ── Risk assessment ───────────────────────────────────────────────────
+        st.divider()
+        st.subheader("风险评估")
+
+        pessimistic = next((s for s in scn_result.scenarios if s.name == "悲观"), None)
+        if pessimistic:
+            base_irr = bm.irr_after_tax or 0
+            pessimistic_irr = pessimistic.metrics.irr_after_tax or 0
+            irr_delta = pessimistic_irr - base_irr
+
+            if pessimistic_irr < 0.06:  # IRR < 6%
+                risk_level = "高风险"
+                risk_color = "#dc2626"
+                risk_note = "悲观情景IRR低于行业基准收益率"
+            elif abs(irr_delta) > base_irr * 0.3:  # Delta > 30%
+                risk_level = "中风险"
+                risk_color = "#f59e0b"
+                risk_note = "悲观情景IRR波动幅度较大"
+            else:
+                risk_level = "低风险"
+                risk_color = "#16a34a"
+                risk_note = "项目抗风险能力较强"
+
+            st.markdown(
+                f"<div style='padding:12px;background:#f8fafc;border-left:4px solid {risk_color};"
+                f"border-radius:4px;'>"
+                f"<strong>风险等级:</strong> <span style='color:{risk_color};font-weight:bold'>{risk_level}</span><br/>"
+                f"<strong>悲观情景IRR:</strong> {pessimistic_irr * 100:.2f}% "
+                f"<span style='color:{risk_color}'>({irr_delta * 100:+.2f}pp)</span><br/>"
+                f"<strong>评估:</strong> {risk_note}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -729,24 +887,43 @@ with tab_history:
 
     st.subheader("历史分析记录")
 
-    # History table
-    hist_rows = []
+    # History table with "load to analysis" button
     for h in history:
         params_str = ", ".join(p["name"] for p in h["params"][:5])
         if len(h["params"]) > 5:
             params_str += f" ... +{len(h['params']) - 5}"
         base = h["base_metrics"]
         irr = base.get("irr_after_tax")
-        hist_rows.append({
-            "ID": h["id"],
-            "运行时间": h["created_at"][:19],
-            "参数": params_str,
-            "扰动": ", ".join(f"{p:+.0%}" for p in h["perturbations"]),
-            "基准IRR": f"{irr * 100:.2f}%" if irr else "—",
-            "场景数": len(h["scenarios"]),
-        })
 
-    st.dataframe(hist_rows, use_container_width=True, hide_index=True, height=300)
+        col_t1, col_t2, col_t3, col_t4, col_t5, col_t6, col_t7 = st.columns([1, 3, 3, 2, 2, 2, 1])
+        with col_t1:
+            st.caption(f"#{h['id']}")
+        with col_t2:
+            st.caption(h["created_at"][:19])
+        with col_t3:
+            st.caption(params_str)
+        with col_t4:
+            st.caption(", ".join(f"{p:+.0%}" for p in h["perturbations"]))
+        with col_t5:
+            st.caption(f"{irr * 100:.2f}%" if irr else "—")
+        with col_t6:
+            st.caption(str(len(h["scenarios"])))
+        with col_t7:
+            if st.button("📊 加载", key=f"load_hist_{h['id']}", use_container_width=True, help="加载到敏感性分析Tab查看图表"):
+                rebuilt = _rebuild_result_from_history(h)
+                st.session_state[f"sens_result_{task.id}"] = rebuilt
+                st.session_state[f"hist_loaded_{h['id']}"] = True
+                st.toast(f"已加载记录 #{h['id']}，正在切换到分析视图...")
+                st.rerun()
+
+    st.divider()
+
+    # Indicator when a history record is loaded
+    loaded_hint = [k for k in st.session_state.keys() if k.startswith(f"hist_loaded_") and st.session_state[k]]
+    if loaded_hint:
+        last_loaded = loaded_hint[-1]
+        loaded_id = last_loaded.replace(f"hist_loaded_", "")
+        st.success(f"记录 #{loaded_id} 已加载到「敏感性分析」Tab，可查看龙卷风图/蛛网图等完整分析。")
 
     # Comparison mode toggle
     comparison_mode = st.toggle("对比模式", key="hist_compare_mode")
@@ -839,8 +1016,15 @@ with tab_history:
         if selected_hist:
             h = hist_ids[selected_hist]
 
-            detail_row = st.columns([8, 1])
+            detail_row = st.columns([6, 2, 1])
             with detail_row[1]:
+                if st.button("📊 加载到分析", type="primary", use_container_width=True, key=f"load_detail_{h['id']}"):
+                    rebuilt = _rebuild_result_from_history(h)
+                    st.session_state[f"sens_result_{task.id}"] = rebuilt
+                    st.session_state[f"hist_loaded_{h['id']}"] = True
+                    st.toast(f"已加载记录 #{h['id']} 到分析视图")
+                    st.rerun()
+            with detail_row[2]:
                 if st.button("🗑️ 删除", type="secondary", use_container_width=True, key=f"del_hist_{h['id']}"):
                     db.delete_sensitivity(h["id"])
                     st.toast("已删除")
@@ -883,3 +1067,73 @@ with tab_history:
 
             if summary_data:
                 st.dataframe(summary_data, use_container_width=True, hide_index=True)
+
+            # ── Inline chart preview ──────────────────────────────────────
+            st.divider()
+            st.subheader("快速图表预览")
+
+            rebuilt = _rebuild_result_from_history(h)
+            col_c1, col_c2 = st.columns([3, 3])
+            with col_c1:
+                hist_chart_metric = st.selectbox(
+                    "指标",
+                    list(METRICS.keys()),
+                    index=0,
+                    key="hist_chart_metric",
+                )
+            with col_c2:
+                hist_chart_type = st.selectbox(
+                    "图表",
+                    ["龙卷风图", "蛛网图"],
+                    key="hist_chart_type",
+                )
+
+            h_metric_key, h_mult, h_unit, _, _ = METRICS[hist_chart_metric]
+            if hist_chart_type == "龙卷风图":
+                html = render_tornado_html(rebuilt, h_metric_key, hist_chart_metric)
+            else:
+                html = render_spider_chart(rebuilt, h_metric_key, hist_chart_metric)
+
+            if html:
+                st.components.v1.html(html, height=450, scrolling=False)
+            else:
+                st.info("无可视化数据")
+
+            # ── Sensitivity ranking (inline) ──────────────────────────────
+            st.divider()
+            st.subheader("敏感度排名")
+
+            h_base_val = getattr(rebuilt.base_metrics, h_metric_key, None)
+            if h_base_val is not None:
+                h_by_param: dict[str, dict] = {}
+                for s in rebuilt.scenarios:
+                    s_val = getattr(s.metrics, h_metric_key, None)
+                    if s_val is not None:
+                        h_by_param.setdefault(s.param_name, {})[s.perturbation] = s_val
+
+                h_rank_rows = []
+                for pname, perts in h_by_param.items():
+                    max_delta = max(abs(v - h_base_val) for v in perts.values())
+                    max_pert = max(perts.keys(), key=lambda p: abs(perts[p] - h_base_val))
+                    pct_at_max = perts[max_pert]
+                    h_rank_rows.append({
+                        "参数": pname,
+                        "基准值": f"{h_base_val * h_mult:.2f}{h_unit}",
+                        "最大变化后值": f"{pct_at_max * h_mult:.2f}{h_unit}",
+                        "最大偏差": f"{abs(pct_at_max - h_base_val) * h_mult:.2f}{h_unit}",
+                        "触发扰动": f"{max_pert:+.0%}",
+                    })
+
+                h_rank_rows.sort(key=lambda r: float(r["最大偏差"].replace(h_unit, "")), reverse=True)
+                for i, r in enumerate(h_rank_rows):
+                    r["排名"] = i + 1
+
+                st.dataframe(
+                    h_rank_rows,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=min(300, len(h_rank_rows) * 35 + 40),
+                    column_config={
+                        "排名": st.column_config.NumberColumn("排名", width="small"),
+                    },
+                )
