@@ -1111,11 +1111,10 @@ with tab_monte_carlo:
         st.divider()
         st.subheader("风险评估")
 
-        if "irr_after_tax" in mc.statistics:
-            stats = mc.statistics["irr_after_tax"]
-            mean_irr = stats["mean"]
-            std_irr = stats["std"]
-            p5_irr = stats["p5"]
+        if stats:
+            mean_irr = stats.get("mean", 0.068)
+            std_irr = stats.get("std", 0.01)
+            p5_irr = stats.get("p5", 0.05)
 
             # Risk criteria
             if p5_irr < 0.04:  # 5th percentile below 4%
