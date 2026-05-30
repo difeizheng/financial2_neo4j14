@@ -1335,63 +1335,64 @@ with tab_history:
                     st.divider()
                     st.subheader(f"{h_a['run_name']} vs {h_b['run_name']}")
 
-            # Base metrics comparison
-            base_a = h_a["base_metrics"]
-            base_b = h_b["base_metrics"]
+                    # Base metrics comparison
+                    base_a = h_a["base_metrics"]
+                    base_b = h_b["base_metrics"]
 
-            compare_rows = []
-            for label, (mkey, mmult, munit, _, _) in METRICS.items():
-                va = base_a.get(mkey)
-                vb = base_b.get(mkey)
-                if va is None and vb is None:
-                    continue
-                delta = (vb - va) * mmult if (va is not None and vb is not None) else None
-                compare_rows.append({
-                    "指标": label,
-                    "记录 A 基准": f"{va * mmult:.2f}{munit}" if va is not None else "—",
-                    "记录 B 基准": f"{vb * mmult:.2f}{munit}" if vb is not None else "—",
-                    "差异": f"{delta:+.2f}{munit}" if delta is not None else "—",
-                })
+                    compare_rows = []
+                    for label, (mkey, mmult, munit, _, _) in METRICS.items():
+                        va = base_a.get(mkey)
+                        vb = base_b.get(mkey)
+                        if va is None and vb is None:
+                            continue
+                        delta = (vb - va) * mmult if (va is not None and vb is not None) else None
+                        compare_rows.append({
+                            "指标": label,
+                            "记录 A 基准": f"{va * mmult:.2f}{munit}" if va is not None else "—",
+                            "记录 B 基准": f"{vb * mmult:.2f}{munit}" if vb is not None else "—",
+                            "差异": f"{delta:+.2f}{munit}" if delta is not None else "—",
+                        })
 
-            st.dataframe(compare_rows, use_container_width=True, hide_index=True)
+                    st.dataframe(compare_rows, use_container_width=True, hide_index=True)
 
-            # Parameter impact comparison
-            st.divider()
-            st.subheader("参数影响对比")
+                    # Parameter impact comparison
+                    st.divider()
+                    st.subheader("参数影响对比")
 
-            # Build IRR summary for both
-            def _build_hist_summary(hist):
-                by_p: dict[str, dict] = {}
-                for s in hist["scenarios"]:
-                    by_p.setdefault(s["param_name"], {})[s["perturbation"]] = s["metrics"]
-                return by_p
+                    # Build IRR summary for both
+                    def _build_hist_summary(hist):
+                        by_p: dict[str, dict] = {}
+                        for s in hist["scenarios"]:
+                            by_p.setdefault(s["param_name"], {})[s["perturbation"]] = s["metrics"]
+                        return by_p
 
-            pa = _build_hist_summary(h_a)
-            pb = _build_hist_summary(h_b)
+                    pa = _build_hist_summary(h_a)
+                    pb = _build_hist_summary(h_b)
 
-            all_params_hist = sorted(set(list(pa.keys()) + list(pb.keys())))
-            all_perts = sorted(set(
-                list(p for perts in pa.values() for p in perts)
-                + list(p for perts in pb.values() for p in perts)
-            ))
+                    all_params_hist = sorted(set(list(pa.keys()) + list(pb.keys())))
+                    all_perts = sorted(set(
+                        list(p for perts in pa.values() for p in perts)
+                        + list(p for perts in pb.values() for p in perts)
+                    ))
 
-            compare_param_rows = []
-            for pname in all_params_hist:
-                row = {"参数": pname}
-                base_irr_a = h_a["base_metrics"].get("irr_after_tax")
-                base_irr_b = h_b["base_metrics"].get("irr_after_tax")
-                for pct in all_perts:
-                    val_a = pa.get(pname, {}).get(pct, {})
-                    val_b = pb.get(pname, {}).get(pct, {})
-                    irr_a = val_a.get("irr_after_tax") if isinstance(val_a, dict) else None
-                    irr_b = val_b.get("irr_after_tax") if isinstance(val_b, dict) else None
-                    if irr_a is not None or irr_b is not None:
-                        a_str = f"{irr_a * 100:.2f}%" if irr_a is not None else "—"
-                        b_str = f"{irr_b * 100:.2f}%" if irr_b is not None else "—"
-                        row[f"{pct:+.0%}"] = f"A: {a_str} / B: {b_str}"
-                compare_param_rows.append(row)
+                    compare_param_rows = []
+                    for pname in all_params_hist:
+                        row = {"参数": pname}
+                        base_irr_a = h_a["base_metrics"].get("irr_after_tax")
+                        base_irr_b = h_b["base_metrics"].get("irr_after_tax")
+                        for pct in all_perts:
+                            val_a = pa.get(pname, {}).get(pct, {})
+                            val_b = pb.get(pname, {}).get(pct, {})
+                            irr_a = val_a.get("irr_after_tax") if isinstance(val_a, dict) else None
+                            irr_b = val_b.get("irr_after_tax") if isinstance(val_b, dict) else None
+                            if irr_a is not None or irr_b is not None:
+                                a_str = f"{irr_a * 100:.2f}%" if irr_a is not None else "—"
+                                b_str = f"{irr_b * 100:.2f}%" if irr_b is not None else "—"
+                                row[f"{pct:+.0%}"] = f"A: {a_str} / B: {b_str}"
+                        compare_param_rows.append(row)
 
-            if compare_param_rows:
+                    if compare_param_rows:
+                        st.dataframe(compare_param_rows, use_container_width=True, hide_index=True)
                 st.dataframe(compare_param_rows, use_container_width=True, hide_index=True)
 
             else:
