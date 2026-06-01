@@ -1,0 +1,715 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Financial Intelligence Platform — 开发蓝图</title>
+<style>
+  /* ===== Reset & Base ===== */
+  *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+  :root {
+    --blue-900: #0d47a1;
+    --blue-700: #1565c0;
+    --blue-600: #1e88e5;
+    --blue-100: #bbdefb;
+    --blue-50:  #e3f2fd;
+
+    --orange-900: #e65100;
+    --orange-700: #f57c00;
+    --orange-600: #fb8c00;
+    --orange-100: #ffe0b2;
+    --orange-50:  #fff3e0;
+
+    --purple-900: #4a148c;
+    --purple-700: #7b1fa2;
+    --purple-600: #8e24aa;
+    --purple-100: #e1bee7;
+    --purple-50:  #f3e5f5;
+
+    --gray-900: #212121;
+    --gray-700: #616161;
+    --gray-500: #9e9e9e;
+    --gray-300: #e0e0e0;
+    --gray-100: #f5f5f5;
+    --gray-50:  #fafafa;
+    --white:    #ffffff;
+  }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue",
+                 Helvetica, Arial, sans-serif;
+    background: var(--gray-100);
+    color: var(--gray-900);
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ===== Page Container ===== */
+  .page {
+    width: 1400px;
+    margin: 0 auto;
+    padding: 48px 56px 40px;
+    background: var(--white);
+    min-height: 100vh;
+  }
+
+  @media print {
+    body { background: white; }
+    .page { padding: 32px 40px 24px; }
+    .no-print { display: none; }
+  }
+
+  /* ===== Header ===== */
+  .header {
+    text-align: center;
+    margin-bottom: 40px;
+    padding-bottom: 24px;
+    border-bottom: 3px solid var(--gray-300);
+    position: relative;
+  }
+
+  .header::after {
+    content: '';
+    position: absolute;
+    bottom: -3px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 120px;
+    height: 3px;
+    background: linear-gradient(90deg, var(--blue-600), var(--orange-600), var(--purple-600));
+  }
+
+  .header h1 {
+    font-size: 28px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    color: var(--gray-900);
+    margin-bottom: 8px;
+  }
+
+  .header .subtitle {
+    font-size: 15px;
+    color: var(--gray-700);
+    font-weight: 400;
+  }
+
+  .header .subtitle strong {
+    color: var(--blue-700);
+    font-weight: 600;
+  }
+
+  /* ===== Legend ===== */
+  .legend {
+    display: flex;
+    justify-content: center;
+    gap: 32px;
+    margin-bottom: 32px;
+    font-size: 13px;
+    color: var(--gray-700);
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .legend-dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 3px;
+  }
+
+  .legend-icon {
+    font-size: 16px;
+  }
+
+  /* ===== Ladder Container ===== */
+  .ladder {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    padding-left: 0;
+  }
+
+  /* ===== Phase Layer ===== */
+  .phase {
+    position: relative;
+    border-radius: 12px;
+    padding: 0;
+    overflow: visible;
+    transition: transform 0.2s;
+  }
+
+  .phase:hover {
+    transform: translateY(-2px);
+  }
+
+  /* Staircase offset — each layer shifts left */
+  .phase-1 { margin-left: 0; }
+  .phase-2 { margin-left: 60px; margin-top: -8px; }
+  .phase-3 { margin-left: 120px; margin-top: -8px; }
+
+  /* Phase border-left accent bar */
+  .phase-inner {
+    border-radius: 12px;
+    overflow: hidden;
+    border: 1px solid var(--gray-300);
+    background: var(--white);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+  }
+
+  .phase-1 .phase-inner { border-left: 5px solid var(--blue-600); }
+  .phase-2 .phase-inner { border-left: 5px solid var(--orange-600); }
+  .phase-3 .phase-inner { border-left: 5px solid var(--purple-600); }
+
+  /* ===== Phase Header ===== */
+  .phase-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 24px;
+    border-bottom: 1px solid var(--gray-300);
+  }
+
+  .phase-1 .phase-header { background: var(--blue-50); }
+  .phase-2 .phase-header { background: var(--orange-50); }
+  .phase-3 .phase-header { background: var(--purple-50); }
+
+  .phase-number {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    font-size: 14px;
+    font-weight: 700;
+    color: white;
+    flex-shrink: 0;
+  }
+
+  .phase-1 .phase-number { background: var(--blue-700); }
+  .phase-2 .phase-number { background: var(--orange-700); }
+  .phase-3 .phase-number { background: var(--purple-700); }
+
+  .phase-title {
+    font-size: 17px;
+    font-weight: 700;
+    color: var(--gray-900);
+  }
+
+  .phase-slogan {
+    font-size: 13px;
+    color: var(--gray-700);
+    margin-left: auto;
+    font-style: italic;
+    padding: 3px 12px;
+    border-radius: 12px;
+    background: rgba(255,255,255,0.6);
+    white-space: nowrap;
+  }
+
+  .phase-1 .phase-slogan { color: var(--blue-900); }
+  .phase-2 .phase-slogan { color: var(--orange-900); }
+  .phase-3 .phase-slogan { color: var(--purple-900); }
+
+  /* ===== Phase Body — Two Columns ===== */
+  .phase-body {
+    display: grid;
+    grid-template-columns: 1fr 40px 1fr;
+    padding: 18px 24px;
+    gap: 0;
+    align-items: stretch;
+  }
+
+  .column {
+    padding: 12px 16px;
+  }
+
+  .column-biz {
+    background: var(--gray-50);
+    border-radius: 8px;
+    border: 1px solid var(--gray-300);
+  }
+
+  .column-tech {
+    background: var(--gray-50);
+    border-radius: 8px;
+    border: 1px solid var(--gray-300);
+  }
+
+  /* Divider with arrow */
+  .column-divider {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+  }
+
+  .column-divider::before {
+    content: '⟷';
+    font-size: 20px;
+    color: var(--gray-500);
+  }
+
+  /* Column Headers */
+  .col-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 10px;
+    padding-bottom: 6px;
+    border-bottom: 2px solid var(--gray-300);
+  }
+
+  .col-header .icon { font-size: 16px; }
+
+  .phase-1 .column-biz .col-header { color: var(--blue-700); border-color: var(--blue-100); }
+  .phase-1 .column-tech .col-header { color: var(--blue-700); border-color: var(--blue-100); }
+  .phase-2 .column-biz .col-header { color: var(--orange-700); border-color: var(--orange-100); }
+  .phase-2 .column-tech .col-header { color: var(--orange-700); border-color: var(--orange-100); }
+  .phase-3 .column-biz .col-header { color: var(--purple-700); border-color: var(--purple-100); }
+  .phase-3 .column-tech .col-header { color: var(--purple-700); border-color: var(--purple-100); }
+
+  /* Items */
+  .item-list {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .item-list li {
+    font-size: 13.5px;
+    line-height: 1.5;
+    padding-left: 18px;
+    position: relative;
+    color: var(--gray-900);
+  }
+
+  .item-list li::before {
+    content: '•';
+    position: absolute;
+    left: 2px;
+    font-weight: 700;
+  }
+
+  .phase-1 .column-biz .item-list li::before { color: var(--blue-600); }
+  .phase-1 .column-tech .item-list li::before { color: var(--blue-600); }
+  .phase-2 .column-biz .item-list li::before { color: var(--orange-600); }
+  .phase-2 .column-tech .item-list li::before { color: var(--orange-600); }
+  .phase-3 .column-biz .item-list li::before { color: var(--purple-600); }
+  .phase-3 .column-tech .item-list li::before { color: var(--purple-600); }
+
+  .item-list li .tag {
+    display: inline-block;
+    font-size: 11px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-weight: 600;
+    margin-left: 4px;
+    vertical-align: middle;
+  }
+
+  .phase-1 .tag { background: var(--blue-100); color: var(--blue-900); }
+  .phase-2 .tag { background: var(--orange-100); color: var(--orange-900); }
+  .phase-3 .tag { background: var(--purple-100); color: var(--purple-900); }
+
+  /* ===== Dependency Arrows Between Phases ===== */
+  .dependency {
+    display: flex;
+    align-items: center;
+    padding: 4px 24px 4px 24px;
+    position: relative;
+    height: 32px;
+  }
+
+  .dep-1-2 { margin-left: 30px; }
+  .dep-2-3 { margin-left: 90px; }
+
+  .dep-line {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--gray-700);
+    font-weight: 600;
+    padding: 4px 14px;
+    background: var(--gray-100);
+    border-radius: 20px;
+    border: 1px dashed var(--gray-500);
+  }
+
+  .dep-line .arrow {
+    font-size: 18px;
+    color: var(--gray-500);
+  }
+
+  /* ===== Timeline Footer ===== */
+  .timeline {
+    margin-top: 32px;
+    padding-top: 20px;
+    border-top: 2px solid var(--gray-300);
+    position: relative;
+  }
+
+  .timeline::after {
+    content: '';
+    position: absolute;
+    top: -2px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 80px;
+    height: 2px;
+    background: linear-gradient(90deg, var(--blue-600), var(--orange-600), var(--purple-600));
+  }
+
+  .timeline-title {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--gray-700);
+    text-align: center;
+    margin-bottom: 16px;
+    letter-spacing: 1px;
+  }
+
+  .timeline-bar {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 16px;
+  }
+
+  .tl-phase {
+    padding: 12px 16px;
+    border-radius: 8px;
+    border: 1px solid var(--gray-300);
+    background: var(--gray-50);
+  }
+
+  .tl-phase-1 { border-left: 4px solid var(--blue-600); }
+  .tl-phase-2 { border-left: 4px solid var(--orange-600); }
+  .tl-phase-3 { border-left: 4px solid var(--purple-600); }
+
+  .tl-phase-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+  }
+
+  .tl-phase-name {
+    font-size: 13px;
+    font-weight: 700;
+  }
+
+  .tl-phase-1 .tl-phase-name { color: var(--blue-700); }
+  .tl-phase-2 .tl-phase-name { color: var(--orange-700); }
+  .tl-phase-3 .tl-phase-name { color: var(--purple-700); }
+
+  .tl-duration {
+    font-size: 12px;
+    color: var(--gray-500);
+    font-weight: 600;
+    background: var(--gray-100);
+    padding: 2px 8px;
+    border-radius: 10px;
+  }
+
+  .tl-milestones {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .tl-milestone {
+    font-size: 12px;
+    color: var(--gray-700);
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .tl-milestone::before {
+    content: '▸';
+    font-size: 10px;
+    color: var(--gray-500);
+  }
+
+  /* ===== Bottom Summary ===== */
+  .summary {
+    margin-top: 24px;
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 16px;
+  }
+
+  .summary-card {
+    text-align: center;
+    padding: 14px;
+    border-radius: 8px;
+    border: 1px solid var(--gray-300);
+    background: var(--gray-50);
+  }
+
+  .summary-card .value {
+    font-size: 24px;
+    font-weight: 700;
+    display: block;
+    margin-bottom: 2px;
+  }
+
+  .summary-card .label {
+    font-size: 12px;
+    color: var(--gray-700);
+  }
+
+  .summary-card:nth-child(1) .value { color: var(--blue-700); }
+  .summary-card:nth-child(2) .value { color: var(--orange-700); }
+  .summary-card:nth-child(3) .value { color: var(--purple-700); }
+
+  /* ===== Footer ===== */
+  .footer {
+    margin-top: 24px;
+    text-align: center;
+    font-size: 11px;
+    color: var(--gray-500);
+    padding-top: 16px;
+    border-top: 1px solid var(--gray-300);
+  }
+</style>
+</head>
+<body>
+
+<div class="page">
+
+  <!-- ===== Header ===== -->
+  <div class="header">
+    <h1>🏗️ Financial Intelligence Platform — 开发蓝图</h1>
+    <div class="subtitle">
+      从 <strong>Excel 财务模型</strong> 到 <strong>专业投资建议</strong> 的智能化平台 — 分三步走，每步交付可验证的业务价值
+    </div>
+  </div>
+
+  <!-- ===== Legend ===== -->
+  <div class="legend">
+    <div class="legend-item">
+      <span class="legend-dot" style="background:var(--blue-600)"></span>
+      <span>第一阶段 · 数据基础</span>
+    </div>
+    <div class="legend-item">
+      <span class="legend-dot" style="background:var(--orange-600)"></span>
+      <span>第二阶段 · 风险分析</span>
+    </div>
+    <div class="legend-item">
+      <span class="legend-dot" style="background:var(--purple-600)"></span>
+      <span>第三阶段 · 智能咨询</span>
+    </div>
+    <div class="legend-item">
+      <span class="legend-icon">📋</span>
+      <span>甲方业务视角</span>
+    </div>
+    <div class="legend-item">
+      <span class="legend-icon">⚙️</span>
+      <span>技术开发视角</span>
+    </div>
+  </div>
+
+  <!-- ===== Ladder ===== -->
+  <div class="ladder">
+
+    <!-- ── Phase 3 (Top) ── -->
+    <div class="phase phase-3">
+      <div class="phase-inner">
+        <div class="phase-header">
+          <div class="phase-number">3</div>
+          <div class="phase-title">🧠 智能咨询平台</div>
+          <div class="phase-slogan">"让建议可自动生成"</div>
+        </div>
+        <div class="phase-body">
+          <div class="column column-biz">
+            <div class="col-header"><span class="icon">📋</span> 甲方得到</div>
+            <ul class="item-list">
+              <li><strong>专业投资分析报告</strong> — 一键生成 Word / PDF / PPT</li>
+              <li><strong>智能问答</strong> — 用自然语言问数据、问风险、问建议</li>
+              <li><strong>风险仪表盘</strong> — 综合评分 + 关键指标卡片 + 告警</li>
+              <li><strong>多项目组合对比</strong> — 横向比较不同投资项目</li>
+              <li><strong>客户端口</strong> — 投资方可独立查看报告和仪表盘</li>
+            </ul>
+          </div>
+          <div class="column-divider"></div>
+          <div class="column column-tech">
+            <div class="col-header"><span class="icon">⚙️</span> 开发构建</div>
+            <ul class="item-list">
+              <li><strong>报告引擎</strong> — 模板驱动 + 图表自动生成 <span class="tag">Word/PDF/PPT</span></li>
+              <li><strong>LLM 问答引擎</strong> — RAG 检索增强 + 多轮对话管理</li>
+              <li><strong>叙述生成器</strong> — 分析结果 → 自然语言解读</li>
+              <li><strong>可视化仪表盘</strong> — React + ECharts 交互图表</li>
+              <li><strong>多项目服务</strong> — 组合管理 + 跨项目指标对比 API</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Dependency Arrow 2→3 ── -->
+    <div class="dependency dep-2-3">
+      <div class="dep-line">
+        <span class="arrow">↑</span>
+        风险量化结果 驱动 报告与建议生成
+      </div>
+    </div>
+
+    <!-- ── Phase 2 (Middle) ── -->
+    <div class="phase phase-2">
+      <div class="phase-inner">
+        <div class="phase-header">
+          <div class="phase-number">2</div>
+          <div class="phase-title">📊 风险分析平台</div>
+          <div class="phase-slogan">"让风险可量化"</div>
+        </div>
+        <div class="phase-body">
+          <div class="column column-biz">
+            <div class="col-header"><span class="icon">📋</span> 甲方得到</div>
+            <ul class="item-list">
+              <li><strong>悲观 / 基准 / 乐观情景对比</strong> — 自动计算三套指标</li>
+              <li><strong>敏感性矩阵 + 龙卷风图</strong> — 哪个参数影响最大？</li>
+              <li><strong>蒙特卡罗概率模拟</strong> — IRR / NPV 的概率分布</li>
+              <li><strong>盈亏平衡分析</strong> — 找到投资临界点</li>
+              <li><strong>历史对比</strong> — 不同时间点的分析结果可追溯对比</li>
+            </ul>
+          </div>
+          <div class="column-divider"></div>
+          <div class="column column-tech">
+            <div class="col-header"><span class="icon">⚙️</span> 开发构建</div>
+            <ul class="item-list">
+              <li><strong>情景 / 敏感性 / MC 分析引擎</strong> — 核心算法封装为服务</li>
+              <li><strong>并行计算框架</strong> — Celery + Redis 异步任务队列 <span class="tag">1000次MC<60s</span></li>
+              <li><strong>派生指标计算</strong> — IRR / NPV / DSCR / 回收期</li>
+              <li><strong>风险指标引擎</strong> — VaR / 压力测试 / 信用风险评估</li>
+              <li><strong>结果持久化</strong> — PostgreSQL 存储分析历史 + 版本对比</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Dependency Arrow 1→2 ── -->
+    <div class="dependency dep-1-2">
+      <div class="dep-line">
+        <span class="arrow">↑</span>
+        结构化数据 驱动 多维风险分析
+      </div>
+    </div>
+
+    <!-- ── Phase 1 (Bottom / Foundation) ── -->
+    <div class="phase phase-1">
+      <div class="phase-inner">
+        <div class="phase-header">
+          <div class="phase-number">1</div>
+          <div class="phase-title">🏗️ 数据基础平台</div>
+          <div class="phase-slogan">"让数据可计算"</div>
+        </div>
+        <div class="phase-body">
+          <div class="column column-biz">
+            <div class="col-header"><span class="icon">📋</span> 甲方得到</div>
+            <ul class="item-list">
+              <li><strong>Excel 自动解析</strong> — 上传模型文件，自动识别表结构和指标</li>
+              <li><strong>三层知识图谱浏览</strong> — Sheet → 表 → 指标 → 单元格逐层下钻</li>
+              <li><strong>修改参数 → 即时重算</strong> — 改一个电价，全模型自动更新</li>
+              <li><strong>快照对比</strong> — 保存不同方案，任意两版差异一目了然</li>
+              <li><strong>Excel 导出</strong> — 重算结果导出为标准 Excel 文件</li>
+            </ul>
+          </div>
+          <div class="column-divider"></div>
+          <div class="column column-tech">
+            <div class="col-header"><span class="icon">⚙️</span> 开发构建</div>
+            <ul class="item-list">
+              <li><strong>解析引擎</strong> — openpyxl 双模式 + 公式词法分析 + 依赖提取</li>
+              <li><strong>三层图谱引擎</strong> — Cell → Indicator → Table <span class="tag">Neo4j</span></li>
+              <li><strong>增量重算引擎</strong> — Kahn 拓扑排序 + 快速路径优化 <span class="tag">42%命中</span></li>
+              <li><strong>API 平台</strong> — FastAPI + JWT 认证 + OpenAPI 文档</li>
+              <li><strong>数据存储</strong> — PostgreSQL + Neo4j + Redis + MinIO</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /ladder -->
+
+  <!-- ===== Timeline ===== -->
+  <div class="timeline">
+    <div class="timeline-title">📅 开发时间线与关键里程碑</div>
+    <div class="timeline-bar">
+      <div class="tl-phase tl-phase-1">
+        <div class="tl-phase-header">
+          <span class="tl-phase-name">🏗️ 第一阶段 · 数据基础</span>
+          <span class="tl-duration">10–12 周</span>
+        </div>
+        <div class="tl-milestones">
+          <div class="tl-milestone">Week 1–2: 后端框架搭建 + 引擎模块化重构</div>
+          <div class="tl-milestone">Week 3–6: 解析/图谱/重算引擎 → API 集成</div>
+          <div class="tl-milestone">Week 7–8: 前端框架 + 数据浏览 + 参数编辑</div>
+          <div class="tl-milestone">Week 9–12: 前后端联调 + 准确性验证 + 验收</div>
+        </div>
+      </div>
+      <div class="tl-phase tl-phase-2">
+        <div class="tl-phase-header">
+          <span class="tl-phase-name">📊 第二阶段 · 风险分析</span>
+          <span class="tl-duration">10–12 周</span>
+        </div>
+        <div class="tl-milestones">
+          <div class="tl-milestone">Week 13–16: 分析引擎服务化 + 派生指标 API</div>
+          <div class="tl-milestone">Week 17–18: 情景/敏感性/MC 异步任务集成</div>
+          <div class="tl-milestone">Week 19–20: 可视化图表 + 风险仪表盘首页</div>
+          <div class="tl-milestone">Week 21–24: 端到端测试 + 准确性验证 + 验收</div>
+        </div>
+      </div>
+      <div class="tl-phase tl-phase-3">
+        <div class="tl-phase-header">
+          <span class="tl-phase-name">🧠 第三阶段 · 智能咨询</span>
+          <span class="tl-duration">12–14 周</span>
+        </div>
+        <div class="tl-milestones">
+          <div class="tl-milestone">Week 25–30: 报告模板引擎 + 多格式导出</div>
+          <div class="tl-milestone">Week 31–34: LLM 问答增强 + 多轮对话</div>
+          <div class="tl-milestone">Week 35–38: 客户端仪表盘 + 多项目管理</div>
+          <div class="tl-milestone">Week 39–40: 安全审计 + 压力测试 + 上线</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Summary Cards ===== -->
+  <div class="summary">
+    <div class="summary-card">
+      <span class="value">10 个月</span>
+      <span class="label">预估总工期 (2026.06 → 2027.05)</span>
+    </div>
+    <div class="summary-card">
+      <span class="value">8–10 人</span>
+      <span class="label">核心团队规模</span>
+    </div>
+    <div class="summary-card">
+      <span class="value">3 个阶段</span>
+      <span class="label">每阶段独立可验收交付</span>
+    </div>
+  </div>
+
+  <!-- ===== Footer ===== -->
+  <div class="footer">
+    Financial Intelligence Platform · Architecture Overview · v1.0 · 2026-06-01
+  </div>
+
+</div><!-- /page -->
+
+</body>
+</html>

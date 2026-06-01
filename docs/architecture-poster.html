@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Financial Intelligence Platform — 一页纸蓝图</title>
+<style>
+  *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+  :root {
+    --bg-dark: #0f172a;
+    --text-primary: #f1f5f9;
+    --text-secondary: rgba(255,255,255,0.55);
+    --blue: #3b82f6;
+    --blue-glow: rgba(59,130,246,0.15);
+    --orange: #f59e0b;
+    --orange-glow: rgba(245,158,11,0.15);
+    --purple: #a855f7;
+    --purple-glow: rgba(168,85,247,0.15);
+    --green: #22c55e;
+    --green-glow: rgba(34,197,94,0.12);
+  }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    background: var(--bg-dark);
+    color: var(--text-primary);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ===== Poster ===== */
+  .poster {
+    width: 1320px;
+    height: 700px;
+    background: var(--bg-dark);
+    border-radius: 16px;
+    padding: 40px 48px 32px;
+    display: flex;
+    flex-direction: column;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .poster::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(255,255,255,0.02) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+  }
+
+  /* ===== Title ===== */
+  .title-section {
+    text-align: center;
+    margin-bottom: 24px;
+    position: relative;
+    z-index: 1;
+  }
+
+  .title-section h1 {
+    font-size: 26px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    margin-bottom: 6px;
+  }
+
+  .title-section h1 span {
+    background: linear-gradient(90deg, var(--blue), var(--orange), var(--purple));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .title-section .tagline {
+    font-size: 14px;
+    color: var(--text-secondary);
+    letter-spacing: 4px;
+  }
+
+  /* =========================================================
+     Stages — each row = [left content] + [right io-cell]
+     Left and right share the SAME height automatically.
+     ========================================================= */
+  .stages {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    position: relative;
+    z-index: 1;
+  }
+
+  /* --- Common row layout --- */
+  .stage-row,
+  .connector-row {
+    display: flex;
+    align-items: stretch;
+  }
+
+  /* Left side: takes remaining space */
+  .stage-row .left,
+  .connector-row .left {
+    flex: 1;
+    min-width: 0;
+  }
+
+  /* Right side: fixed width IO column */
+  .io-cell {
+    width: 160px;
+    flex-shrink: 0;
+    margin-left: 24px;
+    padding-left: 24px;
+    border-left: 1px solid rgba(255,255,255,0.06);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+  }
+
+  /* ===== Floor cards ===== */
+  .stage-3 .left { padding-left: 160px; }
+  .stage-2 .left { padding-left: 80px; }
+  .stage-1 .left { padding-left: 0; }
+
+  .floor-card {
+    border-radius: 10px;
+    padding: 18px 24px;
+    display: grid;
+    grid-template-columns: 56px 1fr;
+    gap: 16px;
+    align-items: center;
+    backdrop-filter: blur(8px);
+    transition: transform 0.2s, box-shadow 0.2s;
+  }
+
+  .floor-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+  }
+
+  .stage-1 .floor-card { background: var(--blue-glow); border: 1px solid rgba(59,130,246,0.25); }
+  .stage-2 .floor-card { background: var(--orange-glow); border: 1px solid rgba(245,158,11,0.25); }
+  .stage-3 .floor-card { background: var(--purple-glow); border: 1px solid rgba(168,85,247,0.25); }
+
+  .floor-badge {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .floor-num {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+    font-weight: 800;
+    color: white;
+  }
+
+  .stage-1 .floor-num { background: var(--blue); }
+  .stage-2 .floor-num { background: var(--orange); }
+  .stage-3 .floor-num { background: var(--purple); }
+
+  .floor-icon { font-size: 22px; }
+
+  .floor-content {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+  }
+
+  .floor-title {
+    font-size: 18px;
+    font-weight: 700;
+    white-space: nowrap;
+    min-width: 100px;
+  }
+
+  .stage-1 .floor-title { color: var(--blue); }
+  .stage-2 .floor-title { color: var(--orange); }
+  .stage-3 .floor-title { color: var(--purple); }
+
+  .floor-slogan {
+    font-size: 14px;
+    color: var(--text-secondary);
+    font-style: italic;
+    white-space: nowrap;
+    padding: 3px 12px;
+    border-radius: 12px;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.08);
+  }
+
+  .floor-keywords {
+    display: flex;
+    gap: 8px;
+    margin-left: auto;
+  }
+
+  .keyword {
+    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 4px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+
+  .stage-1 .keyword { background: rgba(59,130,246,0.15); color: #93c5fd; border: 1px solid rgba(59,130,246,0.2); }
+  .stage-2 .keyword { background: rgba(245,158,11,0.15); color: #fcd34d; border: 1px solid rgba(245,158,11,0.2); }
+  .stage-3 .keyword { background: rgba(168,85,247,0.15); color: #d8b4fe; border: 1px solid rgba(168,85,247,0.2); }
+
+  /* ===== Connector (dep arrow) ===== */
+  .connector-row .left {
+    display: flex;
+    align-items: center;
+    padding: 3px 0;
+  }
+
+  .dep-content {
+    font-size: 11px;
+    color: var(--text-secondary);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 10px;
+    border-radius: 10px;
+    background: rgba(255,255,255,0.03);
+  }
+
+  .dep-content .arrow-up { font-size: 14px; }
+
+  .conn-3-2 .left { padding-left: 200px; }
+  .conn-2-1 .left { padding-left: 120px; }
+
+  /* ===== IO Cell contents ===== */
+
+  /* Flow line segment (used in connector rows) */
+  .io-line {
+    width: 2px;
+    flex: 1;
+    background: linear-gradient(180deg, var(--green), var(--purple), var(--orange), var(--blue));
+    opacity: 0.4;
+    border-radius: 1px;
+    min-height: 4px;
+  }
+
+  /* Flow node: line + dot (used in middle stage row) */
+  .io-flow-node {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    flex: 1;
+    min-height: 0;
+  }
+
+  .io-flow-node .seg {
+    width: 2px;
+    flex: 1;
+    background: linear-gradient(180deg, var(--green), var(--purple), var(--orange), var(--blue));
+    opacity: 0.4;
+    border-radius: 1px;
+  }
+
+  .io-flow-node .dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    border: 2px solid var(--bg-dark);
+    flex-shrink: 0;
+  }
+
+  .stage-2 .dot { background: var(--orange); }
+
+  /* IO boxes */
+  .io-box {
+    width: 136px;
+    text-align: center;
+    padding: 14px 10px;
+    border-radius: 10px;
+  }
+
+  .io-box .io-icon {
+    font-size: 28px;
+    display: block;
+    margin-bottom: 6px;
+  }
+
+  .io-box .io-title {
+    font-size: 14px;
+    font-weight: 700;
+    display: block;
+    margin-bottom: 4px;
+  }
+
+  .io-box .io-desc {
+    font-size: 11px;
+    line-height: 1.5;
+    display: block;
+    opacity: 0.7;
+  }
+
+  .io-output {
+    background: var(--green-glow);
+    border: 1px solid rgba(34,197,94,0.3);
+  }
+
+  .io-output .io-title { color: #86efac; }
+
+  .io-input {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.1);
+  }
+
+  .io-input .io-title { color: var(--text-secondary); }
+
+  /* "价值递增" label — positioned relative to stages container */
+  .flow-label {
+    position: absolute;
+    right: 10px;
+    top: 50%;
+    transform: translateY(-50%);
+    writing-mode: vertical-rl;
+    font-size: 12px;
+    letter-spacing: 8px;
+    color: var(--text-secondary);
+    z-index: 3;
+  }
+
+  /* ===== Bottom ===== */
+  .bottom-info {
+    margin-top: 16px;
+    text-align: right;
+    position: relative;
+    z-index: 1;
+  }
+
+  .bottom-note {
+    font-size: 11px;
+    color: rgba(255,255,255,0.3);
+  }
+</style>
+</head>
+<body>
+
+<div class="poster">
+
+  <!-- Title -->
+  <div class="title-section">
+    <h1><span>Financial Intelligence Platform</span></h1>
+    <div class="tagline">从 Excel 到投资建议 — 三步构建智能财务咨询平台</div>
+  </div>
+
+  <!--
+    Layout: 5 rows, each row = [left] + [io-cell]
+    Left and io-cell are in the SAME flex row → guaranteed same height.
+
+    Row 1 (stage-3):  [Floor 3 card]        [📄 投资建议 box]
+    Row 2 (conn-3-2): [dep arrow]            [│ line segment]
+    Row 3 (stage-2):  [Floor 2 card]        [│ line · ● dot · │ line]
+    Row 4 (conn-2-1): [dep arrow]            [│ line segment]
+    Row 5 (stage-1):  [Floor 1 card]        [📁 Excel box]
+
+    The line segments in io-cells are flush (no gap between rows),
+    so they form one continuous vertical line.
+  -->
+  <div class="stages">
+
+    <!-- Row 1: Stage 3 -->
+    <div class="stage-row stage-3">
+      <div class="left">
+        <div class="floor-card">
+          <div class="floor-badge">
+            <div class="floor-num">3</div>
+            <div class="floor-icon">🧠</div>
+          </div>
+          <div class="floor-content">
+            <div class="floor-title">智能咨询</div>
+            <div class="floor-slogan">"让建议可自动生成"</div>
+            <div class="floor-keywords">
+              <span class="keyword">报告引擎</span>
+              <span class="keyword">LLM问答</span>
+              <span class="keyword">风险仪表盘</span>
+              <span class="keyword">客户端口</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="io-cell">
+        <div class="io-box io-output">
+          <span class="io-icon">📄</span>
+          <span class="io-title">投资建议</span>
+          <span class="io-desc">报告 · 问答 · 仪表盘</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Row 2: Connector 3→2 -->
+    <div class="connector-row conn-3-2">
+      <div class="left">
+        <div class="dep-content">
+          <span class="arrow-up">↑</span> 风险量化结果 驱动 报告与建议
+        </div>
+      </div>
+      <div class="io-cell">
+        <div class="io-line"></div>
+      </div>
+    </div>
+
+    <!-- Row 3: Stage 2 -->
+    <div class="stage-row stage-2">
+      <div class="left">
+        <div class="floor-card">
+          <div class="floor-badge">
+            <div class="floor-num">2</div>
+            <div class="floor-icon">📊</div>
+          </div>
+          <div class="floor-content">
+            <div class="floor-title">风险分析</div>
+            <div class="floor-slogan">"让风险可量化"</div>
+            <div class="floor-keywords">
+              <span class="keyword">情景分析</span>
+              <span class="keyword">敏感性矩阵</span>
+              <span class="keyword">蒙特卡罗</span>
+              <span class="keyword">盈亏平衡</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="io-cell">
+        <div class="io-flow-node">
+          <div class="seg"></div>
+          <div class="dot"></div>
+          <div class="seg"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Row 4: Connector 2→1 -->
+    <div class="connector-row conn-2-1">
+      <div class="left">
+        <div class="dep-content">
+          <span class="arrow-up">↑</span> 结构化数据 驱动 多维风险分析
+        </div>
+      </div>
+      <div class="io-cell">
+        <div class="io-line"></div>
+      </div>
+    </div>
+
+    <!-- Row 5: Stage 1 -->
+    <div class="stage-row stage-1">
+      <div class="left">
+        <div class="floor-card">
+          <div class="floor-badge">
+            <div class="floor-num">1</div>
+            <div class="floor-icon">🏗️</div>
+          </div>
+          <div class="floor-content">
+            <div class="floor-title">数据基础</div>
+            <div class="floor-slogan">"让数据可计算"</div>
+            <div class="floor-keywords">
+              <span class="keyword">Excel解析</span>
+              <span class="keyword">知识图谱</span>
+              <span class="keyword">增量重算</span>
+              <span class="keyword">快照对比</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="io-cell">
+        <div class="io-box io-input">
+          <span class="io-icon">📁</span>
+          <span class="io-title">Excel 模型</span>
+          <span class="io-desc">财务模型文件</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- "价值递增" label — absolute, positioned beside the io-column -->
+    <span class="flow-label">价值递增</span>
+
+  </div><!-- /stages -->
+
+  <!-- Bottom -->
+  <div class="bottom-info">
+    <span class="bottom-note">详图见 architecture-overview.html · 架构见 system-architecture.md</span>
+  </div>
+
+</div><!-- /poster -->
+
+</body>
+</html>
