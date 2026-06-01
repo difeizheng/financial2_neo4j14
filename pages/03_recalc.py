@@ -1,6 +1,7 @@
 """Page 3: Parameter workspace — two-column editor + results."""
 from __future__ import annotations
 import copy
+import html
 import json
 import os
 import sys
@@ -76,6 +77,60 @@ with scn_row[0]:
     if selected_scenario != ws.active_scenario:
         ws.active_scenario = selected_scenario
         save_workspace(ws)
+        # 切换场景：优先加载已保存的snapshot，避免重复重算
+        from financial_kg.storage.task_db import TaskDB as _TaskDB
+        from financial_kg.engine.snapshot import load_snapshot as _load_snapshot
+        _db = _TaskDB()
+        _snaps = _db.list_snapshots(task.id)
+        # 找该场景的最新snapshot（名称包含场景名）
+        _scene_snaps = [s for s in _snaps if selected_scenario in s.name]
+        if _scene_snaps:
+            # 最新snapshot（created_at DESC排序）
+            _latest_snap = _scene_snaps[0]
+            try:
+                _snap_data = _load_snapshot(_latest_snap.filepath)
+                # 创建working_graph并应用snapshot值
+                working_graph_cached = copy.deepcopy(base_graph)
+                for cid, val in _snap_data.values.items():
+                    cell = working_graph_cached.cells.get(cid)
+                    if cell:
+                        cell.value = val
+                # 同步更新indicator summary_value（用value_cell_id指向的值）
+                for ind_id, ind in working_graph_cached.indicators.items():
+                    # 优先使用value_cell_id指向的cell值
+                    if ind.value_cell_id:
+                        cell = working_graph_cached.cells.get(ind.value_cell_id)
+                        if cell and cell.value is not None:
+                            ind.summary_value = cell.value
+                    else:
+                        # 无value_cell_id时，尝试从cell_ids中取第一个有效值
+                        for cid in ind.cell_ids:
+                            cell = working_graph_cached.cells.get(cid)
+                            if cell and cell.value is not None:
+                                ind.summary_value = cell.value
+                                break
+                st.session_state[f"wg_{task.id}"] = working_graph_cached
+                st.session_state[f"rr_{task.id}"] = None  # 没有新的重算结果，但有cached值
+                st.toast(f"已加载场景「{selected_scenario}」的缓存数据", icon="⚡")
+            except Exception as e:
+                # snapshot加载失败，清除旧结果
+                st.session_state.pop(f"rr_{task.id}", None)
+                st.session_state.pop(f"wg_{task.id}", None)
+                st.toast(f"加载失败，显示基准值", icon="⚠️")
+        else:
+            # 该场景没有snapshot，检查是否有overrides
+            scenario = ws.scenarios.get(selected_scenario)
+            if scenario and scenario.overrides:
+                # 有overrides但没snapshot，需要预览重算
+                working_graph_preview = copy.deepcopy(base_graph)
+                preview_result = apply_and_recalc(working_graph_preview, ws, base_graph, record_history=False)
+                st.session_state[f"wg_{task.id}"] = working_graph_preview
+                st.session_state[f"rr_{task.id}"] = preview_result
+                st.toast(f"场景「{selected_scenario}」预览重算完成", icon="🔄")
+            else:
+                # 无overrides，显示基准
+                st.session_state.pop(f"rr_{task.id}", None)
+                st.session_state.pop(f"wg_{task.id}", None)
         st.rerun()
 
 with scn_row[1]:
@@ -622,70 +677,368 @@ with results_col:
     # ── Tab 1: Key metrics ───────────────────────────────────────────────
     with r_tabs[0]:
         # 始终显示关键指标（基线 + 变化）
-        all_key_ids = get_key_metrics(base_graph)
+        key_metric_ids = get_key_metrics(base_graph)
+        all_indicator_ids = list(base_graph.indicators.keys())
 
-        # 用户可选关注指标
+        # 用户可选关注指标（从workspace持久化读取，有序list）
         fav_key = f"fav_metrics_{task.id}"
         if fav_key not in st.session_state:
-            st.session_state[fav_key] = set(all_key_ids[:12])  # 默认前12个
+            # 从workspace读取，如果为空则用默认关键指标
+            if ws.favorite_metrics:
+                st.session_state[fav_key] = list(ws.favorite_metrics)  # 保持顺序
+            else:
+                st.session_state[fav_key] = list(key_metric_ids[:12])  # 默认前12个
 
-        with st.expander("⭐ 自定义关注指标", expanded=len(all_key_ids) <= 12):
-            st.caption("勾选需要追踪的指标（不勾选则使用自动匹配的关键指标）")
-            metric_cols = st.columns(3)
-            for idx, ind_id in enumerate(sorted(all_key_ids)):
+        # Helper: 移动指标位置
+        def _move_indicator(idx: int, direction: str):
+            """移动指标位置（direction='up'或'down'）。"""
+            fav_list = st.session_state[fav_key]
+            if direction == "up" and idx > 0:
+                fav_list[idx], fav_list[idx-1] = fav_list[idx-1], fav_list[idx]
+            elif direction == "down" and idx < len(fav_list) - 1:
+                fav_list[idx], fav_list[idx+1] = fav_list[idx+1], fav_list[idx]
+            st.session_state[fav_key] = fav_list
+            ws.favorite_metrics = fav_list
+            save_workspace(ws)
+
+        # ═══════════════════════════════════════════════════════════════════════════
+        # 自定义关注指标面板（方案A：分组 + 搜索 + 详情）
+        # ═══════════════════════════════════════════════════════════════════════════
+        with st.expander("⭐ 自定义关注指标", expanded=False):
+            # 顶部控制栏
+            ctrl_cols = st.columns([3, 2, 1])
+            with ctrl_cols[0]:
+                search_kw = st.text_input(
+                    "🔍 搜索",
+                    placeholder="输入指标名称或Sheet名...",
+                    key=f"fav_search_{task.id}",
+                    label_visibility="collapsed",
+                )
+            with ctrl_cols[1]:
+                scope_choice = st.radio(
+                    "指标范围",
+                    ["关键指标", "全部指标"],
+                    horizontal=True,
+                    key=f"fav_scope_{task.id}",
+                    label_visibility="collapsed",
+                )
+            with ctrl_cols[2]:
+                st.caption(f"已选 **{len(st.session_state[fav_key])}** 个")
+
+            # 快捷操作
+            quick_cols = st.columns([1, 1, 1, 8])
+            with quick_cols[0]:
+                if st.button("清空", key=f"fav_clear_{task.id}", use_container_width=True):
+                    st.session_state[fav_key] = []
+                    ws.favorite_metrics = []
+                    save_workspace(ws)
+                    st.rerun()
+            with quick_cols[1]:
+                if st.button("全选关键", key=f"fav_all_key_{task.id}", use_container_width=True):
+                    st.session_state[fav_key] = list(key_metric_ids)
+                    ws.favorite_metrics = list(key_metric_ids)
+                    save_workspace(ws)
+                    st.rerun()
+            with quick_cols[2]:
+                if st.button("全选全部", key=f"fav_all_{task.id}", use_container_width=True):
+                    st.session_state[fav_key] = list(all_indicator_ids)
+                    ws.favorite_metrics = list(all_indicator_ids)
+                    save_workspace(ws)
+                    st.rerun()
+
+            # ── Sheet多选过滤 ─────────────────────────────────────────────────────
+            # 获取所有Sheet列表
+            all_sheets = sorted({ind.sheet or "未知" for ind in base_graph.indicators.values()})
+            selected_sheets = st.multiselect(
+                "📂 按Sheet筛选",
+                all_sheets,
+                default=[],  # 默认显示全部（不筛选）
+                key=f"fav_sheet_filter_{task.id}",
+                help="选择特定Sheet只显示该Sheet的指标，不选则显示全部",
+            )
+
+            # 确定要展示的指标范围
+            base_ids = key_metric_ids if scope_choice == "关键指标" else all_indicator_ids
+
+            # 搜索过滤
+            if search_kw:
+                kw = search_kw.lower()
+                filtered_ids = [
+                    ind_id for ind_id in base_ids
+                    if kw in (base_graph.indicators[ind_id].name or "").lower()
+                    or kw in (base_graph.indicators[ind_id].sheet or "").lower()
+                ]
+            else:
+                filtered_ids = base_ids
+
+            # Sheet过滤（如果有选择）
+            if selected_sheets:
+                filtered_ids = [
+                    ind_id for ind_id in filtered_ids
+                    if base_graph.indicators.get(ind_id) and (base_graph.indicators[ind_id].sheet or "未知") in selected_sheets
+                ]
+
+            # 按Sheet分组
+            sheet_groups: dict[str, list[str]] = {}
+            for ind_id in filtered_ids:
                 ind = base_graph.indicators.get(ind_id)
-                label = ind.name if ind else ind_id
-                with metric_cols[idx % 3]:
-                    checked = ind_id in st.session_state[fav_key]
-                    if st.checkbox(label, value=checked, key=f"fav_{ind_id}"):
-                        st.session_state[fav_key].add(ind_id)
-                    elif ind_id in st.session_state[fav_key]:
-                        st.session_state[fav_key].discard(ind_id)
+                if ind:
+                    sheet = ind.sheet or "未知"
+                    if sheet not in sheet_groups:
+                        sheet_groups[sheet] = []
+                    sheet_groups[sheet].append(ind_id)
 
-        display_ids = st.session_state[fav_key] if st.session_state[fav_key] else set(all_key_ids)
-        if not display_ids:
-            st.info("未选择任何关注指标，请在上方勾选")
-        else:
-            n_show = min(len(display_ids), 12)
-            for ri in range((n_show + 2) // 3):
-                mc = st.columns(3)
-                for j, ind_id in enumerate(sorted(display_ids)[ri * 3:(ri + 1) * 3]):
+            # 展示分组（用container+divider代替嵌套expander）
+            st.caption(f"共 {len(filtered_ids)} 个指标，按Sheet分组")
+
+            # 用checkbox控制是否展示全部（折叠逻辑）
+            show_all_sheets = st.checkbox("展开全部Sheet", value=False, key=f"fav_show_all_{task.id}")
+
+            # 只展示前N个Sheet或全部
+            max_sheets = 100 if show_all_sheets else 5
+            sheet_names_sorted = sorted(sheet_groups.keys())
+
+            for sheet_idx, sheet_name in enumerate(sheet_names_sorted[:max_sheets]):
+                ind_ids_in_sheet = sheet_groups[sheet_name]
+
+                # Sheet组标题
+                st.markdown(f"**📂 {sheet_name}** ({len(ind_ids_in_sheet)}个)")
+
+                # 每Sheet内部用3列checkbox（按行号排序）
+                sheet_cols = st.columns(3)
+                # 按ind.row排序（Excel行号）
+                sorted_ind_ids = sorted(
+                    ind_ids_in_sheet,
+                    key=lambda x: (base_graph.indicators.get(x).row or 0, base_graph.indicators.get(x).name or "")
+                )
+                for idx, ind_id in enumerate(sorted_ind_ids):
                     ind = base_graph.indicators.get(ind_id)
                     if not ind:
                         continue
-                    old_val = ind.summary_value
-                    new_val = old_val
 
-                    # 如果有重算结果，显示新值
-                    if recalc_result and working_graph:
-                        w_ind = working_graph.indicators.get(ind_id)
-                        if w_ind:
-                            new_val = w_ind.summary_value
-
-                    delta = None
-                    delta_pct = None
-                    if old_val is not None and new_val is not None:
+                    # 构建标签：名称 + 行号 + 当前值
+                    name = ind.name or ind_id[:20]
+                    row_info = f"第{ind.row}行" if ind.row else ""
+                    val_info = ""
+                    if ind.summary_value is not None:
                         try:
-                            delta = float(new_val) - float(old_val)
-                            if abs(delta) > 1e-9:
-                                delta_pct = (delta / abs(float(old_val)) * 100) if old_val != 0 else None
+                            v = float(ind.summary_value)
+                            if abs(v) > 1e6:
+                                val_info = f"{v/1e6:.2f}M"
+                            elif abs(v) > 1e3:
+                                val_info = f"{v/1e3:.2f}K"
                             else:
-                                delta = None
+                                val_info = f"{v:.2f}"
                         except (ValueError, TypeError):
-                            pass
+                            val_info = str(ind.summary_value)[:10]
 
-                    # 有变化时高亮颜色
-                    metric_color = "normal"
-                    if delta is not None and delta < 0:
-                        metric_color = "inverse"
+                    label = f"{name}"
+                    detail = f"{row_info} | {val_info}" if row_info or val_info else ""
 
-                    with mc[j]:
-                        st.metric(
-                            label=ind.name or ind_id,
-                            value=new_val if new_val is not None else "—",
-                            delta=f"{delta:+.2f} ({delta_pct:+.1f}%)" if delta is not None else None,
-                            delta_color=metric_color,
-                        )
+                    with sheet_cols[idx % 3]:
+                        checked = ind_id in st.session_state[fav_key]
+                        new_checked = st.checkbox(label, value=checked, key=f"fav_{ind_id}_{task.id}")
+                        # 状态变化时更新list + 保存到workspace
+                        fav_list = st.session_state[fav_key]
+                        if new_checked and ind_id not in fav_list:
+                            fav_list.append(ind_id)  # 添加到末尾
+                            st.session_state[fav_key] = fav_list
+                            ws.favorite_metrics = fav_list
+                            save_workspace(ws)
+                        elif not new_checked and ind_id in fav_list:
+                            fav_list.remove(ind_id)  # 从list移除
+                            st.session_state[fav_key] = fav_list
+                            ws.favorite_metrics = fav_list
+                            save_workspace(ws)
+                        if detail:
+                            st.caption(detail, unsafe_allow_html=False)
+
+                # Sheet组分隔
+                if sheet_idx < len(sheet_names_sorted[:max_sheets]) - 1:
+                    st.divider()
+
+            # 如果有更多Sheet未显示
+            if len(sheet_names_sorted) > max_sheets:
+                st.caption(f"还有 {len(sheet_names_sorted) - max_sheets} 个Sheet未显示，勾选「展开全部Sheet」查看")
+
+        # 检查是否有选择
+        fav_list = st.session_state[fav_key]
+        if not fav_list:
+            st.info("未选择任何关注指标，请在上方勾选")
+        else:
+            # ── Helper: infer unit from indicator name ─────────────────────────────
+            def _infer_unit(ind_name: str) -> str:
+                """根据指标名称推断单位。"""
+                name_lower = (ind_name or "").lower()
+                if any(k in name_lower for k in ["irr", "内部收益率", "收益率"]):
+                    return "%"
+                elif any(k in name_lower for k in ["npv", "净现值", "现值"]):
+                    return "万元"
+                elif any(k in name_lower for k in ["回收期", "payback", "年限"]):
+                    return "年"
+                elif any(k in name_lower for k in ["dscr", "偿债覆盖率", "覆盖率"]):
+                    return ""  # 无单位
+                elif any(k in name_lower for k in ["收入", "成本", "利润", "投资", "费用", "现金流", "营业", "总额", "合计"]):
+                    return "万元"
+                elif any(k in name_lower for k in ["电量", "发电量", "用电量"]):
+                    return "万kWh"
+                elif any(k in name_lower for k in ["装机", "容量", "功率"]):
+                    return "MW"
+                elif any(k in name_lower for k in ["电价", "价格", "单价"]):
+                    return "元/kWh"
+                elif any(k in name_lower for k in ["利率", "利率", "率"]):
+                    return "%"
+                else:
+                    return ""
+
+            # ── Helper: format value compactly ─────────────────────────────────────
+            def _format_value_compact(val: Any, unit: str) -> str:
+                """格式化值（紧凑，大数用K/M）。"""
+                if val is None:
+                    return "—"
+                try:
+                    v = float(val)
+                    # 根据单位调整显示
+                    if unit == "%":
+                        return f"{v:.2f}%"
+                    elif unit == "年":
+                        return f"{v:.2f}年"
+                    elif unit in ["万元", "元"]:
+                        # 大数用M/K
+                        if abs(v) > 1e8:
+                            return f"{v/1e8:.2f}亿"
+                        elif abs(v) > 1e6:
+                            return f"{v/1e6:.2f}M"
+                        elif abs(v) > 1e4:
+                            return f"{v/1e4:.2f}万"
+                        else:
+                            return f"{v:.0f}"
+                    elif unit == "万kWh":
+                        if abs(v) > 1e4:
+                            return f"{v/1e4:.2f}亿kWh"
+                        else:
+                            return f"{v:.0f}万kWh"
+                    elif unit == "MW":
+                        return f"{v:.0f}MW"
+                    elif unit == "元/kWh":
+                        return f"{v:.4f}元/kWh"
+                    else:
+                        if abs(v) > 1e6:
+                            return f"{v/1e6:.2f}M"
+                        elif abs(v) > 1e3:
+                            return f"{v/1e3:.2f}K"
+                        else:
+                            return f"{v:.2f}"
+                except (ValueError, TypeError):
+                    return str(val)[:12]
+
+            # ── Helper: build card HTML string ───────────────────────────────────────
+            def _build_card_html(idx: int, ind_id: str, task_id: str) -> str:
+                """构建单个指标卡片HTML字符串（不渲染，只返回HTML）。"""
+                # 从base_graph获取基准值
+                ind = base_graph.indicators.get(ind_id)
+                if not ind:
+                    return ""
+
+                old_val = ind.summary_value  # 基准值（用于对比）
+                new_val = old_val
+
+                # 优先使用working_graph的值（snapshot加载或重算后的值）
+                if working_graph:
+                    w_ind = working_graph.indicators.get(ind_id)
+                    if w_ind:
+                        new_val = w_ind.summary_value
+
+                delta = None
+                delta_pct = None
+                if old_val is not None and new_val is not None:
+                    try:
+                        delta = float(new_val) - float(old_val)
+                        if abs(delta) > 1e-9:
+                            delta_pct = (delta / abs(float(old_val)) * 100) if old_val != 0 else None
+                        else:
+                            delta = None
+                    except (ValueError, TypeError):
+                        pass
+
+                unit = _infer_unit(ind.name or "")
+                label_raw = f"{ind.name or ind_id[:20]} ({unit})" if unit else (ind.name or ind_id[:20])
+                label_with_unit = html.escape(label_raw)
+
+                val_str = _format_value_compact(new_val, unit)
+                val_escaped = html.escape(val_str)
+
+                delta_str = ""
+                if delta is not None:
+                    delta_fmt = _format_value_compact(delta, unit)
+                    if delta_pct is not None and abs(delta_pct) < 100:
+                        delta_str = f"{delta_fmt} ({delta_pct:+.1f}%)"
+                    else:
+                        delta_str = delta_fmt
+                delta_escaped = html.escape(delta_str) if delta_str else ""
+
+                name_lower = (ind.name or "").lower()
+                is_good = False
+                if delta is not None:
+                    if any(k in name_lower for k in ["irr", "npv", "dscr", "收入", "利润"]):
+                        is_good = delta > 0
+                    elif any(k in name_lower for k in ["回收期", "成本", "费用"]):
+                        is_good = delta < 0
+                    else:
+                        is_good = delta > 0
+
+                delta_color = "#22c55e" if is_good else "#ef4444"
+
+                delta_html = ""
+                if delta_escaped:
+                    delta_html = f'<br/><span style="font-size:0.85em;color:{delta_color};">Δ {delta_escaped}</span>'
+
+                return (
+                    f'<div style="flex:1;border:1px solid #e5e7eb;border-radius:6px;padding:8px;margin:2px;">'
+                    f'<span style="font-size:0.95em;font-weight:600;color:#374151;">{label_with_unit}</span><br/>'
+                    f'<span style="font-size:1.1em;font-weight:700;color:#111827;">{val_escaped}</span>'
+                    f'{delta_html}'
+                    f'</div>'
+                )
+
+            # ── Display metrics in 2 columns (HTML flexbox) ───────────────────────────
+            fav_list = st.session_state[fav_key]
+            n_show = min(len(fav_list), 12)
+
+            for idx in range(0, n_show, 2):
+                # 两列卡片HTML（用flexbox，不嵌套columns）
+                cards_html = '<div style="display:flex;gap:8px;">'
+                cards_html += _build_card_html(idx, fav_list[idx], task.id)
+                if idx + 1 < n_show:
+                    cards_html += _build_card_html(idx + 1, fav_list[idx + 1], task.id)
+                cards_html += '</div>'
+                st.markdown(cards_html, unsafe_allow_html=True)
+
+                # 按钮行（第一层columns，4列：左卡片的↑↓ + 右卡片的↑↓）
+                btn_cols = st.columns([1, 1, 1, 1])
+                # 左卡片按钮
+                with btn_cols[0]:
+                    if idx > 0:
+                        if st.button("⬆", key=f"up_{idx}_{task.id}"):
+                            _move_indicator(idx, "up")
+                            st.rerun()
+                with btn_cols[1]:
+                    if idx < n_show - 1:
+                        if st.button("⬇", key=f"down_{idx}_{task.id}"):
+                            _move_indicator(idx, "down")
+                            st.rerun()
+                # 右卡片按钮
+                if idx + 1 < n_show:
+                    with btn_cols[2]:
+                        if idx + 1 > 0:
+                            if st.button("⬆", key=f"up_{idx+1}_{task.id}"):
+                                _move_indicator(idx + 1, "up")
+                                st.rerun()
+                    with btn_cols[3]:
+                        if idx + 1 < n_show - 1:
+                            if st.button("⬇", key=f"down_{idx+1}_{task.id}"):
+                                _move_indicator(idx + 1, "down")
+                                st.rerun()
 
             # 受影响 Indicator 详情（仅重算后显示）
             if recalc_result and working_graph:

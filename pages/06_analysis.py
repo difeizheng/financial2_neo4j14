@@ -1,6 +1,8 @@
 """Page 6: Financial analysis — sensitivity, history, comparison."""
 from __future__ import annotations
 
+import json
+import numpy as np
 import os
 import sys
 import time
@@ -14,9 +16,11 @@ from financial_kg.storage.json_store import load_graph
 from financial_kg.storage.task_db import TaskDB
 from financial_kg.models.graph import FinancialGraph
 from financial_kg.engine.sensitivity import run_sensitivity, SensitivityResult, SensitivityScenario
+from financial_kg.engine.sensitivity_parallel import run_sensitivity_parallel, ParallelSensitivityResult
 from financial_kg.engine.derived_metrics import DerivedMetrics
 from financial_kg.engine.break_even import find_break_even, BreakEvenResult
 from financial_kg.engine.scenario_analysis import run_scenario_analysis, ScenarioAnalysisResult, classify_parameter
+from financial_kg.engine.scenario_analysis_parallel import run_scenario_analysis_parallel, ParallelScenarioResult
 from financial_kg.viz.tornado_chart import render_tornado_html, render_spider_chart
 
 st.set_page_config(layout="wide")
@@ -161,8 +165,34 @@ tab_sensitivity, tab_break_even, tab_scenario, tab_monte_carlo, tab_history, tab
 with tab_sensitivity:
     st.subheader("参数选择")
 
+    # ── Mode selector ───────────────────────────────────────────────
+    sens_mode = st.radio(
+        "计算模式",
+        ["串行模式（单进程）", "并行模式（多进程）"],
+        horizontal=True,
+        key="sens_mode",
+        help="并行模式适合20+场景，4进程约8x加速",
+    )
+
+    is_parallel_sens = sens_mode == "并行模式（多进程）"
+
+    if is_parallel_sens:
+        st.info("🚀 并行模式：多进程并行执行，适合大量参数×扰动组合")
+        sens_workers = st.slider(
+            "进程数量",
+            min_value=1,
+            max_value=8,
+            value=4,
+            step=1,
+            help="建议设置为CPU核心数，最多8进程（防止内存耗尽）",
+            key="sens_workers_slider",
+        )
+        st.caption(f"预计内存峰值：{sens_workers * 300:.0f}MB")
+    else:
+        st.caption("串行模式：逐个执行场景")
+
     # Filter bar
-    col_f1, col_f2, col_f3 = st.columns([2, 2, 3])
+    col_f1, col_f2, col_f3, col_f4 = st.columns([2, 2, 3, 1])
     with col_f1:
         cat_filter = st.multiselect("按类别筛选", all_categories, default=[], key="sens_cat")
     with col_f2:
@@ -174,6 +204,9 @@ with tab_sensitivity:
             default=[-0.1, -0.05, 0.05, 0.1],
             key="sens_perturbations",
         )
+    with col_f4:
+        if perturbations:
+            st.caption(f"{len(perturbations)}档扰动")
 
     # Filtered params
     filtered = all_params
@@ -207,55 +240,125 @@ with tab_sensitivity:
         # Run button
         run_row = st.columns([2, 6])
         with run_row[0]:
+            # Show scenario count estimate
+            if selected_keys:
+                scenario_count = len(selected_keys) * len(perturbations)
+                st.caption(f"预估场景数：{scenario_count}")
+                if scenario_count > 20 and not is_parallel_sens:
+                    st.warning("建议使用并行模式加速")
+
             if st.button("运行敏感性分析", type="primary", use_container_width=True, disabled=not selected_keys):
                 param_cells = [param_options[k] for k in selected_keys]
 
-                with st.spinner(f"分析中（{len(param_cells)} 参数 × {len(perturbations)} 扰动）..."):
-                    result = run_sensitivity(
-                        graph=graph,
-                        param_cells=param_cells,
-                        perturbations=perturbations,
-                        task_id="",  # Don't create snapshots
+                if is_parallel_sens:
+                    # Parallel mode
+                    from financial_kg.engine.sensitivity_parallel import run_sensitivity_parallel
+
+                    cells_path = os.path.join(task.output_dir, f"{task.id}_cells.json")
+
+                    with st.spinner(f"并行分析中（{len(param_cells)} 参数 × {len(perturbations)} 扰动，{sens_workers} 进程）..."):
+                        parallel_result = run_sensitivity_parallel(
+                            graph=graph,
+                            param_cells=param_cells,
+                            perturbations=perturbations,
+                            workers=sens_workers,
+                            cells_path=cells_path,
+                        )
+
+                    # Convert ParallelSensitivityResult to SensitivityResult for compatibility
+                    result = SensitivityResult(
+                        base_metrics=parallel_result.base_metrics,
+                        scenarios=parallel_result.scenarios,
+                        summary_table=parallel_result.summary_table,
                     )
+                    st.session_state[f"sens_result_{task.id}"] = result
+                    st.session_state[f"sens_workers_{task.id}"] = parallel_result.workers
 
-                st.session_state[f"sens_result_{task.id}"] = result
-
-                # Save to SQLite
-                params_list = [{"cell_id": c, "name": n} for c, n in param_cells]
-                scenarios_data = []
-                for s in result.scenarios:
-                    metrics_dict = {}
+                    # Save to SQLite (same structure as serial)
+                    params_list = [{"cell_id": c, "name": n} for c, n in param_cells]
+                    scenarios_data = []
+                    for s in result.scenarios:
+                        metrics_dict = {}
+                        for field_name in ("irr_after_tax", "irr_before_tax", "npv_after_tax",
+                                           "npv_before_tax", "payback_period", "dscr_avg", "dscr_min"):
+                            val = getattr(s.metrics, field_name, None)
+                            if val is not None:
+                                metrics_dict[field_name] = val
+                        scenarios_data.append({
+                            "name": s.name,
+                            "param_name": s.param_name,
+                            "param_cell_id": s.param_cell_id,
+                            "perturbation": s.perturbation,
+                            "original_value": s.original_value,
+                            "perturbed_value": s.perturbed_value,
+                            "metrics": metrics_dict,
+                            "snapshot_name": s.snapshot_name,
+                        })
+                    base_dict = {}
                     for field_name in ("irr_after_tax", "irr_before_tax", "npv_after_tax",
                                        "npv_before_tax", "payback_period", "dscr_avg", "dscr_min"):
-                        val = getattr(s.metrics, field_name, None)
+                        val = getattr(result.base_metrics, field_name, None)
                         if val is not None:
-                            metrics_dict[field_name] = val
-                    scenarios_data.append({
-                        "name": s.name,
-                        "param_name": s.param_name,
-                        "param_cell_id": s.param_cell_id,
-                        "perturbation": s.perturbation,
-                        "original_value": s.original_value,
-                        "perturbed_value": s.perturbed_value,
-                        "metrics": metrics_dict,
-                        "snapshot_name": s.snapshot_name,
-                    })
-                base_dict = {}
-                for field_name in ("irr_after_tax", "irr_before_tax", "npv_after_tax",
-                                   "npv_before_tax", "payback_period", "dscr_avg", "dscr_min"):
-                    val = getattr(result.base_metrics, field_name, None)
-                    if val is not None:
-                        base_dict[field_name] = val
+                            base_dict[field_name] = val
 
-                db.save_sensitivity(
-                    task_id=task.id,
-                    run_name=f"分析_{len(param_cells)}参数_{time.strftime('%H%M')}",
-                    params=params_list,
-                    perturbations=perturbations,
-                    base_metrics=base_dict,
-                    scenarios=scenarios_data,
-                )
-                st.toast("分析完成并已保存")
+                    db.save_sensitivity(
+                        task_id=task.id,
+                        run_name=f"分析_并行_{sens_workers}进程_{len(param_cells)}参数_{time.strftime('%H%M')}",
+                        params=params_list,
+                        perturbations=perturbations,
+                        base_metrics=base_dict,
+                        scenarios=scenarios_data,
+                    )
+                    st.toast(f"并行分析完成（{parallel_result.total_scenarios}场景×{parallel_result.workers}进程）并已保存")
+
+                else:
+                    # Serial mode (original)
+                    with st.spinner(f"分析中（{len(param_cells)} 参数 × {len(perturbations)} 扰动）..."):
+                        result = run_sensitivity(
+                            graph=graph,
+                            param_cells=param_cells,
+                            perturbations=perturbations,
+                            task_id="",  # Don't create snapshots
+                        )
+
+                    st.session_state[f"sens_result_{task.id}"] = result
+
+                    # Save to SQLite
+                    params_list = [{"cell_id": c, "name": n} for c, n in param_cells]
+                    scenarios_data = []
+                    for s in result.scenarios:
+                        metrics_dict = {}
+                        for field_name in ("irr_after_tax", "irr_before_tax", "npv_after_tax",
+                                           "npv_before_tax", "payback_period", "dscr_avg", "dscr_min"):
+                            val = getattr(s.metrics, field_name, None)
+                            if val is not None:
+                                metrics_dict[field_name] = val
+                        scenarios_data.append({
+                            "name": s.name,
+                            "param_name": s.param_name,
+                            "param_cell_id": s.param_cell_id,
+                            "perturbation": s.perturbation,
+                            "original_value": s.original_value,
+                            "perturbed_value": s.perturbed_value,
+                            "metrics": metrics_dict,
+                            "snapshot_name": s.snapshot_name,
+                        })
+                    base_dict = {}
+                    for field_name in ("irr_after_tax", "irr_before_tax", "npv_after_tax",
+                                       "npv_before_tax", "payback_period", "dscr_avg", "dscr_min"):
+                        val = getattr(result.base_metrics, field_name, None)
+                        if val is not None:
+                            base_dict[field_name] = val
+
+                    db.save_sensitivity(
+                        task_id=task.id,
+                        run_name=f"分析_{len(param_cells)}参数_{time.strftime('%H%M')}",
+                        params=params_list,
+                        perturbations=perturbations,
+                        base_metrics=base_dict,
+                        scenarios=scenarios_data,
+                    )
+                    st.toast("分析完成并已保存")
                 st.rerun()
 
         # ── Display results ──────────────────────────────────────────────
@@ -474,6 +577,41 @@ with tab_break_even:
     st.subheader("盈亏平衡分析")
     st.caption("搜索参数需要变化多少，关键指标才会触达设定的阈值")
 
+    # ── Mode selector ───────────────────────────────────────
+    be_mode = st.radio(
+        "计算模式",
+        ["并行模式（多进程）", "串行模式（单进程）"],
+        horizontal=True,
+        key="be_mode",
+        help="并行模式利用下游范围重算+多候选点并行测试，约2分钟完成；串行模式约6小时",
+    )
+
+    is_parallel_be = be_mode == "并行模式（多进程）"
+
+    if is_parallel_be:
+        st.info("🚀 并行模式：下游范围重算（5秒/次）+ 多候选点并行测试，预计2分钟完成")
+        be_workers = st.slider(
+            "进程数量",
+            min_value=1,
+            max_value=8,
+            value=4,
+            step=1,
+            help="建议设置为CPU核心数，最多8进程",
+            key="be_workers_slider",
+        )
+        be_candidates = st.slider(
+            "每轮候选点数",
+            min_value=2,
+            max_value=5,
+            value=3,
+            step=1,
+            help="每轮并行测试的候选点数量，3个为最优（收敛快+并行效率高）",
+            key="be_candidates_slider",
+        )
+        st.caption(f"预计轮数: ~17轮 (每轮{be_candidates}个候选点×{be_workers}进程)")
+    else:
+        st.warning("⚠️ 串行模式：每次迭代完整重算（8分钟），50次迭代约6小时")
+
     # Configuration
     col_be1, col_be2, col_be3 = st.columns(3)
     with col_be1:
@@ -502,58 +640,174 @@ with tab_break_even:
 
     be_metric_key, be_mult, be_unit, _, _ = METRICS[be_metric_label]
 
-    # Parameter selector
-    be_param_options = {
-        f"{r['name']} | {r['sheet']} 第{r['row']}行 {r['col']}列 = {r['value']:,.2f}": r["cell_id"]
-        for r in all_params
-    }
-    be_param_labels = list(be_param_options.keys())
-    selected_be_param = st.selectbox("参数", be_param_labels, key="be_param_sel")
+    # ── Filter: only show params with downstream impact ────────────────────────
+    @st.cache_data(show_spinner="筛选有影响的参数...")
+    def _filter_params_with_impact(task_id: str, output_dir: str, all_params: list[dict]) -> list[dict]:
+        """Only return parameters that have downstream cells (affect other cells).
+
+        Optimization: Use graph.predecessors() directly (O(1)) instead of full BFS (O(n)).
+        """
+        from financial_kg.storage.json_store import load_graph
+        import os
+
+        cells_path = os.path.join(output_dir, f"{task_id}_cells.json")
+        g = load_graph(cells_path)
+
+        filtered = []
+        for p in all_params:
+            cid = p["cell_id"]
+            if g.cell_graph.has_node(cid):
+                # Fast check: predecessors = cells that depend on this cell
+                pred_count = g.cell_graph.in_degree(cid)
+                if pred_count > 0:
+                    p["downstream_count"] = pred_count
+                    filtered.append(p)
+
+        return filtered
+
+    be_params_with_impact = _filter_params_with_impact(task.id, task.output_dir, all_params)
+
+    if not be_params_with_impact:
+        st.warning("未找到有下游影响的参数。图谱依赖关系可能不完整。")
+    else:
+        st.caption(f"已筛选 {len(be_params_with_impact)} 个有影响的参数（下游cells > 0）")
+
+        # Parameter selector (sorted by impact)
+        be_params_with_impact.sort(key=lambda x: x.get("downstream_count", 0), reverse=True)
+        be_param_options = {
+            f"{r['name']} ({r.get('downstream_count', 0)} cells影响) | {r['sheet']} 第{r['row']}行 {r['col']}列 = {r['value']:,.2f}": (r["cell_id"], r["name"])
+            for r in be_params_with_impact
+        }
+        be_param_labels = list(be_param_options.keys())
+        selected_be_param = st.selectbox("参数", be_param_labels, key="be_param_sel")
+
+        # Show downstream count
+        selected_info = be_param_options[selected_be_param]
+        st.caption(f"该参数修改会影响约 {selected_be_param.split('(')[1].split()[0]} 个下游单元格")
 
     # Run
     if st.button("搜索盈亏平衡点", type="primary", use_container_width=True):
-        with st.spinner("二分搜索中..."):
-            be_result = find_break_even(
-                graph=graph,
-                cell_id=be_param_options[selected_be_param],
-                metric_key=be_metric_key,
-                threshold=be_threshold,
-                max_iterations=50,
-            )
-            # Fill in param name
-            be_result = BreakEvenResult(
-                param_name=be_param_options[selected_be_param].split(" | ")[0] if " | " in be_param_options[selected_be_param] else "",
+        cell_id, param_name = be_param_options[selected_be_param]
+
+        if is_parallel_be:
+            from financial_kg.engine.break_even_parallel import find_break_even_parallel, ParallelBreakEvenResult
+
+            cells_path = os.path.join(task.output_dir, f"{task.id}_cells.json")
+
+            progress_bar = st.progress(0, text=f"并行搜索中...")
+
+            with st.spinner(f"并行搜索盈亏平衡点（{be_workers}进程，每轮{be_candidates}候选点）..."):
+                be_result = find_break_even_parallel(
+                    graph=graph,
+                    cell_id=cell_id,
+                    metric_key=be_metric_key,
+                    threshold=be_threshold,
+                    max_rounds=20,
+                    candidates_per_round=be_candidates,
+                    workers=be_workers,
+                    cells_path=cells_path,
+                    metric_label=be_metric_label,
+                    perturb_pct=be_perturb_pct,
+                )
+
+            progress_bar.empty()
+
+            # Convert to compatible result format for display
+            be_result_display = BreakEvenResult(
+                param_name=param_name,
                 param_cell_id=be_result.param_cell_id,
                 original_value=be_result.original_value,
                 metric_key=be_result.metric_key,
-                metric_label=be_metric_label,
-                threshold=be_threshold,
+                metric_label=be_result.metric_label,
+                threshold=be_result.threshold,
                 break_even_value=be_result.break_even_value,
                 break_even_pct=be_result.break_even_pct,
                 found=be_result.found,
-                iterations=be_result.iterations,
+                iterations=be_result.total_evaluations,  # Use total evaluations
                 metric_at_break_even=be_result.metric_at_break_even,
                 direction=be_result.direction,
             )
-        st.session_state[f"be_result_{task.id}"] = be_result
+            st.session_state[f"be_result_{task.id}"] = be_result_display
+            st.session_state[f"be_parallel_info_{task.id}"] = {
+                "workers": be_result.workers,
+                "rounds": be_result.rounds,
+                "elapsed_seconds": be_result.elapsed_seconds,
+            }
+            st.toast(f"并行搜索完成：{be_result.rounds}轮×{be_workers}进程，耗时{be_result.elapsed_seconds:.1f}秒")
+
+        else:
+            # Serial mode (original)
+            with st.spinner("二分搜索中（预计6小时）..."):
+                be_result = find_break_even(
+                    graph=graph,
+                    cell_id=cell_id,
+                    metric_key=be_metric_key,
+                    threshold=be_threshold,
+                    max_iterations=50,
+                    perturb_pct=be_perturb_pct,
+                )
+                be_result_display = BreakEvenResult(
+                    param_name=param_name,
+                    param_cell_id=be_result.param_cell_id,
+                    original_value=be_result.original_value,
+                    metric_key=be_result.metric_key,
+                    metric_label=be_metric_label,
+                    threshold=be_threshold,
+                    break_even_value=be_result.break_even_value,
+                    break_even_pct=be_result.break_even_pct,
+                    found=be_result.found,
+                    iterations=be_result.iterations,
+                    metric_at_break_even=be_result.metric_at_break_even,
+                    direction=be_result.direction,
+                )
+            st.session_state[f"be_result_{task.id}"] = be_result_display
 
     # Display result
     be_key = f"be_result_{task.id}"
     be: BreakEvenResult | None = st.session_state.get(be_key)
+    be_parallel_info = st.session_state.get(f"be_parallel_info_{task.id}")
 
     if be:
         st.divider()
+        # Always show current base metric value for context
+        from financial_kg.engine.derived_metrics import compute_derived_metrics
+        _be_base_m = compute_derived_metrics(graph)
+        _be_base_val = getattr(_be_base_m, be.metric_key, None)
+
         if not be.found:
+            if _be_base_val is not None:
+                _be_val_str = f"{_be_base_val * be_mult:.2f}{be_unit}"
+                _be_gap = be.threshold - _be_base_val
+                _be_dir_hint = "提高" if _be_gap > 0 else "降低"
+                _be_gap_str = f"{abs(_be_gap) * be_mult:.2f}{be_unit}"
+                _be_diag = (
+                    f"当前 **{be_metric_label}** 基准值为 **{_be_val_str}**，"
+                    f"需要**{_be_dir_hint} {_be_gap_str}**才能达到阈值 "
+                    f"{be_threshold * be_mult:.2f}{be_unit}。\n\n"
+                )
+            else:
+                _be_diag = f"当前 **{be_metric_label}** 基准值无法计算。\n\n"
             st.warning(
-                f"在 ±{be_perturb_pct}% 范围内未找到 {be_metric_label}={be_threshold} 的盈亏平衡点。"
-                f"当前 {be_metric_label} 基准值可能已高于/低于阈值。"
+                f"在 ±{be_perturb_pct}% 范围内未找到 {be_metric_label}={be_threshold * be_mult:.2f}{be_unit} 的盈亏平衡点。\n\n"
+                f"{_be_diag}"
+                f"💡 建议：①增大扰动范围（如 ±80%） ②更换影响更大的参数 ③降低阈值"
             )
         else:
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("参数原值", f"{be.original_value:,.2f}")
             c2.metric("盈亏平衡值", f"{be.break_even_value:,.2f}" if be.break_even_value else "—")
             c3.metric("需要变化", f"{be.break_even_pct:+.1%}" if be.break_even_pct else "—")
-            c4.metric("搜索次数", str(be.iterations))
+            if be_parallel_info:
+                c4.metric("搜索耗时", f"{be_parallel_info['elapsed_seconds']:.1f}秒")
+            else:
+                c4.metric("搜索次数", str(be.iterations))
+
+            # Parallel mode additional info
+            if be_parallel_info:
+                st.caption(
+                    f"并行模式：{be_parallel_info['rounds']}轮搜索 × {be_parallel_info['workers']}进程 "
+                    f"共测试{be.iterations}个候选值"
+                )
 
             # Base metric value
             from financial_kg.engine.derived_metrics import compute_derived_metrics
@@ -574,6 +828,28 @@ with tab_break_even:
 with tab_scenario:
     st.subheader("情景分析")
     st.caption("多变量同时变动，对比悲观/基准/乐观三种情景")
+
+    # ── Parallel execution option ───────────────────────────────────────
+    scn_parallel_col1, scn_parallel_col2 = st.columns([3, 2])
+    with scn_parallel_col1:
+        scn_parallel = st.toggle(
+            "并行执行",
+            value=False,  # Default off for 3 scenarios
+            key="scn_parallel_toggle",
+            help="标准3情景模式收益有限，自定义5+情景建议开启",
+        )
+    with scn_parallel_col2:
+        if scn_parallel:
+            scn_workers = st.slider(
+                "进程数",
+                min_value=1,
+                max_value=8,
+                value=4,
+                step=1,
+                key="scn_workers_slider",
+            )
+        else:
+            scn_workers = 1
 
     # Mode selector
     scenario_mode = st.radio(
@@ -654,43 +930,102 @@ with tab_scenario:
             # ── Run scenario analysis ───────────────────────────────────────────
             st.divider()
             if st.button("运行情景分析", type="primary", use_container_width=True, disabled=not selected_scn_keys):
-                from financial_kg.engine.scenario_analysis import run_scenario_analysis
+                cells_path = os.path.join(task.output_dir, f"{task.id}_cells.json")
 
-                with st.spinner("分析悲观/基准/乐观三种情景..."):
-                    scn_result = run_scenario_analysis(
-                        graph=graph,
-                        param_cells=classifications,
-                        preset="standard",
+                if scn_parallel:
+                    # Parallel mode
+                    from financial_kg.engine.scenario_analysis_parallel import run_scenario_analysis_parallel
+                    from financial_kg.engine.scenario_analysis import VAR_CLASSIFICATION, DEFAULT_CLASSIFICATION
+
+                    # Build scenario_ratios
+                    scenario_names = ["悲观", "基准", "乐观"]
+                    scenario_ratios = {}
+                    for scenario_name in scenario_names:
+                        scenario_ratios[scenario_name] = {}
+                        for cell_id, param_name, classification in classifications:
+                            ratios = VAR_CLASSIFICATION.get(classification, VAR_CLASSIFICATION[DEFAULT_CLASSIFICATION])
+                            scenario_ratios[scenario_name][cell_id] = ratios[scenario_name]
+
+                    with st.spinner(f"并行分析悲观/基准/乐观三种情景（{scn_workers} 进程）..."):
+                        parallel_scn_result = run_scenario_analysis_parallel(
+                            graph=graph,
+                            param_cells=classifications,
+                            scenario_ratios=scenario_ratios,
+                            workers=scn_workers,
+                            cells_path=cells_path,
+                        )
+
+                    # Convert to ScenarioAnalysisResult for compatibility
+                    scn_result = ScenarioAnalysisResult(
+                        base_metrics=parallel_scn_result.base_metrics,
+                        scenarios=parallel_scn_result.scenarios,
+                        comparison_table=parallel_scn_result.comparison_table,
+                        delta_table=parallel_scn_result.delta_table,
                     )
+                    st.session_state[f"scn_result_{task.id}"] = scn_result
 
-                st.session_state[f"scn_result_{task.id}"] = scn_result
+                    # Save to database
+                    params_data = [{"cell_id": c, "name": n, "classification": cls} for c, n, cls in classifications]
+                    base_metrics_data = {
+                        k: v for k in ["irr_after_tax", "npv_after_tax", "payback_period", "dscr_avg", "dscr_min"]
+                        if (v := getattr(scn_result.base_metrics, k, None)) is not None
+                    }
+                    scenarios_data = []
+                    for s in scn_result.scenarios:
+                        scenarios_data.append({
+                            "name": s.name,
+                            "param_changes": s.param_changes,
+                            "metrics": {k: v for k in ["irr_after_tax", "npv_after_tax", "payback_period"]
+                                        if (v := getattr(s.metrics, k, None)) is not None},
+                            "changed_cells": s.changed_cells,
+                        })
+                    db.save_scenario(
+                        task_id=task.id,
+                        run_name=f"情景分析_并行_{scn_workers}进程_{len(classifications)}参数_{time.strftime('%H%M')}",
+                        params=params_data,
+                        base_metrics=base_metrics_data,
+                        scenarios=scenarios_data,
+                        comparison_table=scn_result.comparison_table,
+                        delta_table=scn_result.delta_table,
+                    )
+                    st.toast(f"并行情景分析完成（{scn_workers}进程）并已保存")
 
-                # Save to database
-                params_data = [{"cell_id": c, "name": n, "classification": cls} for c, n, cls in classifications]
-                base_metrics_data = {
-                    k: v for k in ["irr_after_tax", "npv_after_tax", "payback_period", "dscr_avg", "dscr_min"]
-                    if (v := getattr(scn_result.base_metrics, k, None)) is not None
-                }
-                scenarios_data = []
-                for s in scn_result.scenarios:
-                    scenarios_data.append({
-                        "name": s.name,
-                        "param_changes": s.param_changes,
-                        "metrics": {k: v for k in ["irr_after_tax", "npv_after_tax", "payback_period"]
-                                    if (v := getattr(s.metrics, k, None)) is not None},
-                        "changed_cells": s.changed_cells,
-                    })
-                db.save_scenario(
-                    task_id=task.id,
-                    run_name=f"情景分析_{len(classifications)}参数_{time.strftime('%H%M')}",
-                    params=params_data,
-                    base_metrics=base_metrics_data,
-                    scenarios=scenarios_data,
-                    comparison_table=scn_result.comparison_table,
-                    delta_table=scn_result.delta_table,
-                )
+                else:
+                    # Serial mode (original)
+                    with st.spinner("分析悲观/基准/乐观三种情景..."):
+                        scn_result = run_scenario_analysis(
+                            graph=graph,
+                            param_cells=classifications,
+                            preset="standard",
+                        )
 
-                st.toast("情景分析完成并已保存")
+                    st.session_state[f"scn_result_{task.id}"] = scn_result
+
+                    # Save to database
+                    params_data = [{"cell_id": c, "name": n, "classification": cls} for c, n, cls in classifications]
+                    base_metrics_data = {
+                        k: v for k in ["irr_after_tax", "npv_after_tax", "payback_period", "dscr_avg", "dscr_min"]
+                        if (v := getattr(scn_result.base_metrics, k, None)) is not None
+                    }
+                    scenarios_data = []
+                    for s in scn_result.scenarios:
+                        scenarios_data.append({
+                            "name": s.name,
+                            "param_changes": s.param_changes,
+                            "metrics": {k: v for k in ["irr_after_tax", "npv_after_tax", "payback_period"]
+                                        if (v := getattr(s.metrics, k, None)) is not None},
+                            "changed_cells": s.changed_cells,
+                        })
+                    db.save_scenario(
+                        task_id=task.id,
+                        run_name=f"情景分析_{len(classifications)}参数_{time.strftime('%H%M')}",
+                        params=params_data,
+                        base_metrics=base_metrics_data,
+                        scenarios=scenarios_data,
+                        comparison_table=scn_result.comparison_table,
+                        delta_table=scn_result.delta_table,
+                    )
+                    st.toast("情景分析完成并已保存")
                 st.rerun()
 
         # ── Custom scenario mode ───────────────────────────────────────────────
@@ -729,17 +1064,42 @@ with tab_scenario:
 
             if st.button("运行自定义情景分析", type="primary", use_container_width=True):
                 from financial_kg.engine.scenario_analysis import run_scenario_analysis
+                cells_path = os.path.join(task.output_dir, f"{task.id}_cells.json")
 
-                with st.spinner(f"分析 {len(scn_name_list)} 种情景..."):
-                    scn_result = run_scenario_analysis(
-                        graph=graph,
-                        param_cells=[(r["cell_id"], r["name"], "revenue") for key in selected_scn_keys for r in [scn_param_options[key]]],
-                        preset="custom",
-                        custom_ratios=custom_ratios,
+                if scn_parallel and len(scn_name_list) > 3:
+                    # Parallel mode for custom scenarios
+                    from financial_kg.engine.scenario_analysis_parallel import run_scenario_analysis_parallel
+
+                    with st.spinner(f"并行分析 {len(scn_name_list)} 种情景（{scn_workers} 进程）..."):
+                        scn_result = run_scenario_analysis_parallel(
+                            graph=graph,
+                            param_cells=[(r["cell_id"], r["name"], "revenue") for key in selected_scn_keys for r in [scn_param_options[key]]],
+                            scenario_ratios=custom_ratios,
+                            workers=scn_workers,
+                            cells_path=cells_path,
+                        )
+
+                    # Convert to ScenarioAnalysisResult
+                    scn_result = ScenarioAnalysisResult(
+                        base_metrics=scn_result.base_metrics,
+                        scenarios=scn_result.scenarios,
+                        comparison_table=scn_result.comparison_table,
+                        delta_table=scn_result.delta_table,
                     )
+                    st.toast(f"并行自定义情景分析完成（{scn_workers}进程）")
+
+                else:
+                    # Serial mode
+                    with st.spinner(f"分析 {len(scn_name_list)} 种情景..."):
+                        scn_result = run_scenario_analysis(
+                            graph=graph,
+                            param_cells=[(r["cell_id"], r["name"], "revenue") for key in selected_scn_keys for r in [scn_param_options[key]]],
+                            preset="custom",
+                            custom_ratios=custom_ratios,
+                        )
+                    st.toast("自定义情景分析完成")
 
                 st.session_state[f"scn_result_{task.id}"] = scn_result
-                st.toast("情景分析完成")
                 st.rerun()
 
     # ── Display results ───────────────────────────────────────────────────────
@@ -868,19 +1228,37 @@ with tab_monte_carlo:
 
     if is_fast_mode:
         st.info("⚡ 快速模式：敏感性系数近似，1000次仅需1秒，准确度约97%")
+        iterations = 1000  # Default for fast mode
     elif is_parallel_mode:
         st.info("🚀 并行模式：多进程并行执行")
         # Workers configuration
         workers = st.slider(
             "进程数量",
             min_value=1,
-            max_value=16,
+            max_value=8,  # Reduced from 16 to 8 for memory safety
             value=4,
             step=1,
-            help="建议设置为CPU核心数",
+            help="建议设置为CPU核心数，最多8进程（防止内存耗尽）",
+        )
+        # Iterations slider (moved here for scope)
+        iterations = st.slider(
+            "模拟次数",
+            min_value=100,
+            max_value=5000,
+            value=1000,
+            step=100,
+            help="次数越多结果越精确，但耗时更长",
+        )
+        st.warning(
+            f"⚠️ 并行模式内存安全：已限制最多8进程。"
+            f"当前配置：{workers}进程 × {iterations}次，"
+            f"预计内存峰值：{workers * 300:.0f}MB"
         )
     else:
-        st.warning("⚠️ 精确模式：单进程执行，100次约需500分钟")
+        st.warning(
+            f"⚠️ 精确模式：单进程执行，100次约需500分钟"
+        )
+        iterations = 100  # Default for precise mode
 
     # ── Parameter selection ───────────────────────────────────────────────
     st.divider()
@@ -920,14 +1298,16 @@ with tab_monte_carlo:
             st.divider()
             st.subheader("设置概率分布")
 
-            iterations = st.slider(
-                "模拟次数",
-                min_value=100,
-                max_value=5000,
-                value=1000,
-                step=100,
-                help="次数越多结果越精确，但耗时更长",
-            )
+            # Iterations slider (only for non-parallel modes)
+            if not is_parallel_mode:
+                iterations = st.slider(
+                    "模拟次数",
+                    min_value=100,
+                    max_value=5000,
+                    value=1000,
+                    step=100,
+                    help="次数越多结果越精确，但耗时更长",
+                )
 
             # Show estimated time for parallel mode
             if is_parallel_mode:
@@ -1018,6 +1398,8 @@ with tab_monte_carlo:
                     # Save to database
                     params_data = [{"name": name, "distribution": {"type": dc.type, "params": dc.params}}
                                    for name, dc in fast_dists]
+                    # Extract IRR values for storage
+                    irr_values_to_save = mc_result.irr_values if hasattr(mc_result, 'irr_values') else []
                     db.save_monte_carlo(
                         task_id=task.id,
                         run_name=f"蒙特卡罗_快速_{iterations}次_{time.strftime('%H%M')}",
@@ -1027,6 +1409,7 @@ with tab_monte_carlo:
                         base_irr=base_irr,
                         statistics=mc_result.statistics,
                         probability_table=mc_result.probability_table,
+                        irr_values=irr_values_to_save,  # Store IRR values
                     )
 
                     st.toast(f"快速模式完成 {iterations} 次模拟并已保存")
@@ -1058,12 +1441,15 @@ with tab_monte_carlo:
 
                     progress_bar = st.progress(0, text=f"预克隆图谱 (0/{workers})...")
 
+                    cells_path = os.path.join(task.output_dir, f"{task.id}_cells.json")
+
                     with st.spinner(f"并行执行 {iterations} 次（{workers} 进程）..."):
                         mc_result = run_monte_carlo_parallel(
                             graph=graph,
                             param_cells=parallel_dists,
                             iterations=iterations,
                             workers=workers,
+                            cells_path=cells_path,
                             seed=42,
                         )
 
@@ -1074,6 +1460,9 @@ with tab_monte_carlo:
                     # Save to database
                     params_data = [{"cell_id": c, "name": n, "distribution": {"type": dc.type, "params": dc.params}}
                                    for c, n, dc in parallel_dists]
+                    # Extract IRR values for storage
+                    irr_values_to_save = mc_result.irr_values if hasattr(mc_result, 'irr_values') else []
+                    npv_values_to_save = mc_result.npv_values if hasattr(mc_result, 'npv_values') else []
                     db.save_monte_carlo(
                         task_id=task.id,
                         run_name=f"蒙特卡罗_并行_{iterations}次_{workers}进程_{time.strftime('%H%M')}",
@@ -1083,6 +1472,7 @@ with tab_monte_carlo:
                         base_irr=mc_result.base_metrics.irr_after_tax or 0.068,
                         statistics=mc_result.statistics.get("irr_after_tax", {}),
                         probability_table=mc_result.probability_table,
+                        irr_values=irr_values_to_save,  # Store IRR values for visualization
                     )
 
                     st.toast(f"并行模式完成 {iterations} 次×{workers}进程并已保存")
@@ -1109,6 +1499,8 @@ with tab_monte_carlo:
                     # Save to database
                     params_data = [{"name": name, "distribution": {"type": dc.type, "params": dc.params}}
                                    for name, dc in dist_configs]
+                    # Extract IRR values from simulations
+                    irr_values_to_save = [s.metrics.irr_after_tax for s in mc_result.simulations if s.metrics.irr_after_tax]
                     db.save_monte_carlo(
                         task_id=task.id,
                         run_name=f"蒙特卡罗_精确_{iterations}次_{time.strftime('%H%M')}",
@@ -1118,6 +1510,7 @@ with tab_monte_carlo:
                         base_irr=mc_result.base_metrics.irr_after_tax or 0.068,
                         statistics=mc_result.statistics.get("irr_after_tax", {}),
                         probability_table=mc_result.probability_table,
+                        irr_values=irr_values_to_save,  # Store IRR values
                     )
 
                     st.toast(f"精确模式完成 {iterations} 次模拟并已保存")
@@ -1135,18 +1528,46 @@ with tab_monte_carlo:
         if st.button("清除结果", type="secondary", key="clear_mc_result"):
             st.session_state.pop(mc_result_key, None)
             st.session_state.pop(f"mc_mode_{task.id}", None)
+            st.session_state.pop(f"mc_params_{task.id}", None)  # Clear params info
             st.rerun()
 
+        # ── Show parameters analyzed ───────────────────────────────────────
+        params_info = st.session_state.get(f"mc_params_{task.id}", [])
+        if params_info:
+            st.subheader("分析参数")
+            params_rows = []
+            for p in params_info:
+                dist_type = p.get("distribution", {}).get("type", "normal")
+                dist_params = p.get("distribution", {}).get("params", {})
+                if dist_type == "normal":
+                    dist_str = f"正态(σ={dist_params.get('std', 0)*100:.1f}%)"
+                elif dist_type == "uniform":
+                    dist_str = f"均匀({dist_params.get('min', 0)*100:+.1f}%~{dist_params.get('max', 0)*100:+.1f}%)"
+                elif dist_type == "triangular":
+                    dist_str = f"三角({dist_params.get('min', 0)*100:+.1f}%~{dist_params.get('max', 0)*100:+.1f}%)"
+                else:
+                    dist_str = dist_type
+                params_rows.append({
+                    "参数": p.get("name", "未知"),
+                    "分布": dist_str,
+                    "Cell ID": p.get("cell_id", "—"),
+                })
+            st.dataframe(params_rows, use_container_width=True, hide_index=True, height=min(200, len(params_rows)*35+40))
+            st.caption(f"模拟次数: {mc_result.iterations if hasattr(mc_result, 'iterations') else '未知'}")
+
         # Mode indicator
-        if mc_mode_type == "fast":
+        if hasattr(mc_result, 'base_irr'):
+            # FastMonteCarloResult (fast or parallel mode history)
             st.caption("⚡ 快速模式结果（敏感性系数近似）")
-            base_irr = mc_result.base_irr if hasattr(mc_result, 'base_irr') else 0.068
+            base_irr = mc_result.base_irr
             st.caption(f"基准IRR: {base_irr * 100:.2f}%")
-        else:
-            from financial_kg.engine.monte_carlo import MonteCarloResult
-            mc: MonteCarloResult = mc_result
-            bm = mc.base_metrics
+        elif hasattr(mc_result, 'base_metrics'):
+            # MonteCarloResult or ParallelMonteCarloResult (precise mode)
+            bm = mc_result.base_metrics
             st.caption(f"基准: IRR={bm.irr_after_tax * 100:.2f}%, NPV={bm.npv_after_tax:,.0f}")
+        else:
+            # Fallback
+            st.caption("蒙特卡罗模拟结果")
 
         # ── Statistics table ───────────────────────────────────────────────────
         st.subheader("统计指标")
@@ -1181,8 +1602,19 @@ with tab_monte_carlo:
         if mc_mode_type == "fast":
             irr_values = mc_result.irr_values if hasattr(mc_result, 'irr_values') else []
             irr_values = [v * 100 for v in irr_values]  # Convert to percentage
+        elif mc_mode_type == "parallel":
+            # Parallel mode now stores irr_values
+            irr_values = mc_result.irr_values if hasattr(mc_result, 'irr_values') else []
+            irr_values = [v * 100 for v in irr_values]  # Convert to percentage
         else:
-            irr_values = [s.metrics.irr_after_tax * 100 for s in mc_result.simulations if s.metrics.irr_after_tax]
+            # Precise mode: has simulations attribute
+            if hasattr(mc_result, 'simulations'):
+                irr_values = [s.metrics.irr_after_tax * 100 for s in mc_result.simulations if s.metrics.irr_after_tax]
+            elif hasattr(mc_result, 'irr_values'):
+                # Fallback: use irr_values if available
+                irr_values = [v * 100 for v in mc_result.irr_values]
+            else:
+                irr_values = []
 
         if irr_values:
             import json
@@ -1230,21 +1662,67 @@ with tab_monte_carlo:
         st.divider()
         st.subheader("风险评估")
 
+        # Get stats from correct structure
+        if hasattr(mc_result, 'statistics'):
+            stats_dict = mc_result.statistics
+            if isinstance(stats_dict, dict) and "irr_after_tax" in stats_dict:
+                stats = stats_dict["irr_after_tax"]
+            else:
+                stats = stats_dict
+        else:
+            stats = {}
+
         if stats:
             mean_irr = stats.get("mean", 0.068)
             std_irr = stats.get("std", 0.01)
             p5_irr = stats.get("p5", 0.05)
 
-        # ── Risk assessment ───────────────────────────────────────────────────────
-        st.divider()
-        st.subheader("风险评估")
+            # ── Cumulative probability chart ─────────────────────────────────────
+            st.subheader("累积概率曲线")
+            st.caption("显示IRR低于某个阈值的累积概率，帮助评估风险")
 
-        if stats:
-            mean_irr = stats.get("mean", 0.068)
-            std_irr = stats.get("std", 0.01)
-            p5_irr = stats.get("p5", 0.05)
+            # Build cumulative probability data
+            if irr_values:
+                sorted_irr = sorted(irr_values)
+                cum_prob = []
+                thresholds = np.linspace(min(irr_values), max(irr_values), 50)
+                for thresh in thresholds:
+                    prob_below = sum(1 for v in irr_values if v <= thresh) / len(irr_values)
+                    cum_prob.append(prob_below * 100)
 
-            # Risk criteria
+                cum_chart_option = {
+                    "title": {"text": "IRR累积概率分布", "left": "center", "textStyle": {"fontSize": 14}},
+                    "tooltip": {"trigger": "axis", "formatter": "IRR ≤ {b}%: {c}%概率"},
+                    "xAxis": {"type": "value", "name": "IRR (%)", "min": min(irr_values), "max": max(irr_values)},
+                    "yAxis": {"type": "value", "name": "累积概率 (%)", "min": 0, "max": 100},
+                    "series": [{
+                        "name": "累积概率",
+                        "type": "line",
+                        "data": [[t, p] for t, p in zip(thresholds, cum_prob)],
+                        "smooth": True,
+                        "markLine": {
+                            "data": [
+                                {"xAxis": 6.0, "name": "行业基准6%", "label": {"formatter": "基准6%"}},
+                                {"yAxis": 50, "name": "中位数", "label": {"formatter": "50%概率"}},
+                            ],
+                            "lineStyle": {"color": "#ef4444", "type": "dashed"},
+                        },
+                    }],
+                }
+
+                cum_chart_html = (
+                    "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                    "<script src='https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js'></script>"
+                    "<style>body{margin:0;font-family:sans-serif;}#chart{width:100%;height:320px;}</style>"
+                    "</head><body><div id='chart'></div>"
+                    "<script>var chart=echarts.init(document.getElementById('chart'));"
+                    "var option=" + json.dumps(cum_chart_option, ensure_ascii=False) + ";"
+                    "chart.setOption(option);window.addEventListener('resize',function(){chart.resize();});"
+                    "</script></body></html>"
+                )
+                st.components.v1.html(cum_chart_html, height=350, scrolling=False)
+
+            # ── Risk criteria ───────────────────────────────────────────────────────
             if p5_irr < 0.04:  # 5th percentile below 4%
                 risk_level = "极高风险"
                 risk_color = "#991b1b"
@@ -1473,131 +1951,131 @@ with tab_history:
                 hist_ids = {f"[{h['id']}] {h['run_name']} ({h['created_at'][:19]})": h for h in history}
                 selected_hist = st.selectbox("查看历史详情", list(hist_ids.keys()), label_visibility="collapsed")
 
-        if selected_hist:
-            h = hist_ids[selected_hist]
+            if selected_hist:
+                h = hist_ids[selected_hist]
 
-            detail_row = st.columns([6, 2, 1])
-            with detail_row[1]:
-                if st.button("📊 加载到分析", type="primary", use_container_width=True, key=f"load_detail_{h['id']}"):
-                    rebuilt = _rebuild_result_from_history(h)
-                    st.session_state[f"sens_result_{task.id}"] = rebuilt
-                    st.session_state[f"hist_loaded_{h['id']}"] = True
-                    st.toast(f"已加载记录 #{h['id']} 到分析视图")
-                    st.rerun()
-            with detail_row[2]:
-                if st.button("🗑️ 删除", type="secondary", use_container_width=True, key=f"del_hist_{h['id']}"):
-                    db.delete_sensitivity(h["id"])
-                    st.toast("已删除")
-                    st.rerun()
+                detail_row = st.columns([6, 2, 1])
+                with detail_row[1]:
+                    if st.button("📊 加载到分析", type="primary", use_container_width=True, key=f"load_detail_{h['id']}"):
+                        rebuilt = _rebuild_result_from_history(h)
+                        st.session_state[f"sens_result_{task.id}"] = rebuilt
+                        st.session_state[f"hist_loaded_{h['id']}"] = True
+                        st.toast(f"已加载记录 #{h['id']} 到分析视图")
+                        st.rerun()
+                with detail_row[2]:
+                    if st.button("🗑️ 删除", type="secondary", use_container_width=True, key=f"del_hist_{h['id']}"):
+                        db.delete_sensitivity(h["id"])
+                        st.toast("已删除")
+                        st.rerun()
 
-            st.caption(f"运行时间: {h['created_at'][:19]} | "
-                       f"参数: {', '.join(p['name'] for p in h['params'])} | "
-                       f"扰动: {', '.join(f'{p:+.0%}' for p in h['perturbations'])}")
+                st.caption(f"运行时间: {h['created_at'][:19]} | "
+                           f"参数: {', '.join(p['name'] for p in h['params'])} | "
+                           f"扰动: {', '.join(f'{p:+.0%}' for p in h['perturbations'])}")
 
-            # Multi-metric base comparison
-            st.subheader("基准指标")
-            base_m = h["base_metrics"]
-            base_rows = []
-            for label, (mkey, mmult, munit, _, _) in METRICS.items():
-                val = base_m.get(mkey)
-                if val is not None:
-                    base_rows.append({"指标": label, "基准值": f"{val * mmult:.2f}{munit}"})
-            if base_rows:
-                st.dataframe(base_rows, use_container_width=True, hide_index=True, height=200)
-
-            # IRR summary
-            st.subheader("IRR 敏感性汇总表")
-            summary_data = []
-            by_param: dict[str, dict] = {}
-            for s in h["scenarios"]:
-                by_param.setdefault(s["param_name"], {})[s["perturbation"]] = s["metrics"]
-
-            for pname, perts in by_param.items():
-                row = {"参数": pname}
-                for pct, metrics in sorted(perts.items()):
-                    label = f"{pct:+.0%}"
-                    irr = metrics.get("irr_after_tax")
-                    if irr is not None:
-                        base_irr = base_m.get("irr_after_tax")
-                        delta = (irr - base_irr) * 100 if base_irr is not None else 0
-                        row[label] = f"{irr * 100:.2f}% ({delta:+.2f}pp)"
-                    else:
-                        row[label] = "—"
-                summary_data.append(row)
-
-            if summary_data:
-                st.dataframe(summary_data, use_container_width=True, hide_index=True)
-
-            # ── Inline chart preview ──────────────────────────────────────
-            st.divider()
-            st.subheader("快速图表预览")
-
-            rebuilt = _rebuild_result_from_history(h)
-            col_c1, col_c2 = st.columns([3, 3])
-            with col_c1:
-                hist_chart_metric = st.selectbox(
-                    "指标",
-                    list(METRICS.keys()),
-                    index=0,
-                    key="hist_chart_metric",
-                )
-            with col_c2:
-                hist_chart_type = st.selectbox(
-                    "图表",
-                    ["龙卷风图", "蛛网图"],
-                    key="hist_chart_type",
-                )
-
-            h_metric_key, h_mult, h_unit, _, _ = METRICS[hist_chart_metric]
-            if hist_chart_type == "龙卷风图":
-                html = render_tornado_html(rebuilt, h_metric_key, hist_chart_metric)
-            else:
-                html = render_spider_chart(rebuilt, h_metric_key, hist_chart_metric)
-
-            if html:
-                st.components.v1.html(html, height=450, scrolling=False)
-            else:
-                st.info("无可视化数据")
-
-            # ── Sensitivity ranking (inline) ──────────────────────────────
-            st.divider()
-            st.subheader("敏感度排名")
-
-            h_base_val = getattr(rebuilt.base_metrics, h_metric_key, None)
-            if h_base_val is not None:
-                h_by_param: dict[str, dict] = {}
-                for s in rebuilt.scenarios:
-                    s_val = getattr(s.metrics, h_metric_key, None)
-                    if s_val is not None:
-                        h_by_param.setdefault(s.param_name, {})[s.perturbation] = s_val
-
-                h_rank_rows = []
-                for pname, perts in h_by_param.items():
-                    max_delta = max(abs(v - h_base_val) for v in perts.values())
-                    max_pert = max(perts.keys(), key=lambda p: abs(perts[p] - h_base_val))
-                    pct_at_max = perts[max_pert]
-                    h_rank_rows.append({
-                        "参数": pname,
-                        "基准值": f"{h_base_val * h_mult:.2f}{h_unit}",
-                        "最大变化后值": f"{pct_at_max * h_mult:.2f}{h_unit}",
-                        "最大偏差": f"{abs(pct_at_max - h_base_val) * h_mult:.2f}{h_unit}",
-                        "触发扰动": f"{max_pert:+.0%}",
-                    })
-
-                h_rank_rows.sort(key=lambda r: float(r["最大偏差"].replace(h_unit, "")), reverse=True)
-                for i, r in enumerate(h_rank_rows):
-                    r["排名"] = i + 1
-
-                st.dataframe(
-                    h_rank_rows,
-                    use_container_width=True,
-                    hide_index=True,
-                    height=min(300, len(h_rank_rows) * 35 + 40),
-                    column_config={
-                        "排名": st.column_config.NumberColumn("排名", width="small"),
-                    },
-                )
-
+                # Multi-metric base comparison
+                st.subheader("基准指标")
+                base_m = h["base_metrics"]
+                base_rows = []
+                for label, (mkey, mmult, munit, _, _) in METRICS.items():
+                    val = base_m.get(mkey)
+                    if val is not None:
+                        base_rows.append({"指标": label, "基准值": f"{val * mmult:.2f}{munit}"})
+                if base_rows:
+                    st.dataframe(base_rows, use_container_width=True, hide_index=True, height=200)
+    
+                # IRR summary
+                st.subheader("IRR 敏感性汇总表")
+                summary_data = []
+                by_param: dict[str, dict] = {}
+                for s in h["scenarios"]:
+                    by_param.setdefault(s["param_name"], {})[s["perturbation"]] = s["metrics"]
+    
+                for pname, perts in by_param.items():
+                    row = {"参数": pname}
+                    for pct, metrics in sorted(perts.items()):
+                        label = f"{pct:+.0%}"
+                        irr = metrics.get("irr_after_tax")
+                        if irr is not None:
+                            base_irr = base_m.get("irr_after_tax")
+                            delta = (irr - base_irr) * 100 if base_irr is not None else 0
+                            row[label] = f"{irr * 100:.2f}% ({delta:+.2f}pp)"
+                        else:
+                            row[label] = "—"
+                    summary_data.append(row)
+    
+                if summary_data:
+                    st.dataframe(summary_data, use_container_width=True, hide_index=True)
+    
+                # ── Inline chart preview ──────────────────────────────────────
+                st.divider()
+                st.subheader("快速图表预览")
+    
+                rebuilt = _rebuild_result_from_history(h)
+                col_c1, col_c2 = st.columns([3, 3])
+                with col_c1:
+                    hist_chart_metric = st.selectbox(
+                        "指标",
+                        list(METRICS.keys()),
+                        index=0,
+                        key="hist_chart_metric",
+                    )
+                with col_c2:
+                    hist_chart_type = st.selectbox(
+                        "图表",
+                        ["龙卷风图", "蛛网图"],
+                        key="hist_chart_type",
+                    )
+    
+                h_metric_key, h_mult, h_unit, _, _ = METRICS[hist_chart_metric]
+                if hist_chart_type == "龙卷风图":
+                    html = render_tornado_html(rebuilt, h_metric_key, hist_chart_metric)
+                else:
+                    html = render_spider_chart(rebuilt, h_metric_key, hist_chart_metric)
+    
+                if html:
+                    st.components.v1.html(html, height=450, scrolling=False)
+                else:
+                    st.info("无可视化数据")
+    
+                # ── Sensitivity ranking (inline) ──────────────────────────────
+                st.divider()
+                st.subheader("敏感度排名")
+    
+                h_base_val = getattr(rebuilt.base_metrics, h_metric_key, None)
+                if h_base_val is not None:
+                    h_by_param: dict[str, dict] = {}
+                    for s in rebuilt.scenarios:
+                        s_val = getattr(s.metrics, h_metric_key, None)
+                        if s_val is not None:
+                            h_by_param.setdefault(s.param_name, {})[s.perturbation] = s_val
+    
+                    h_rank_rows = []
+                    for pname, perts in h_by_param.items():
+                        max_delta = max(abs(v - h_base_val) for v in perts.values())
+                        max_pert = max(perts.keys(), key=lambda p: abs(perts[p] - h_base_val))
+                        pct_at_max = perts[max_pert]
+                        h_rank_rows.append({
+                            "参数": pname,
+                            "基准值": f"{h_base_val * h_mult:.2f}{h_unit}",
+                            "最大变化后值": f"{pct_at_max * h_mult:.2f}{h_unit}",
+                            "最大偏差": f"{abs(pct_at_max - h_base_val) * h_mult:.2f}{h_unit}",
+                            "触发扰动": f"{max_pert:+.0%}",
+                        })
+    
+                    h_rank_rows.sort(key=lambda r: float(r["最大偏差"].replace(h_unit, "")), reverse=True)
+                    for i, r in enumerate(h_rank_rows):
+                        r["排名"] = i + 1
+    
+                    st.dataframe(
+                        h_rank_rows,
+                        use_container_width=True,
+                        hide_index=True,
+                        height=min(300, len(h_rank_rows) * 35 + 40),
+                        column_config={
+                            "排名": st.column_config.NumberColumn("排名", width="small"),
+                        },
+                    )
+    
     # ── Scenario History ───────────────────────────────────────────────────
     with hist_scenario:
         scenario_history = db.list_scenario(task.id)
@@ -1662,31 +2140,41 @@ with tab_history:
             for h in mc_history:
                 stats = h["statistics"]
                 mean_irr = stats.get("mean", 0)
+                params_info = h.get("params", [])
+                params_str = ", ".join(p.get("name", "未知")[:10] for p in params_info[:3])
+                if len(params_info) > 3:
+                    params_str += f" +{len(params_info)-3}"
 
-                col_m1, col_m2, col_m3, col_m4, col_m5, col_m6 = st.columns([1, 2, 2, 2, 2, 1])
+                col_m1, col_m2, col_m3, col_m4, col_m5, col_m6, col_m7 = st.columns([1, 2, 2, 2, 2, 2, 1])
                 with col_m1:
                     st.caption(f"#{h['id']}")
                 with col_m2:
                     st.caption(h["created_at"][:19])
                 with col_m3:
-                    mode_label = "⚡快" if h["mode"] == "fast" else "🎯精"
+                    mode_label = "⚡快" if h["mode"] == "fast" else ("🚀并" if h["mode"] == "parallel" else "🎯精")
                     st.caption(f"{mode_label} {h['iterations']}次")
                 with col_m4:
-                    st.caption(f"均值IRR={mean_irr * 100:.2f}%")
+                    st.caption(params_str if params_str else "—")
                 with col_m5:
+                    st.caption(f"均值IRR={mean_irr * 100:.2f}%")
+                with col_m6:
                     std_irr = stats.get("std", 0)
                     st.caption(f"σ={std_irr * 100:.2f}%")
-                with col_m6:
+                with col_m7:
                     if st.button("📊", key=f"load_mc_hist_{h['id']}", use_container_width=True, help="加载到蒙特卡罗Tab"):
                         from financial_kg.engine.monte_carlo_fast import FastMonteCarloResult
+                        # Load IRR values from database
+                        irr_values_loaded = h.get("irr_values", [])
+                        params_loaded = h.get("params", [])
                         rebuilt = FastMonteCarloResult(
                             base_irr=h["base_irr"],
                             iterations=h["iterations"],
-                            irr_values=[],
+                            irr_values=irr_values_loaded,  # Restore IRR values for charts
                             statistics=stats,
                             probability_table=h["probability_table"],
                         )
                         st.session_state[f"mc_result_{task.id}"] = rebuilt
                         st.session_state[f"mc_mode_{task.id}"] = h["mode"]
+                        st.session_state[f"mc_params_{task.id}"] = params_loaded  # Store params info
                         st.toast(f"已加载蒙特卡罗 #{h['id']}")
                         st.rerun()
