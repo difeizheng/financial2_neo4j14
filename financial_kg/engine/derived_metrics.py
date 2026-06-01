@@ -36,6 +36,7 @@ class DerivedMetrics:
     total_tax: float | None = None
     loan_repayment_period: float | None = None
     icrr: dict[str, float] = field(default_factory=dict)  # sensitivity: {scenario: irr}
+    metric_sources: dict[str, str] = field(default_factory=dict)
 
 
 # ── Pattern matching helpers ─────────────────────────────────────────────────
@@ -258,19 +259,160 @@ def _extract_dscr_series(graph: FinancialGraph) -> dict[str, float]:
 
 # ── Main computation ────────────────────────────────────────────────────────
 
+def _find_capital_after_tax_cf_series(graph: FinancialGraph) -> list[tuple[int, float]] | None:
+    """优先找「资本金税后净现金流量」序列（非累计），用于资本金税后 IRR 计算。
+
+    为什么需要这个：
+    - 通用关键词 "净现金流量" 会被多条 indicator 命中：
+      * 表5-资本金 "净现金流量"（投资活动，48期，无税无财务结构）
+      * 表6-资本金 "税后净现金流量"（52期，资本金税后，财务现金流）
+      * 表6-资本金 "累计税后净现金流量"（累计值，不可用于 IRR）
+      * 表8-全投资 "税后净现金流量"（全投资口径）
+    - 默认插入顺序会让 表5 命中，导致 关键指标对比 显示的 IRR 与 Excel
+      表6 中的「资本金内部收益率（税后）」不一致（典型差异 ~0.2%）。
+    - 本函数按"资本金+税后+净现金流量+非累计"精确匹配，命中 表6-资本金
+      row 41 的序列，与 Excel 的 =XIRR(F41:BE41, F3:BE3) 公式结果一致。
+    """
+    # Priority 1: 资本金 + 税后 + 净现金流量 + 非累计
+    for ind in graph.indicators.values():
+        name = ind.name or ""
+        if "资本金" in name and "税后" in name and "净现金流量" in name \
+                and "累计" not in name and ind.time_series:
+            pairs: list[tuple[int, float]] = []
+            for label, val in ind.time_series.items():
+                year = _parse_year(label)
+                v = _extract_numeric(val)
+                if year is not None and v is not None:
+                    pairs.append((year, v))
+            if len(pairs) >= 2:
+                pairs.sort()
+                return pairs
+    # Priority 2: 税后 + 净现金流量 + 非累计（无 资本金 限定，作为兜底）
+    for ind in graph.indicators.values():
+        name = ind.name or ""
+        if "税后" in name and "净现金流量" in name \
+                and "累计" not in name and "资本金" not in name and ind.time_series:
+            pairs = []
+            for label, val in ind.time_series.items():
+                year = _parse_year(label)
+                v = _extract_numeric(val)
+                if year is not None and v is not None:
+                    pairs.append((year, v))
+            if len(pairs) >= 2:
+                pairs.sort()
+                return pairs
+    return None
+
+
+# ── Direct indicator cell reading ────────────────────────────────────────────
+
+# Maps metric key → list of (keyword_variants,) tuples for indicator name matching.
+# The first match wins; entries are ordered by specificity (most specific first).
+_METRIC_INDICATOR_MAP: dict[str, list[tuple[str, ...]]] = {
+    "irr_after_tax": [
+        ("资本金内部收益率（税后）", "资本金内部收益率(税后)"),
+    ],
+    "irr_before_tax": [
+        ("资本金内部收益率（税前）", "资本金内部收益率(税前)"),
+    ],
+    "payback_period": [
+        ("投资回收期",),
+    ],
+}
+
+# Prefer indicators from these tables when multiple matches exist.
+_PREFERRED_TABLES: dict[str, str] = {
+    "payback_period": "表6",
+}
+
+
+def _extract_table_ref(ind_id: str, cell_col: str, cell_row: int) -> str:
+    """Extract a human-readable table + cell reference from indicator id + cell coords."""
+    # ind_id format: IND_表6-现金流量表-资本金_45__资本金内部收益率（税后）
+    parts = ind_id.split("__")
+    prefix = parts[0].replace("IND_", "") if parts else ""
+    # prefix: 表6-现金流量表-资本金_45
+    # Extract table name (everything before the last _N segment)
+    segments = prefix.rsplit("_", 1)
+    table_name = segments[0] if len(segments) > 1 else prefix
+    return f"{table_name} {cell_col}{cell_row}"
+
+
+def _read_metric_from_indicators(
+    graph: FinancialGraph,
+    metric_key: str,
+) -> tuple[float | None, str | None]:
+    """Read a metric value directly from an indicator's summary cell (D column).
+
+    Returns:
+        (value, source_label) e.g. (0.0784, "表6-现金流量表-资本金 D45").
+        Both are None if no matching indicator is found.
+    """
+    variants_list = _METRIC_INDICATOR_MAP.get(metric_key)
+    if not variants_list:
+        return None, None
+
+    preferred_table = _PREFERRED_TABLES.get(metric_key)
+
+    candidates: list[tuple[float, str, str]] = []  # (value, source, ind_id)
+
+    for variants in variants_list:
+        for ind_id, ind in graph.indicators.items():
+            name = ind.name or ""
+            if not any(v in name for v in variants):
+                continue
+            # Find the D-column cell (summary/total value)
+            for cid in ind.cell_ids:
+                if not cid.endswith("_D"):
+                    continue
+                cell = graph.cells.get(cid)
+                if cell is None:
+                    continue
+                val = _extract_numeric(cell.value)
+                if val is not None:
+                    source = _extract_table_ref(ind_id, cell.col, cell.row)
+                    candidates.append((val, source, ind_id))
+
+    if not candidates:
+        return None, None
+
+    # If there's a preferred table, prefer that candidate
+    if preferred_table:
+        for val, source, ind_id in candidates:
+            if preferred_table in ind_id:
+                return val, source
+
+    # Otherwise return first match
+    return candidates[0][0], candidates[0][1]
+
+
 def compute_derived_metrics(graph: FinancialGraph) -> DerivedMetrics:
     """Compute all derived financial metrics from the current graph state.
 
     This is intended to be called at snapshot creation time, so metrics
     reflect the exact cell values at that moment.
+
+    Priority: read values directly from indicator summary cells (D column)
+    which contain Excel formula results (e.g. =XIRR(...)). Only self-compute
+    as fallback when no matching indicator is found.
     """
     metrics: dict[str, Any] = {}
+    sources: dict[str, str] = {}
 
-    # ── 1. Cash flow series for IRR/NPV/payback ─────────────────────────────
-    cf_pairs = _extract_cash_flow_series(
-        graph,
-        ["项目投资现金流量", "全部投资现金流量", "资本金现金流量", "净现金流量"],
-    )
+    # ── 0. Read IRR / payback directly from indicator cells (authoritative) ─
+    for mkey in ("irr_after_tax", "irr_before_tax", "payback_period"):
+        val, source = _read_metric_from_indicators(graph, mkey)
+        if val is not None:
+            metrics[mkey] = val
+            sources[mkey] = source or "Excel单元格"
+
+    # ── 1. Cash flow series for NPV (NPV has no dedicated Excel cell) ───────
+    cf_pairs = _find_capital_after_tax_cf_series(graph)
+    if not cf_pairs:
+        cf_pairs = _extract_cash_flow_series(
+            graph,
+            ["项目投资现金流量", "全部投资现金流量", "资本金现金流量", "净现金流量"],
+        )
 
     # Fallback: look for any indicator with "现金流量" that has time_series
     if not cf_pairs:
@@ -290,11 +432,7 @@ def compute_derived_metrics(graph: FinancialGraph) -> DerivedMetrics:
     if cf_pairs:
         cash_flows = [v for _, v in cf_pairs]
 
-        irr = _compute_irr(cash_flows)
-        if irr is not None:
-            metrics["irr_after_tax"] = irr
-
-        # NPV — need discount rate
+        # NPV — need discount rate (self-compute, no dedicated Excel cell)
         disc_ind = _match_indicator(graph.indicators, _DISCOUNT_RATE_KEYWORDS)
         disc_rate = _extract_numeric(disc_ind.summary_value) if disc_ind else None
         if disc_rate is None:
@@ -305,10 +443,20 @@ def compute_derived_metrics(graph: FinancialGraph) -> DerivedMetrics:
 
         npv = _compute_npv(cash_flows, disc_rate)
         metrics["npv_after_tax"] = npv
+        sources["npv_after_tax"] = "系统自算"
 
-        payback = _compute_payback_period(cash_flows)
-        if payback is not None:
-            metrics["payback_period"] = payback
+        # Fallback IRR/payback only if not already read from indicator cells
+        if "irr_after_tax" not in metrics:
+            irr = _compute_irr(cash_flows)
+            if irr is not None:
+                metrics["irr_after_tax"] = irr
+                sources["irr_after_tax"] = "系统自算"
+
+        if "payback_period" not in metrics:
+            payback = _compute_payback_period(cash_flows)
+            if payback is not None:
+                metrics["payback_period"] = payback
+                sources["payback_period"] = "系统自算"
 
     # ── 2. DSCR series ──────────────────────────────────────────────────────
     dscr_series = _extract_dscr_series(graph)
@@ -318,6 +466,7 @@ def compute_derived_metrics(graph: FinancialGraph) -> DerivedMetrics:
         if vals:
             metrics["dscr_avg"] = sum(vals) / len(vals)
             metrics["dscr_min"] = min(vals)
+            sources["dscr_avg"] = "系统自算"
 
     # ── 3. Summary values from keyword-matched indicators ───────────────────
     for key, kw_list in [
@@ -351,18 +500,21 @@ def compute_derived_metrics(graph: FinancialGraph) -> DerivedMetrics:
             metrics["annual_net_cashflow"] = sum(nc_vals) / len(nc_vals)
 
     # ── 6. Before-tax IRR/NPV (if separate indicators exist) ───────────────
-    cf_before_tax = _extract_cash_flow_series(
-        graph,
-        ["项目投资现金流量(税前)", "税前现金流量"],
-    )
-    if cf_before_tax:
-        cf_bt = [v for _, v in cf_before_tax]
-        irr_bt = _compute_irr(cf_bt)
-        if irr_bt is not None:
-            metrics["irr_before_tax"] = irr_bt
-        disc_rate_bt = disc_rate if disc_rate else 0.08
-        metrics["npv_before_tax"] = _compute_npv(cf_bt, disc_rate_bt)
+    if "irr_before_tax" not in metrics:
+        cf_before_tax = _extract_cash_flow_series(
+            graph,
+            ["项目投资现金流量(税前)", "税前现金流量"],
+        )
+        if cf_before_tax:
+            cf_bt = [v for _, v in cf_before_tax]
+            irr_bt = _compute_irr(cf_bt)
+            if irr_bt is not None:
+                metrics["irr_before_tax"] = irr_bt
+                sources["irr_before_tax"] = "系统自算"
+            disc_rate_bt = disc_rate if disc_rate else 0.08
+            metrics["npv_before_tax"] = _compute_npv(cf_bt, disc_rate_bt)
 
+    metrics["metric_sources"] = sources
     return DerivedMetrics(**metrics)
 
 
@@ -383,6 +535,8 @@ def serialize_metrics(metrics: DerivedMetrics) -> dict[str, Any]:
         result["dscr_series"] = metrics.dscr_series
     if metrics.icrr:
         result["icrr"] = metrics.icrr
+    if metrics.metric_sources:
+        result["metric_sources"] = metrics.metric_sources
     return result
 
 
@@ -400,4 +554,6 @@ def deserialize_metrics(data: dict[str, Any]) -> DerivedMetrics:
         kwargs["dscr_series"] = data["dscr_series"]
     if "icrr" in data:
         kwargs["icrr"] = data["icrr"]
+    if "metric_sources" in data:
+        kwargs["metric_sources"] = data["metric_sources"]
     return DerivedMetrics(**kwargs)

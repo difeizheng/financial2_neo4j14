@@ -23,7 +23,7 @@ from financial_kg.viz.compare_viz import (
     export_diff_report_excel,
 )
 from financial_kg.engine.excel_export import export_modified_excel, find_original_excel
-from financial_kg.engine.derived_metrics import DerivedMetrics
+from financial_kg.engine.derived_metrics import DerivedMetrics, deserialize_metrics
 
 st.set_page_config(layout="wide")
 st.title("📊 快照对比")
@@ -58,13 +58,13 @@ if len(snaps) < 2:
 snap_map = {f"{s.name} ({s.created_at[:19]})": s for s in snaps}
 snap_labels = list(snap_map.keys())
 
-# Session state for A/B selection
+# Session state for A/B selection (default: B=newest, A=second-newest)
 _key_a = f"cmp_a_{task.id}"
 _key_b = f"cmp_b_{task.id}"
 if _key_a not in st.session_state:
-    st.session_state[_key_a] = snap_labels[0]
+    st.session_state[_key_a] = snap_labels[1] if len(snap_labels) >= 2 else snap_labels[0]
 if _key_b not in st.session_state:
-    st.session_state[_key_b] = snap_labels[-1]
+    st.session_state[_key_b] = snap_labels[0]  # newest (created_at DESC order)
 
 # Card-style selector
 st.subheader("选择对比快照")
@@ -134,6 +134,8 @@ if st.button("执行对比", type="primary", use_container_width=True):
     st.session_state["diff_task_id"] = task.id
     st.session_state["snap_a_values"] = snap_a.values
     st.session_state["snap_b_values"] = snap_b.values
+    st.session_state["snap_a_derived"] = snap_a.derived_metrics
+    st.session_state["snap_b_derived"] = snap_b.derived_metrics
     st.session_state["snap_a_name"] = rec_a.name
     st.session_state["snap_b_name"] = rec_b.name
     st.session_state["recalc_excel_path"] = recalc_excel_path
@@ -398,158 +400,448 @@ def _render_compare_tabs(graph, task_id: str, task_output_dir: str, task_filenam
 
 
     # ══════════════════════════════════════════════════════════════════════════════
-    # Tab 1: Key metrics comparison
+    # Tab 1: Key metrics comparison (方案A: 卡片仪表盘)
     # ══════════════════════════════════════════════════════════════════════════════
     with tab_metrics:
-        # Summary metrics
-        c1, c2, c3 = st.columns(3)
-        c1.metric("变化单元格数", diff.summary["total_changed_cells"])
-        c2.metric("受影响 Indicator 数", diff.summary["total_changed_indicators"])
-        c3.metric("涉及 Sheet 数", len(diff.summary["sheets_affected"]))
+        # ── Helper: read metric directly from snapshot cell values ────────────
+        # For IRR / payback, read the value from the indicator's D-column cell
+        # in the snapshot (which contains the Excel formula result after recalc).
+        # This is authoritative — matches what the user sees in Excel.
+        _METRIC_INDICATOR_KEYWORDS: list[tuple[str, tuple[str, ...], str | None]] = [
+            # (metric_key, keyword_variants, preferred_table_prefix)
+            ("irr_after_tax", ("资本金内部收益率（税后）", "资本金内部收益率(税后)"), None),
+            ("irr_before_tax", ("资本金内部收益率（税前）", "资本金内部收益率(税前)"), None),
+            ("payback_period", ("投资回收期",), "表6"),
+        ]
 
-        if diff.summary["sheets_affected"]:
-            st.caption("涉及 Sheet：" + "、".join(diff.summary["sheets_affected"]))
+        def _read_metric_from_snap(
+            snap_values: dict, graph: FinancialGraph, metric_key: str,
+            keywords: tuple[str, ...], prefer_table: str | None,
+        ) -> tuple[float | None, str | None]:
+            """Read a metric from snapshot cell values via indicator matching."""
+            candidates: list[tuple[float, str]] = []
+            for ind_id, ind in graph.indicators.items():
+                name = ind.name or ""
+                if not any(kw in name for kw in keywords):
+                    continue
+                for cid in ind.cell_ids:
+                    if not cid.endswith("_D"):
+                        continue
+                    raw = snap_values.get(cid)
+                    if raw is None:
+                        continue
+                    try:
+                        val = float(raw)
+                    except (ValueError, TypeError):
+                        continue
+                    # Build source label: "表N-XXX D45"
+                    cell = graph.cells.get(cid)
+                    parts = ind_id.split("__")
+                    prefix = parts[0].replace("IND_", "") if parts else ""
+                    segs = prefix.rsplit("_", 1)
+                    tbl = segs[0] if len(segs) > 1 else prefix
+                    ref = f"{tbl} {cell.col}{cell.row}" if cell else cid
+                    candidates.append((val, ref))
+
+            if not candidates:
+                return None, None
+            if prefer_table:
+                for v, s in candidates:
+                    if prefer_table in s:
+                        return v, s
+            return candidates[0][0], candidates[0][1]
+
+        def _get_snapshot_metrics(
+            snap_values: dict, snap_derived: dict, graph: FinancialGraph,
+        ) -> tuple[DerivedMetrics, dict[str, str]]:
+            """Build DerivedMetrics from snapshot, preferring direct cell reads."""
+            metrics: dict[str, Any] = {}
+            sources: dict[str, str] = {}
+
+            # 1. Read IRR / payback from indicator cells (authoritative)
+            for mkey, kws, pref in _METRIC_INDICATOR_KEYWORDS:
+                val, source = _read_metric_from_snap(snap_values, graph, mkey, kws, pref)
+                if val is not None:
+                    metrics[mkey] = val
+                    sources[mkey] = source or ""
+
+            # 2. Read NPV / DSCR from snap_derived (self-computed, no Excel cell)
+            if snap_derived:
+                dm_old = deserialize_metrics(snap_derived)
+                if "npv_after_tax" not in metrics and dm_old.npv_after_tax is not None:
+                    metrics["npv_after_tax"] = dm_old.npv_after_tax
+                    sources["npv_after_tax"] = "系统自算"
+                if dm_old.dscr_avg is not None:
+                    metrics["dscr_avg"] = dm_old.dscr_avg
+                    sources["dscr_avg"] = "系统自算"
+                if dm_old.dscr_min is not None:
+                    metrics["dscr_min"] = dm_old.dscr_min
+                    sources["dscr_min"] = "系统自算"
+
+            metrics["metric_sources"] = sources
+            return DerivedMetrics(**metrics), sources
+
+        # ── Helper: extract cells for a specific indicator keyword ───────────────────
+        def _get_cells_for_indicator_keyword(keyword: str, diff, graph) -> list[dict]:
+            """Get changed cells that belong to indicators matching keyword."""
+            cells = []
+            for c in diff.changed_cells:
+                ind_name = c.get("indicator_name", "")
+                if ind_name and keyword.lower() in ind_name.lower():
+                    cells.append(c)
+            return cells
+
+        # Compute metrics
+        snap_a_derived = st.session_state.get("snap_a_derived", {})
+        snap_b_derived = st.session_state.get("snap_b_derived", {})
+        metrics_a, sources_a = _get_snapshot_metrics(snap_a_values, snap_a_derived, graph)
+        metrics_b, sources_b = _get_snapshot_metrics(snap_b_values, snap_b_derived, graph)
+
+        # ═══════════════════════════════════════════════════════════════════════════
+        # 变化概要卡片（快照A/B相对于基准的参数修改）
+        # ═══════════════════════════════════════════════════════════════════════════
+        def _get_user_param_edits(snapshot_values: dict, graph) -> list[dict]:
+            """找出快照相对于原始基准的参数输入修改（用户手动编辑的常量单元格）。"""
+            edits = []
+            for cid, snap_val in snapshot_values.items():
+                cell = graph.cells.get(cid)
+                if not cell:
+                    continue
+                # 只关注参数输入表的常量单元格（非公式，用户可编辑）
+                if ("参数" in cell.sheet or "输入" in cell.sheet) and not cell.formula_raw:
+                    orig_val = cell.value
+                    # 检查是否有变化（数值对比）
+                    try:
+                        orig_num = float(orig_val) if orig_val is not None else None
+                        snap_num = float(snap_val) if snap_val is not None else None
+                        if orig_num is not None and snap_num is not None:
+                            if abs(orig_num - snap_num) > 1e-9:
+                                # 找indicator名称
+                                ind_name = ""
+                                for ind_id, ind in graph.indicators.items():
+                                    if cid in ind.cell_ids:
+                                        ind_name = ind.name or ""
+                                        break
+                                edits.append({
+                                    "cell_id": cid,
+                                    "sheet": cell.sheet,
+                                    "indicator": ind_name[:20] if ind_name else cid[:20],
+                                    "old": orig_num,
+                                    "new": snap_num,
+                                    "change": snap_num - orig_num,
+                                })
+                    except (ValueError, TypeError):
+                        # 非数值，跳过或记录字符串变化
+                        if str(orig_val) != str(snap_val):
+                            edits.append({
+                                "cell_id": cid,
+                                "sheet": cell.sheet,
+                                "indicator": cid[:20],
+                                "old": orig_val,
+                                "new": snap_val,
+                                "change": None,
+                            })
+            # 按变化量排序
+            edits.sort(key=lambda x: abs(x["change"]) if x["change"] is not None else 0, reverse=True)
+            return edits
+
+        # 找出快照A和B相对于基准的修改
+        edits_a = _get_user_param_edits(snap_a_values, graph)
+        edits_b = _get_user_param_edits(snap_b_values, graph)
+
+        # 找出A和B之间的参数差异（共同修改了哪些，各自独有修改了哪些）
+        param_ids_a = {e["cell_id"] for e in edits_a}
+        param_ids_b = {e["cell_id"] for e in edits_b}
+
+        common_edits = param_ids_a & param_ids_b  # 两快照都修改了
+        only_a_edits = param_ids_a - param_ids_b  # 只有A修改了
+        only_b_edits = param_ids_b - param_ids_a  # 只有B修改了
+
+        # 生成概要文字
+        def _format_edits_summary(edits: list[dict], label: str) -> str:
+            if not edits:
+                return f"{label}：无参数修改"
+            top3 = edits[:3]
+            parts = []
+            for e in top3:
+                if e["change"] is not None:
+                    pct = (e["change"] / abs(e["old"]) * 100) if e["old"] != 0 else None
+                    if pct and abs(pct) < 100:
+                        parts.append(f"{e['indicator']} {e['change']:+.2f} ({pct:+.0f}%)")
+                    else:
+                        parts.append(f"{e['indicator']} {e['change']:+.2f}")
+                else:
+                    parts.append(f"{e['indicator']} 改变")
+            return f"{label}：{', '.join(parts)}{'...' if len(edits)>3 else ''}"
+
+        summary_a = _format_edits_summary(edits_a, snap_a_name)
+        summary_b = _format_edits_summary(edits_b, snap_b_name)
+
+        # 展示两列对比
+        st.markdown(f"""
+        <div style="background: linear-gradient(90deg, #f8f9fa 0%, #fff 100%);
+                    border: 1px solid #ddd;
+                    padding: 16px;
+                    margin: 8px 0;
+                    border-radius: 8px;">
+            <div style="font-size: 1.1em; font-weight: 600; margin-bottom: 12px; color: #1565C0;">
+                📝 参数修改概要（相对于原始基准）
+            </div>
+            <div style="display: flex; gap: 20px;">
+                <div style="flex: 1; padding: 8px; background: #e3f2fd; border-radius: 4px;">
+                    <div style="font-weight: 500; color: #1976D2;">{snap_a_name}</div>
+                    <div style="font-size: 0.9em; margin-top: 4px;">{summary_a}</div>
+                    <div style="font-size: 0.8em; color: #666; margin-top: 2px;">
+                        共修改 {len(edits_a)} 个参数
+                    </div>
+                </div>
+                <div style="flex: 1; padding: 8px; background: #fff3e0; border-radius: 4px;">
+                    <div style="font-weight: 500; color: #F57C00;">{snap_b_name}</div>
+                    <div style="font-size: 0.9em; margin-top: 4px;">{summary_b}</div>
+                    <div style="font-size: 0.8em; color: #666; margin-top: 2px;">
+                        共修改 {len(edits_b)} 个参数
+                    </div>
+                </div>
+            </div>
+            {f'''<div style="margin-top: 10px; font-size: 0.85em; color: #555;">
+                共同修改 {len(common_edits)} 个参数，
+                {snap_a_name}独有 {len(only_a_edits)} 个，
+                {snap_b_name}独有 {len(only_b_edits)} 个
+            </div>''' if common_edits or only_a_edits or only_b_edits else ''}
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ═══════════════════════════════════════════════════════════════════════════
+        # 区1: 变化概览（紧凑一行）
+        # ═══════════════════════════════════════════════════════════════════════════
+        st.subheader("📊 变化概览")
+        ov_cols = st.columns(6)
+        ov_cols[0].metric("变化单元格", diff.summary["total_changed_cells"])
+        ov_cols[1].metric("受影响Indicator", diff.summary["total_changed_indicators"])
+        ov_cols[2].metric("涉及Sheet", len(diff.summary["sheets_affected"]))
+        if diff.changed_cells:
+            summary = compute_change_summary(diff, graph)
+            ov_cols[3].metric("总增加", f"{summary['total_increase']:,.0f}")
+            ov_cols[4].metric("总减少", f"{summary['total_decrease']:,.0f}")
+            ov_cols[5].metric("最大变化", f"{summary['max_magnitude']:,.0f}")
+        else:
+            for i in range(3, 6):
+                ov_cols[i].metric("—", "—")
 
         st.divider()
 
-        # Derived metrics comparison
-        st.subheader(f"{snap_a_name} vs {snap_b_name} — 关键财务指标")
+        # ═══════════════════════════════════════════════════════════════════════════
+        # 区2: 关键财务指标卡片（大卡片 + st.metric + 展开详情）
+        # ═══════════════════════════════════════════════════════════════════════════
+        st.subheader("💰 关键财务指标对比")
 
-        def _compute_metrics_for_snapshot(snapshot_values, graph):
-            """Compute derived metrics for a snapshot."""
-            # Apply snapshot values to graph cells temporarily
-            original_values = {}
-            for cid, val in snapshot_values.items():
-                cell = graph.cells.get(cid)
-                if cell:
-                    original_values[cid] = cell.value
-                    cell.value = val
-
-            # Collect metrics from graph indicators
-            irr = None
-            npv = None
-            payback = None
-            dscr_avg = None
-            dscr_min = None
-
-            for ind_id, ind in graph.indicators.items():
-                if ind.name:
-                    name_lower = ind.name.lower()
-                    val = ind.summary_value
-                    if val is not None:
-                        try:
-                            float_val = float(val)
-                        except (ValueError, TypeError):
-                            continue
-                        if any(k in name_lower for k in ["irr", "内部收益率"]):
-                            if irr is None:
-                                irr = float_val
-                        elif any(k in name_lower for k in ["净现值", "npv"]):
-                            if npv is None:
-                                npv = float_val
-                        elif any(k in name_lower for k in ["回收期", "payback"]):
-                            if payback is None:
-                                payback = float_val
-                        elif "dscr" in name_lower:
-                            if dscr_avg is None:
-                                dscr_avg = float_val
-                            if dscr_min is None or float_val < dscr_min:
-                                dscr_min = float_val
-
-            # Restore original values
-            for cid, val in original_values.items():
-                cell = graph.cells.get(cid)
-                if cell:
-                    cell.value = val
-
-            return DerivedMetrics(
-                irr_after_tax=irr,
-                npv_after_tax=npv,
-                payback_period=payback,
-                dscr_avg=dscr_avg,
-                dscr_min=dscr_min,
-            )
-
-        # Compute metrics for both snapshots
-        metrics_a = _compute_metrics_for_snapshot(snap_a_values, graph)
-        metrics_b = _compute_metrics_for_snapshot(snap_b_values, graph)
-
-        # Display comparison cards
         metric_defs = [
-            ("税后IRR", "irr_after_tax", "{:.2f}%", 100, True),
-            ("财务净现值", "npv_after_tax", "{:,.0f}", 1, False),
-            ("投资回收期", "payback_period", "{:.2f}年", 1, True),
-            ("DSCR均值", "dscr_avg", "{:.2f}", 1, False),
-            ("DSCR最低值", "dscr_min", "{:.2f}", 1, False),
+            ("📈 税后IRR", "irr_after_tax", "{:.2f}%", 100, False, "irr"),  # 增加=好事
+            ("💵 财务净现值", "npv_after_tax", "{:,.0f}元", 1, False, "npv"),  # 增加=好事
+            ("⏱️ 投资回收期", "payback_period", "{:.2f}年", 1, True, "回收期"),  # 减少=好事
+            ("🛡️ DSCR均值", "dscr_avg", "{:.2f}", 1, False, "dscr"),  # 增加=好事
+            ("🛡️ DSCR最低值", "dscr_min", "{:.2f}", 1, False, "dscr"),  # 增加=好事
         ]
 
-        n_cols = min(len(metric_defs), 5)
-        metric_cols = st.columns(n_cols)
+        card_cols = st.columns(min(len(metric_defs), 5))
 
-        for i, (label, attr, fmt, multiplier, lower_is_better) in enumerate(metric_defs):
+        for i, (label, attr, fmt, multiplier, lower_better, keyword) in enumerate(metric_defs):
             val_a = getattr(metrics_a, attr, None)
             val_b = getattr(metrics_b, attr, None)
 
-            with metric_cols[i % n_cols]:
-                row_a, row_b = st.columns(2)
-                with row_a:
-                    st.caption(snap_a_name)
-                    if val_a is not None:
-                        st.markdown(f"**{fmt.format(val_a * multiplier)}**")
-                    else:
-                        st.caption("—")
-                with row_b:
-                    st.caption(snap_b_name)
+            with card_cols[i]:
+                # 大卡片容器
+                with st.container(border=True):
+                    st.markdown(f"**{label}**")
+
+                    # 计算delta值（格式化显示）
+                    delta_str = None
+                    if val_a is not None and val_b is not None:
+                        delta_raw = val_b - val_a
+                        if "irr" in attr:
+                            delta_str = f"{delta_raw*100:+.2f}%"
+                        elif "npv" in attr:
+                            delta_str = f"{delta_raw:+,.0f}元"
+                        elif "payback" in attr:
+                            delta_str = f"{delta_raw:+.2f}年"
+                        else:
+                            delta_str = f"{delta_raw:+.2f}"
+
                     if val_b is not None:
-                        st.markdown(f"**{fmt.format(val_b * multiplier)}**")
+                        st.metric(
+                            snap_b_name,
+                            value=fmt.format(val_b * multiplier),
+                            delta=delta_str,
+                            delta_color="inverse" if lower_better else "normal",
+                        )
                     else:
-                        st.caption("—")
+                        st.metric(snap_b_name, value="—", delta=None)
 
-                # Delta
-                if val_a is not None and val_b is not None:
-                    delta = val_b - val_a
-                    pct = (delta / abs(val_a) * 100) if val_a != 0 else None
-                    delta_str = f"{delta:+.2f}" if multiplier == 1 else f"{delta * multiplier:+.2f}"
-                    if pct is not None:
-                        delta_str += f" ({pct:+.1f}%)"
-                    # Color: green = positive change, red = negative
-                    if "irr" in attr or "npv" in attr or "dscr" in attr:
-                        good = delta > 0
-                    elif "payback" in attr:
-                        good = delta < 0  # shorter payback is better
-                    else:
-                        good = True
+                    if val_a is not None:
+                        st.caption(f"{snap_a_name}: {fmt.format(val_a * multiplier)}")
 
-                    color = "green" if good else "red"
-                    st.markdown(f"<span style='color:{color};font-weight:bold;font-size:0.9em'>变化: {delta_str}</span>", unsafe_allow_html=True)
-                else:
-                    st.caption("无法计算变化")
+                    # 来源标注：显示数据来自哪个表/单元格
+                    source_b = sources_b.get(attr, "")
+                    if source_b:
+                        st.caption(f"📎 {source_b}")
+
+                    # 展开详情：显示涉及单元格
+                    cells_for_this = _get_cells_for_indicator_keyword(keyword, diff, graph)
+                    with st.expander(f"涉及单元格 ({len(cells_for_this)}个)", expanded=False):
+                        if cells_for_this:
+                            import pandas as pd
+                            detail_rows = [
+                                {"Cell ID": c["id"][:25], "Sheet": c.get("sheet", ""), "旧值": c.get("old", ""), "新值": c.get("new", "")}
+                                for c in cells_for_this[:20]  # 最多显示20个
+                            ]
+                            st.dataframe(pd.DataFrame(detail_rows), hide_index=True, use_container_width=True)
+                            if len(cells_for_this) > 20:
+                                st.caption(f"显示前20个，共{len(cells_for_this)}个")
+                        else:
+                            st.caption("未找到涉及该指标的变化单元格")
 
         st.divider()
 
-        # Change summary
+        # ═══════════════════════════════════════════════════════════════════════════
+        # 区3: 变更分布（Sheet排行 + 变化瀑布图）
+        # ═══════════════════════════════════════════════════════════════════════════
         if diff.changed_cells:
             summary = compute_change_summary(diff, graph)
 
-            st.subheader("变更摘要")
-            r1, r2, r3, r4 = st.columns(4)
-            r1.metric("总增加量", f"{summary['total_increase']:,.2f}")
-            r2.metric("总减少量", f"{summary['total_decrease']:,.2f}")
-            r3.metric("最大变化单元格", summary["max_magnitude_cell"][:30])
-            r4.metric("最大变化幅度", f"{summary['max_magnitude']:,.2f}")
+            st.subheader("📋 变更分布")
+            dist_cols = st.columns([2, 3])
 
-            # Sheet + Indicator ranking side by side
-            rank_a, rank_b = st.columns(2)
-            with rank_a:
+            with dist_cols[0]:
+                st.markdown("**Sheet 变更排行**")
                 if summary["sheets_ranking"]:
-                    st.caption("Sheet 变更排行")
-                    sheet_rows = [{"Sheet": s, "变化数": c} for s, c in summary["sheets_ranking"]]
-                    st.bar_chart(sheet_rows, x="Sheet", y="变化数", horizontal=True)
-            with rank_b:
-                if summary["top_indicators"]:
-                    st.caption("Top 10 受影响 Indicator")
-                    ind_rows = [{"Indicator": n, "变化单元格数": c} for n, c in summary["top_indicators"]]
-                    st.bar_chart(ind_rows, x="Indicator", y="变化单元格数", horizontal=True)
+                    import pandas as pd
+                    sheet_df = pd.DataFrame([
+                        {"Sheet": s, "变化数": c, "占比": f"{c/diff.summary['total_changed_cells']*100:.1f}%"}
+                        for s, c in summary["sheets_ranking"][:10]
+                    ])
+                    sheet_event = st.dataframe(
+                        sheet_df,
+                        hide_index=True,
+                        use_container_width=True,
+                        on_select="rerun",
+                        selection_mode="single-row",
+                        key="sheet_rank_select",
+                    )
+                    # 点击定位到Sheet（在Excel中）
+                    sheet_sel_rows = sheet_event.selection.get("rows", [])
+                    if sheet_sel_rows:
+                        sel_sheet = summary["sheets_ranking"][sheet_sel_rows[0]][0]
+                        st.caption(f"已选中: {sel_sheet}")
+                        _sheet_excel_path = st.session_state.get("excel_locate_path")
+                        if _sheet_excel_path and st.button("📍 定位到Sheet", key="sheet_locate_btn"):
+                            try:
+                                import win32com.client
+                                import pythoncom
+                                pythoncom.CoInitialize()
+                                try:
+                                    xl = None
+                                    for prog_id in ["ket.Application", "Excel.Application"]:
+                                        try:
+                                            xl = win32com.client.GetActiveObject(prog_id)
+                                            break
+                                        except Exception:
+                                            pass
+                                    if xl is None:
+                                        for prog_id in ["ket.Application", "Excel.Application"]:
+                                            try:
+                                                xl = win32com.client.Dispatch(prog_id)
+                                                break
+                                            except Exception:
+                                                pass
+                                    if xl:
+                                        xl.Visible = True
+                                        abs_path = os.path.abspath(_sheet_excel_path)
+                                        wb = None
+                                        for i in range(1, xl.Workbooks.Count + 1):
+                                            try:
+                                                b = xl.Workbooks(i)
+                                                if os.path.abspath(b.FullName) == abs_path:
+                                                    wb = b
+                                                    break
+                                            except Exception:
+                                                pass
+                                        if wb is None:
+                                            wb = xl.Workbooks.Open(abs_path)
+                                        ws = wb.Sheets(sel_sheet)
+                                        ws.Activate()
+                                        st.success(f"已激活Sheet: {sel_sheet}")
+                                finally:
+                                    pythoncom.CoUninitialize()
+                            except Exception as e:
+                                st.error(f"定位失败: {e}")
+
+            with dist_cols[1]:
+                st.markdown("**变化量瀑布图**")
+                # 瀑布图数据：按Sheet聚合变化量（正负分开）
+                waterfall_data = []
+                for s, c in summary["sheets_ranking"][:10]:
+                    sheet_cells = [x for x in diff.changed_cells if x.get("sheet") == s]
+                    increase = sum(abs(x.get("change_magnitude", 0)) for x in sheet_cells if x.get("direction") == "increase")
+                    decrease = sum(abs(x.get("change_magnitude", 0)) for x in sheet_cells if x.get("direction") == "decrease")
+                    waterfall_data.append({"Sheet": s, "增加": increase, "减少": -decrease})
+
+                if waterfall_data:
+                    import pandas as pd
+                    wf_df = pd.DataFrame(waterfall_data)
+                    # 简化瀑布图：用bar_chart横向堆叠
+                    st.bar_chart(wf_df.set_index("Sheet"), horizontal=True)
+                    st.caption("绿色=增加量，红色=减少量（绝对值）")
+
+        st.divider()
+
+        # ═══════════════════════════════════════════════════════════════════════════
+        # 区4: Top受影响Indicator表格（可点击定位Excel）
+        # ═══════════════════════════════════════════════════════════════════════════
+        if diff.changed_cells:
+            summary = compute_change_summary(diff, graph)
+            st.subheader("🔥 Top 10 受影响Indicator")
+
+            if summary["top_indicators"]:
+                import pandas as pd
+                top_ind_df = pd.DataFrame([
+                    {"Indicator": n, "变化数": c, "操作": "📍"}
+                    for n, c in summary["top_indicators"][:10]
+                ])
+
+                top_event = st.dataframe(
+                    top_ind_df,
+                    hide_index=True,
+                    use_container_width=True,
+                    on_select="rerun",
+                    selection_mode="single-row",
+                    key="top_ind_select",
+                    column_config={
+                        "Indicator": st.column_config.TextColumn("Indicator", width="large"),
+                        "变化数": st.column_config.NumberColumn("变化数", width="small"),
+                    },
+                )
+
+                top_sel_rows = top_event.selection.get("rows", [])
+                if top_sel_rows:
+                    sel_ind_name = summary["top_indicators"][top_sel_rows[0]][0]
+                    st.caption(f"已选中: {sel_ind_name}")
+
+                    # 找到该indicator的row/sheet信息
+                    for ind_id, ind in graph.indicators.items():
+                        if ind.name == sel_ind_name:
+                            _ind_row = ind.row if hasattr(ind, "row") else None
+                            _ind_sheet = ind.sheet if hasattr(ind, "sheet") else None
+                            if _ind_row and _ind_sheet:
+                                st.info(f"位于: {_ind_sheet} 第{_ind_row}行")
+                                _ind_excel_path = st.session_state.get("excel_locate_path")
+                                if _ind_excel_path and st.button("📍 定位Excel", key="top_ind_locate_btn"):
+                                    # 定位到indicator行
+                                    row_cell_ids = [
+                                        cid for cid, cell in graph.cells.items()
+                                        if cell.sheet == _ind_sheet and cell.row == _ind_row
+                                    ]
+                                    _do_excel_locate_row(_ind_excel_path, _ind_sheet, _ind_row, row_cell_ids)
+                            break
 
     # ══════════════════════════════════════════════════════════════════════════════
     # Tab 2: Change matrix
