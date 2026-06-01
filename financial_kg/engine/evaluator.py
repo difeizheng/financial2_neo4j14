@@ -34,6 +34,7 @@ try:
 except ImportError:
     _FORMULAS_AVAILABLE = False
 
+
 from financial_kg.models.graph import FinancialGraph
 
 
@@ -306,6 +307,54 @@ _RE_ROUND = re.compile(r'^=ROUND\((' + _REF + r'),\s*(-?\d+)\)$', re.IGNORECASE)
 _RE_MAX_ZERO_REF = re.compile(
     r'^=MAX\(0,\s*(' + _REF + r')-(' + _REF + r')\)$', re.IGNORECASE
 )
+
+# ── DATEDIF fast path: formulas library returns #NUM!/#VALUE! for it ──────────
+# The library's xdatedif fails on lowercase unit codes ("d" vs "D") and
+# wrap_ufunc converts the string unit argument to float.  Handle in fast path.
+_DATEDIF_EPOCH = datetime(1899, 12, 30)
+
+_RE_DATEDIF = re.compile(
+    r'^=DATEDIF\(\s*(' + _REF + r')\s*,\s*(' + _REF
+    + r')\s*,\s*"([DdMmYy]{1,2})"\s*\)$',
+    re.IGNORECASE,
+)
+# =ROUND((DATEDIF(C19,D19,"d"))/30,0)  or  =ROUND(DATEDIF(I5,I7,"D")/365*12,0)
+_RE_DATEDIF_ROUNDED = re.compile(
+    r'^=ROUND\(\s*\(?\s*DATEDIF\(\s*(' + _REF + r')\s*,\s*(' + _REF
+    + r')\s*,\s*"([DdMmYy]{1,2})"\s*\)\s*\)?\s*/\s*(-?[\d.]+)'
+    r'(?:\s*\*\s*(-?[\d.]+))?\s*,\s*(-?\d+)\s*\)$',
+    re.IGNORECASE,
+)
+
+
+def _datedif_calc(sd_serial: float, ed_serial: float, unit: str) -> float | None:
+    """Compute DATEDIF between two Excel serial dates."""
+    unit = unit.upper()
+    if sd_serial > ed_serial:
+        return None
+    if unit == 'D':
+        return ed_serial - sd_serial
+    dt_s = _DATEDIF_EPOCH + timedelta(days=int(sd_serial))
+    dt_e = _DATEDIF_EPOCH + timedelta(days=int(ed_serial))
+    sy, sm, sd_ = dt_s.year, dt_s.month, dt_s.day
+    ey, em, ed_ = dt_e.year, dt_e.month, dt_e.day
+    if unit == 'Y':
+        return ey - sy - int((em, ed_) < (sm, sd_))
+    if unit == 'M':
+        return (ey - sy) * 12 + (em - sm) - int(ed_ < sd_)
+    if unit == 'MD':
+        if ed_ < sd_:
+            prev_month = dt_e.replace(day=1) - timedelta(days=1)
+            return (ed_ + prev_month.day) - sd_
+        return ed_ - sd_
+    if unit == 'YM':
+        return (em - sm - int(ed_ < sd_)) % 12
+    if unit == 'YD':
+        try:
+            return (dt_e.replace(year=sy) - dt_s).days
+        except ValueError:
+            return (dt_e.replace(year=sy, month=2, day=28) - dt_s).days
+    return None
 # AVERAGE with quoted sheet prefix: =AVERAGE('表名'!H12:H20)
 _RE_AVERAGE_QUOTED = re.compile(
     r"^=AVERAGE\('([^']+)'!([A-Z]+\$?\d+:[A-Z]+\$?\d+)\)$", re.IGNORECASE
@@ -527,6 +576,34 @@ def _try_fast_eval(
         result = _try_range_agg_sheet(sheet_name, range_str, graph, 'average')
         if result is not _MISS:
             return result
+
+    # ── ROUND(DATEDIF(ref,ref,"d")/N, 0): very common pattern for month counting ──
+    m = _RE_DATEDIF_ROUNDED.match(formula_raw)
+    if m:
+        a = _read_cell_value(m.group(1), formula_sheet, graph)
+        b = _read_cell_value(m.group(2), formula_sheet, graph)
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            result = _datedif_calc(float(a), float(b), m.group(3))
+            if result is not None:
+                try:
+                    val = result / float(m.group(4))
+                    if m.group(5):  # optional multiplier (e.g. *12)
+                        val *= float(m.group(5))
+                    return round(val, int(m.group(6)))
+                except ZeroDivisionError:
+                    pass
+        return _MISS
+
+    # ── DATEDIF(ref, ref, "unit"): bare DATEDIF ──
+    m = _RE_DATEDIF.match(formula_raw)
+    if m:
+        a = _read_cell_value(m.group(1), formula_sheet, graph)
+        b = _read_cell_value(m.group(2), formula_sheet, graph)
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            result = _datedif_calc(float(a), float(b), m.group(3))
+            if result is not None:
+                return result
+        return _MISS
 
     # ── IF simple: =IF(A1>0, B1, 0) ──
     m = _RE_IF_SIMPLE.match(formula_raw)
