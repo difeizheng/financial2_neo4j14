@@ -68,6 +68,7 @@ class WorkspaceState:
     last_recalc_result: dict | None = None
     recalc_max_iter: int = 100
     recalc_tol: float = 1e-9
+    favorite_metrics: list[str] = field(default_factory=list)  # 用户选择的关注指标（有序）
 
 
 _WORKSPACES_DIR = Path(__file__).resolve().parent.parent.parent / "workspaces"
@@ -88,6 +89,7 @@ def load_workspace(task_id: str) -> WorkspaceState:
         ws.last_recalc_result = data.get("last_recalc_result")
         ws.recalc_max_iter = data.get("recalc_max_iter", 100)
         ws.recalc_tol = data.get("recalc_tol", 1e-9)
+        ws.favorite_metrics = list(data.get("favorite_metrics", []))  # 保持顺序
 
         for name, sdata in data.get("scenarios", {}).items():
             ws.scenarios[name] = Scenario(
@@ -126,6 +128,7 @@ def save_workspace(ws: WorkspaceState) -> None:
         "last_recalc_result": ws.last_recalc_result,
         "recalc_max_iter": ws.recalc_max_iter,
         "recalc_tol": ws.recalc_tol,
+        "favorite_metrics": ws.favorite_metrics,  # 直接保存list（有序）
         "scenarios": {
             name: {
                 "id": s.id,

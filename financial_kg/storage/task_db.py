@@ -540,26 +540,41 @@ class TaskDB:
         base_irr: float,
         statistics: dict,
         probability_table: list[dict],
+        irr_values: list[float] | None = None,  # Optional: store raw IRR values
     ) -> int:
         """Save monte carlo result, return record_id."""
         now = datetime.now().isoformat()
         with self._conn() as conn:
+            # Add irr_values column if not exists (migration)
+            try:
+                conn.execute("ALTER TABLE monte_carlo_history ADD COLUMN irr_values TEXT DEFAULT '[]'")
+            except Exception:
+                pass  # Column already exists
+
             cur = conn.execute(
-                "INSERT INTO monte_carlo_history (task_id, run_name, mode, iterations, params, base_irr, statistics, probability_table, created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO monte_carlo_history (task_id, run_name, mode, iterations, params, base_irr, statistics, probability_table, irr_values, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (task_id, run_name, mode, iterations,
                  json.dumps(params, ensure_ascii=False),
                  base_irr,
                  json.dumps(statistics, ensure_ascii=False),
-                 json.dumps(probability_table, ensure_ascii=False), now),
+                 json.dumps(probability_table, ensure_ascii=False),
+                 json.dumps(irr_values or [], ensure_ascii=False),  # Store IRR values
+                 now),
             )
             return cur.lastrowid
 
     def list_monte_carlo(self, task_id: str) -> list[dict]:
         """List monte carlo history for a task."""
         with self._conn() as conn:
+            # Ensure irr_values column exists
+            try:
+                conn.execute("ALTER TABLE monte_carlo_history ADD COLUMN irr_values TEXT DEFAULT '[]'")
+            except Exception:
+                pass
+
             rows = conn.execute(
-                "SELECT id, run_name, mode, iterations, params, base_irr, statistics, probability_table, created_at "
+                "SELECT id, run_name, mode, iterations, params, base_irr, statistics, probability_table, irr_values, created_at "
                 "FROM monte_carlo_history WHERE task_id=? ORDER BY created_at DESC",
                 (task_id,),
             ).fetchall()
@@ -573,6 +588,7 @@ class TaskDB:
                 "base_irr": r["base_irr"],
                 "statistics": json.loads(r["statistics"]),
                 "probability_table": json.loads(r["probability_table"]),
+                "irr_values": json.loads(r["irr_values"] if "irr_values" in r.keys() else "[]"),  # Load IRR values
                 "created_at": r["created_at"],
             }
             for r in rows

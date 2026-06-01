@@ -39,6 +39,7 @@ def find_break_even(
     threshold: float,
     max_iterations: int = 50,
     tolerance: float = 1e-6,
+    perturb_pct: float = 50,
 ) -> BreakEvenResult:
     """Binary search for the break-even point.
 
@@ -49,10 +50,14 @@ def find_break_even(
         threshold: Target value the metric must reach.
         max_iterations: Max binary search iterations.
         tolerance: Acceptable distance from threshold.
+        perturb_pct: Maximum perturbation range in percent (default 50).
 
     Returns:
         BreakEvenResult with findings.
     """
+    # ── Defensive deep clone: never mutate the caller's graph ──────────────────────
+    graph = graph.deep_clone()
+
     cell = graph.cells.get(cell_id)
     if cell is None:
         return BreakEvenResult(
@@ -87,9 +92,10 @@ def find_break_even(
     # If base_metric < threshold, we need to increase the metric
     need_decrease = base_metric > threshold
 
-    # Verify break-even exists by testing ±50% perturbation
-    test_val_low = original_val * 0.5
-    test_val_high = original_val * 1.5
+    # Verify break-even exists by testing ±perturb_pct% perturbation
+    factor = perturb_pct / 100.0
+    test_val_low = original_val * (1 - factor)
+    test_val_high = original_val * (1 + factor)
 
     metric_at_low = _eval_metric_at(graph, cell_id, test_val_low, metric_key)
     metric_at_high = _eval_metric_at(graph, cell_id, test_val_high, metric_key)
@@ -172,14 +178,14 @@ def _eval_metric_at(
     graph: FinancialGraph, cell_id: str, value: float, metric_key: str,
 ) -> float | None:
     """Clone graph, set cell value, recalculate, return metric."""
-    work = _clone_graph(graph)
+    work = graph.deep_clone()
     c = work.cells.get(cell_id)
     if c is None:
         return None
     c.value = value
     result = recalculate(work, {cell_id: value})
-    if not result.changed_cells:
-        return None
+    # Always compute metrics even if no cascading changes — the parameter
+    # itself changed, and metrics might depend on it via non-formula paths.
     metrics = compute_derived_metrics(work)
     return getattr(metrics, metric_key, None)
 

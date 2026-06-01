@@ -28,6 +28,21 @@ class FinancialGraph:
 
     # ── Cell layer ──────────────────────────────────────────────────────────
 
+    def deep_clone(self) -> "FinancialGraph":
+        """Create a fully independent copy. Safe for mutation.
+
+        Uses deepcopy on cells, indicators, and tables to ensure no shared
+        mutable state with the original graph. Required for break-even
+        and sensitivity analysis that modify cell values during search.
+        """
+        import copy
+        clone = FinancialGraph(source_file=self.source_file)
+        clone.cells = {cid: copy.deepcopy(cell) for cid, cell in self.cells.items()}
+        clone.indicators = {iid: copy.deepcopy(ind) for iid, ind in self.indicators.items()}
+        clone.tables = {tid: copy.deepcopy(tbl) for tid, tbl in self.tables.items()}
+        clone.cell_graph = self.cell_graph.copy()
+        return clone
+
     def add_cell(self, cell: Cell) -> None:
         self.cells[cell.id] = cell
         self.cell_graph.add_node(cell.id)
