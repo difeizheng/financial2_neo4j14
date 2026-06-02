@@ -1,0 +1,60 @@
+# 预设模板: 1400MW 抽水蓄能电站 (8年建设期)
+# 基于 Excel v17 黄金基准数据，7298行代码验证
+# 这是对标验证的基准项目
+
+name: "1400MW 抽蓄电站 (v17基准)"
+description: "基于Excel v17模型的黄金基准，90个月建设期+40年运营期"
+version: "1.0"
+
+# ── 建设期 ──────────────────────────────────────────────
+construction:
+  start_date: "2023-02-01"
+  end_date: "2030-07-31"
+  operation_years: 40
+
+# ── 运营参数 ────────────────────────────────────────────
+operating:
+  installed_capacity_mw: 1400.0
+  annual_utilization_hours: 1169.29
+  capacity_price: 696.5        # 元/kW·年
+  grid_price: 0.35             # 元/kWh (上网电价)
+  pump_price: 0.23085          # 元/kWh (抽水电价)
+  auxiliary_power_rate: 0.02   # 厂用电率 2%
+
+# ── 融资参数 ────────────────────────────────────────────
+financing:
+  equity_ratio: 0.25                   # 资本金比例 25%
+  construction_interest_rate: 0.043    # 建设期利率 4.3%
+  long_term_rate: 0.043                # 长期贷款利率 4.3%
+  long_term_years: 15                  # 还款期限 15年
+  short_term_rate: 0.0365              # 短期贷款利率 3.65%
+  grace_period_days: 91                # 宽限期 91天
+
+# ── 投资概算 (使用 v17 默认精确值) ──────────────────────
+investment:
+  scale_factor: null  # 使用 from_excel_v17() 精确值
+
+# ── 税务参数 ────────────────────────────────────────────
+tax:
+  vat_rate: 0.13                  # 增值税率 13%
+  income_tax_rate: 0.25           # 所得税率 25%
+  surcharge_rate: 0.10            # 附加税费率 (城建7%+教育3%)
+  loss_carryforward_years: 5      # 亏损弥补年限 5年
+  deductible_input_vat: 67754.50  # 可抵扣进项税 (万元)
+  deductible_vat_amort_years: 10  # 进项税抵扣年限
+
+# ── 折旧摊销 ────────────────────────────────────────────
+depreciation:
+  fixed_assets:
+    original_value: 819191.18  # 固定资产原值 (万元)
+    useful_life: 29            # 折旧年限 (年)
+    residual_rate: 0.05        # 残值率 5%
+  intangible_assets:
+    original_value: 80000.0    # 无形资产原值 (万元)
+    useful_life: 18            # 摊销年限
+    residual_rate: 0.05        # 残值率 5%
+  long_term_prepaid_amount: 458.72  # 长期待摊每笔金额 (万元)
+  long_term_prepaid_period: 5       # 摊销年限
+
+# ── NPV 折现率 ──────────────────────────────────────────
+discount_rate: 0.08

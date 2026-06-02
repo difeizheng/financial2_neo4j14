@@ -1,0 +1,59 @@
+# 预设模板: 1800MW 大型抽水蓄能电站 (10年建设期)
+# 按 v17 基准的 1800/1400 = 1.286 比例缩放投资
+# 模拟一个更大规模、更长建设期的项目
+
+name: "1800MW 大型抽蓄电站"
+description: "大规模项目，10年建设期+40年运营期，投资按1.29x缩放"
+version: "1.0"
+
+# ── 建设期 ──────────────────────────────────────────────
+construction:
+  start_date: "2025-01-01"
+  end_date: "2034-12-31"
+  operation_years: 40
+
+# ── 运营参数 ────────────────────────────────────────────
+operating:
+  installed_capacity_mw: 1800.0
+  annual_utilization_hours: 1200.0   # 略高于基准，大型机组效率更高
+  capacity_price: 696.5
+  grid_price: 0.35
+  pump_price: 0.23085
+  auxiliary_power_rate: 0.02
+
+# ── 融资参数 ────────────────────────────────────────────
+financing:
+  equity_ratio: 0.25
+  construction_interest_rate: 0.043
+  long_term_rate: 0.043
+  long_term_years: 18                  # 大项目还款期更长
+  short_term_rate: 0.0365
+  grace_period_days: 91
+
+# ── 投资概算 (按 1.286 比例缩放) ──────────────────────
+investment:
+  scale_factor: 1.2857143             # 1800/1400
+
+# ── 税务参数 ────────────────────────────────────────────
+tax:
+  vat_rate: 0.13
+  income_tax_rate: 0.25
+  surcharge_rate: 0.10
+  loss_carryforward_years: 5
+  deductible_input_vat: 87120.0       # 按 67754.5 × 1.286 估算
+  deductible_vat_amort_years: 10
+
+# ── 折旧摊销 (投资更大，但年限不变) ─────────────────────
+depreciation:
+  fixed_assets:
+    original_value: 1053359.0         # 819191 × 1.286
+    useful_life: 29
+    residual_rate: 0.05
+  intangible_assets:
+    original_value: 102857.0          # 80000 × 1.286
+    useful_life: 18
+    residual_rate: 0.05
+  long_term_prepaid_amount: 589.35    # 458.72 × 1.286
+  long_term_prepaid_period: 5
+
+discount_rate: 0.08

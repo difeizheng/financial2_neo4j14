@@ -38,6 +38,177 @@ st.set_page_config(layout="wide")
 
 st.title("⚙️ 参数工作台")
 
+# ── Engine selector ─────────────────────────────────────────────────────────
+
+engine_row = st.columns([3, 8])
+with engine_row[0]:
+    engine_choice = st.radio(
+        "计算引擎",
+        ["知识图谱重算引擎", "通用模型引擎"],
+        index=0,
+        horizontal=True,
+        key="engine_select",
+    )
+
+USE_GENERIC_ENGINE = engine_choice == "通用模型引擎"
+
+# ── Generic engine path ─────────────────────────────────────────────────────
+
+if USE_GENERIC_ENGINE:
+    from dataclasses import replace as _replace
+    from financial_model.params import (
+        ConstructionParams as _CP,
+        OperatingParams as _OP,
+        TaxParams as _TP,
+        LoanTerms as _LT,
+    )
+    from financial_model.params.depreciation import AssetCategory as _AC
+    from financial_model.analysis.types import ModelConfig as _MC
+    from financial_model.engines.orchestrator import AllResults as _AR
+    from financial_model.export.excel_exporter import export_excel as _export_excel
+
+    if "gm_config_recalc" not in st.session_state:
+        st.session_state.gm_config_recalc = _MC.from_excel_v17()
+    if "gm_results_recalc" not in st.session_state:
+        st.session_state.gm_results_recalc = None
+
+    _mcfg: _MC = st.session_state.gm_config_recalc
+
+    # ── Left: param editor ──
+    gm_left, gm_right = st.columns([3, 2])
+
+    with gm_left:
+        gm_tabs = st.tabs(["🏗️ 建设期", "💰 融资", "⚡ 运营", "🏛️ 税务", "📉 折旧"])
+
+        with gm_tabs[0]:
+            _c = _mcfg.construction
+            _cs = st.date_input("建设期起始", value=_c.construction_start, key="gm_r_start")
+            _ce = st.date_input("建设期结束", value=_c.construction_end, key="gm_r_end")
+            _oy = st.number_input("运营年限", min_value=5, max_value=80, value=_c.operation_years, key="gm_r_oy")
+            try:
+                _pc = _CP(construction_start=_cs, construction_end=_ce, operation_years=_oy)
+                _ps = _pc.summary()
+                st.info(f"建设期 {_ps['construction_months']}月 ({_ps['construction_years']}年) → {_pc.operation_end}")
+            except ValueError as e:
+                st.error(str(e))
+
+        with gm_tabs[1]:
+            _f = _mcfg.financing
+            _lt_rate = st.number_input("长期贷款利率", min_value=0.0, max_value=0.20,
+                value=_f.long_term_loan.annual_rate, step=0.005, format="%.4f", key="gm_r_lt")
+            _lt_term = st.number_input("还款期限(年)", min_value=5, max_value=50,
+                value=_f.long_term_loan.repayment_term_years, step=1, key="gm_r_ltterm")
+            _st_rate = st.number_input("短期贷款利率", min_value=0.0, max_value=0.20,
+                value=_f.short_term_loan_rate, step=0.005, format="%.4f", key="gm_r_st")
+
+        with gm_tabs[2]:
+            _o = _mcfg.operating
+            _cap = st.number_input("装机容量(MW)", min_value=100.0, value=_o.installed_capacity_mw, step=100.0, key="gm_r_cap")
+            _uh = st.number_input("年利用小时(h)", min_value=0.0, value=_o.annual_utilization_hours, step=50.0, key="gm_r_uh")
+            _gp = st.number_input("上网电价(元/kWh)", min_value=0.0, value=_o.grid_price, step=0.01, format="%.4f", key="gm_r_gp")
+            _pp = st.number_input("抽水电价(元/kWh)", min_value=0.0, value=_o.pump_price, step=0.01, format="%.5f", key="gm_r_pp")
+
+        with gm_tabs[3]:
+            _t = _mcfg.tax
+            _vat = st.number_input("增值税率", min_value=0.0, max_value=1.0, value=_t.vat_rate, step=0.01, format="%.2f", key="gm_r_vat")
+            _itr = st.number_input("所得税率", min_value=0.0, max_value=1.0, value=_t.income_tax_rate, step=0.01, format="%.2f", key="gm_r_itr")
+
+        with gm_tabs[4]:
+            _d = _mcfg.depreciation
+            _fa_orig = st.number_input("固定资产原值(万元)", min_value=0.0, value=_d.fixed_assets.original_value, step=10000.0, format="%.2f", key="gm_r_fao")
+            _fa_life = st.number_input("折旧年限(年)", min_value=5, max_value=50, value=_d.fixed_assets.useful_life, step=1, key="gm_r_fal")
+
+        st.divider()
+        if st.button("🚀 运行通用模型", type="primary", use_container_width=True):
+            try:
+                new_mcfg = _MC(
+                    construction=_CP(construction_start=_cs, construction_end=_ce, operation_years=_oy),
+                    financing=_replace(
+                        _mcfg.financing,
+                        long_term_loan=_replace(_mcfg.financing.long_term_loan, annual_rate=_lt_rate, repayment_term_years=_lt_term),
+                        short_term_loan_rate=_st_rate,
+                    ),
+                    operating=_OP(
+                        installed_capacity_mw=_cap, annual_utilization_hours=_uh,
+                        grid_price=_gp, pump_price=_pp,
+                        capacity_price=_o.capacity_price,
+                        auxiliary_power_rate=_o.auxiliary_power_rate,
+                        production_ratios=_o.production_ratios,
+                    ),
+                    tax=_TP(
+                        vat_rate=_vat, income_tax_rate=_itr,
+                        surcharge_rate=_t.surcharge_rate,
+                        loss_carryforward_years=_t.loss_carryforward_years,
+                        deductible_input_vat=_t.deductible_input_vat,
+                        deductible_vat_amort_years=_t.deductible_vat_amort_years,
+                    ),
+                    depreciation=_replace(
+                        _mcfg.depreciation,
+                        fixed_assets=_AC("固定资产", _fa_orig, _fa_life, _d.fixed_assets.residual_rate),
+                    ),
+                    investment=_mcfg.investment,
+                    discount_rate=_mcfg.discount_rate,
+                )
+                st.session_state.gm_config_recalc = new_mcfg
+                with st.spinner("运行通用模型 (9个引擎)..."):
+                    st.session_state.gm_results_recalc = new_mcfg.to_orchestrator().run()
+            except (ValueError, TypeError) as e:
+                st.error(f"参数错误: {e}")
+
+    # ── Right: results ──
+    with gm_right:
+        _res: _AR | None = st.session_state.gm_results_recalc
+        if _res is None:
+            st.info("👈 设置参数后点击 **运行通用模型**")
+        else:
+            dm = _res.derived_metrics
+            c1 = st.columns(4)
+            c1[0].metric("全投资IRR", f"{dm.irr_total:.2%}" if dm.irr_total else "N/A")
+            c1[1].metric("NPV(万元)", f"{dm.npv_total:,.0f}" if dm.npv_total else "N/A")
+            c1[2].metric("最低DSCR", f"{dm.dscr_min:.2f}" if dm.dscr_min else "N/A")
+            c1[3].metric("回收期(年)", f"{dm.payback_static:.1f}" if dm.payback_static else "N/A")
+
+            st.divider()
+            report_sel = st.selectbox("查看报表", [
+                "投资概算", "资金筹措", "折旧摊销", "成本费用",
+                "收入税金", "利润表(全投资)", "利润表(资本金)",
+                "现金流(全投资)", "现金流(资本金)", "现金流(财务计划)",
+                "资产负债表",
+            ], key="gm_r_report")
+
+            _DF_MAP = {
+                "投资概算": _res.investment,
+                "资金筹措": _res.financing.annual_summary,
+                "折旧摊销": _res.depreciation,
+                "成本费用": _res.cost,
+                "收入税金": _res.revenue,
+                "利润表(全投资)": _res.pnl_total.data,
+                "利润表(资本金)": _res.pnl_equity.data,
+                "现金流(全投资)": _res.cf_total.data,
+                "现金流(资本金)": _res.cf_equity.data,
+                "现金流(财务计划)": _res.cf_plan.data,
+                "资产负债表": _res.balance_sheet.data,
+            }
+            st.dataframe(_DF_MAP[report_sel], use_container_width=True, height=400)
+
+            # Export
+            st.divider()
+            if st.button("📥 导出Excel(13Sheet)", key="gm_r_export"):
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+                    _export_excel(_res, tmp.name, project_name="抽蓄项目")
+                with open(tmp.name, "rb") as f:
+                    st.download_button(
+                        "⬇️ 下载", data=f.read(),
+                        file_name="通用模型_财务报表.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+
+    # Stop here — don't render the knowledge-graph path
+    st.stop()
+
+# ── Knowledge-graph engine path (original) ─────────────────────────────────
+
 db = TaskDB()
 tasks = [t for t in db.list_tasks() if t.status == "done"]
 

@@ -1,0 +1,59 @@
+# 预设模板: 600MW 小型抽水蓄能电站 (5年建设期)
+# 按 v17 基准的 600/1400 = 0.429 比例缩放投资
+# 模拟一个快速建设的小型项目
+
+name: "600MW 小型抽蓄电站"
+description: "快速项目，5年建设期+30年运营期，投资按0.43x缩放"
+version: "1.0"
+
+# ── 建设期 ──────────────────────────────────────────────
+construction:
+  start_date: "2025-01-01"
+  end_date: "2029-12-31"
+  operation_years: 30                  # 小型项目运营期较短
+
+# ── 运营参数 ────────────────────────────────────────────
+operating:
+  installed_capacity_mw: 600.0
+  annual_utilization_hours: 1100.0    # 小型机组利用小时略低
+  capacity_price: 696.5
+  grid_price: 0.35
+  pump_price: 0.23085
+  auxiliary_power_rate: 0.02
+
+# ── 融资参数 ────────────────────────────────────────────
+financing:
+  equity_ratio: 0.30                   # 小项目资本金比例略高
+  construction_interest_rate: 0.040    # 利率略低
+  long_term_rate: 0.040
+  long_term_years: 12                  # 还款期较短
+  short_term_rate: 0.035
+  grace_period_days: 91
+
+# ── 投资概算 (按 0.429 比例缩放) ──────────────────────
+investment:
+  scale_factor: 0.4285714             # 600/1400
+
+# ── 税务参数 ────────────────────────────────────────────
+tax:
+  vat_rate: 0.13
+  income_tax_rate: 0.25
+  surcharge_rate: 0.10
+  loss_carryforward_years: 5
+  deductible_input_vat: 29045.0       # 按 67754.5 × 0.429 估算
+  deductible_vat_amort_years: 10
+
+# ── 折旧摊销 ────────────────────────────────────────────
+depreciation:
+  fixed_assets:
+    original_value: 351108.0          # 819191 × 0.429
+    useful_life: 25                    # 小型项目折旧年限较短
+    residual_rate: 0.05
+  intangible_assets:
+    original_value: 34286.0           # 80000 × 0.429
+    useful_life: 15
+    residual_rate: 0.05
+  long_term_prepaid_amount: 196.60    # 458.72 × 0.429
+  long_term_prepaid_period: 5
+
+discount_rate: 0.08
