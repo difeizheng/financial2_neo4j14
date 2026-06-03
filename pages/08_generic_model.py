@@ -11,6 +11,10 @@ import tempfile
 from dataclasses import replace as _replace
 from datetime import date
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -19,6 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from financial_model.analysis import (
     COMMON_PARAMS,
     METRIC_DISPLAY,
+    ComparisonEngine,
     DistributionType,
     MetricKey,
     ModelConfig,
@@ -32,6 +37,7 @@ from financial_model.analysis import (
 from financial_model.engines.orchestrator import AllResults
 from financial_model.params.presets import list_presets, load_preset, load_preset_metadata
 from financial_model.export.excel_exporter import export_excel
+from financial_model.export.qa_adapter import GenericModelQAAdapter
 from financial_model.export.report_exporter import export_report
 from financial_model.params import (
     ConstructionParams,
@@ -68,6 +74,280 @@ def _init_state() -> None:
 
 
 _init_state()
+
+
+# ══════════════════════════════════════════════════════════
+# 龙卷风图渲染
+# ══════════════════════════════════════════════════════════
+
+_PLT_FONT_CONFIGURED = False
+
+
+def _setup_matplotlib_fonts() -> None:
+    """配置 matplotlib 中文显示（仅首次调用时执行）"""
+    global _PLT_FONT_CONFIGURED
+    if _PLT_FONT_CONFIGURED:
+        return
+    _PLT_FONT_CONFIGURED = True
+    plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "DejaVu Sans"]
+    plt.rcParams["axes.unicode_minus"] = False
+
+
+def _render_tornado_chart(
+    td: pd.DataFrame,
+    metric_name: str,
+    base_val: float | None = None,
+) -> None:
+    """渲染龙卷风图: 水平条形图, 左侧负向/右侧正向, 按 spread 降序."""
+    _setup_matplotlib_fonts()
+
+    n = len(td)
+    fig_height = max(2.8, n * 0.55 + 0.8)
+    fig, ax = plt.subplots(figsize=(6, fig_height), dpi=110)
+
+    params = td["param"].tolist()
+    negatives = td["negative"].tolist()
+    positives = td["positive"].tolist()
+    y_pos = np.arange(n)
+
+    # 负向 (红) / 正向 (绿)
+    ax.barh(y_pos, negatives, align="center",
+            height=0.55, color="#e74c3c", alpha=0.85, label="负向影响")
+    ax.barh(y_pos, positives, align="center",
+            height=0.55, color="#27ae60", alpha=0.85, label="正向影响")
+
+    # 条形末端数值标注
+    for i in range(n):
+        neg_v, pos_v = negatives[i], positives[i]
+        if neg_v != 0:
+            ax.text(neg_v, y_pos[i], f"{neg_v:+.2f}", va="center",
+                    ha="right" if neg_v < 0 else "left",
+                    fontsize=8, color="#c0392b")
+        if pos_v != 0:
+            ax.text(pos_v, y_pos[i], f"{pos_v:+.2f}", va="center",
+                    ha="left" if pos_v > 0 else "right",
+                    fontsize=8, color="#1e8449")
+
+    # 中心线 & 基准值
+    ax.axvline(x=0, color="#2c3e50", linewidth=0.8)
+    if base_val is not None:
+        ax.text(0.02, 0.98, f"基准: {base_val:.4f}",
+                transform=ax.transAxes, va="top", ha="left",
+                fontsize=9, color="#2c3e50",
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="#ecf0f1", alpha=0.8))
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(params, fontsize=9)
+    ax.invert_yaxis()
+    ax.set_xlabel(f"{metric_name} 变化量", fontsize=10)
+    ax.set_title(f"{metric_name} 敏感性龙卷风图", fontsize=12, fontweight="bold")
+    ax.legend(loc="lower right", fontsize=8, framealpha=0.9)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(axis="x", linestyle="--", alpha=0.3)
+
+    plt.tight_layout()
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+
+def _render_mc_distribution(
+    mc_result: object,
+    metric_name: str,
+    key: "MetricKey",
+) -> None:
+    """渲染蒙特卡罗直方图 + 累计分布曲线 (CDF)."""
+    _setup_matplotlib_fonts()
+
+    values = mc_result.metric_series(key)
+    if len(values) == 0:
+        return
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4), dpi=110)
+
+    # ── 左: 直方图 ──
+    n_bins = min(50, max(10, len(values) // 20))
+    ax1.hist(values, bins=n_bins, color="#3498db", alpha=0.8, edgecolor="white")
+
+    # P10/P50/P90 标注
+    p10 = float(np.percentile(values, 10))
+    p50 = float(np.percentile(values, 50))
+    p90 = float(np.percentile(values, 90))
+    for pv, color, label in [(p10, "#e74c3c", "P10"), (p50, "#2c3e50", "P50"), (p90, "#27ae60", "P90")]:
+        ax1.axvline(x=pv, color=color, linewidth=1.5, linestyle="--", label=f"{label}: {pv:.4f}")
+
+    ax1.set_xlabel(metric_name, fontsize=10)
+    ax1.set_ylabel("频次", fontsize=10)
+    ax1.set_title(f"{metric_name} 概率分布", fontsize=11, fontweight="bold")
+    ax1.legend(fontsize=8, loc="upper right")
+    ax1.spines["top"].set_visible(False)
+    ax1.spines["right"].set_visible(False)
+
+    # ── 右: CDF ──
+    sorted_v = np.sort(values)
+    cdf = np.arange(1, len(sorted_v) + 1) / len(sorted_v)
+    ax2.plot(sorted_v, cdf, color="#2980b9", linewidth=2)
+
+    for pv, color, label in [(p10, "#e74c3c", "P10"), (p50, "#2c3e50", "P50"), (p90, "#27ae60", "P90")]:
+        ax2.axvline(x=pv, color=color, linewidth=1, linestyle="--", alpha=0.7)
+        ax2.axhline(y=float(label.replace("P", "")) / 100, color=color, linewidth=0.5, linestyle=":", alpha=0.5)
+
+    ax2.set_xlabel(metric_name, fontsize=10)
+    ax2.set_ylabel("累计概率", fontsize=10)
+    ax2.set_title(f"{metric_name} 累计分布 (CDF)", fontsize=11, fontweight="bold")
+    ax2.spines["top"].set_visible(False)
+    ax2.spines["right"].set_visible(False)
+    ax2.grid(alpha=0.3)
+
+    plt.tight_layout()
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+
+def _render_scenario_radar(
+    scenario_result: object,
+    metric_keys: list["MetricKey"],
+) -> None:
+    """渲染情景对比雷达图 (归一化到 [0,1]).
+
+    兼容 ScenarioComparison (.scenarios) 和 ProjectComparison (.projects)。
+    """
+    _setup_matplotlib_fonts()
+    from financial_model.analysis import METRIC_DISPLAY
+
+    # Duck-type: ScenarioComparison.scenarios 或 ProjectComparison.projects
+    items = getattr(scenario_result, "scenarios", None) or getattr(scenario_result, "projects", None)
+    if items is None or len(items) < 2:
+        return
+
+    n_vars = len(metric_keys)
+    if n_vars < 3:
+        return
+
+    labels = [METRIC_DISPLAY.get(k, str(k)) for k in metric_keys]
+
+    # 归一化: 每个指标在所有项中的 min → 0, max → 1
+    all_vals: dict[MetricKey, list[float]] = {}
+    for k in metric_keys:
+        vals = []
+        for s in items:
+            v = s.metrics.get(k)
+            vals.append(float(v) if v is not None else 0.0)
+        all_vals[k] = vals
+
+    angles = np.linspace(0, 2 * np.pi, n_vars, endpoint=False).tolist()
+    angles += angles[:1]  # 闭合
+
+    colors = ["#e74c3c", "#3498db", "#27ae60", "#f39c12", "#9b59b6"]
+    fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True), dpi=100)
+
+    for idx, s in enumerate(items):
+        norm_vals = []
+        for i, k in enumerate(metric_keys):
+            v = all_vals[k][idx]
+            vmin = min(all_vals[k])
+            vmax = max(all_vals[k])
+            if vmax - vmin > 1e-10:
+                norm_vals.append((v - vmin) / (vmax - vmin))
+            else:
+                norm_vals.append(0.5)
+        norm_vals += norm_vals[:1]  # 闭合
+
+        ax.plot(angles, norm_vals, "o-", linewidth=2, label=s.name,
+                color=colors[idx % len(colors)])
+        ax.fill(angles, norm_vals, alpha=0.15, color=colors[idx % len(colors)])
+
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(labels, fontsize=9)
+    ax.set_ylim(0, 1.1)
+    ax.set_title("情景对比雷达图", fontsize=12, fontweight="bold", pad=20)
+    ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.1), fontsize=9)
+
+    plt.tight_layout()
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+
+def _render_timeseries(results: "AllResults") -> None:
+    """渲染运营期收入/成本/利润时间序列图."""
+    _setup_matplotlib_fonts()
+
+    revenue_df = results.revenue
+    cost_df = results.cost
+    pnl_data = results.pnl_total.data
+
+    if revenue_df is None or cost_df is None or pnl_data is None:
+        st.info("缺少收入/成本数据，无法绘制时间序列")
+        return
+
+    fig, ax1 = plt.subplots(figsize=(10, 5), dpi=110)
+
+    # DataFrame index 是年份整数
+    years_all = list(revenue_df.index)
+
+    # 收入列
+    rev_col = _find_col(revenue_df, ["total_revenue", "electricity_revenue", "发电收入"])
+    cost_col = _find_col(cost_df, ["total_production_cost", "total_cost", "operating_cost"])
+    profit_col = _find_col(pnl_data, ["net_profit", "profit_before_tax"])
+
+    if not rev_col or not cost_col:
+        st.info("未找到可绘制的收入/成本列")
+        plt.close(fig)
+        return
+
+    rev_vals = revenue_df[rev_col].tolist()
+    cost_vals = cost_df[cost_col].tolist()
+
+    # 对齐长度
+    n = min(len(years_all), len(rev_vals), len(cost_vals))
+    years = years_all[:n]
+    rev_vals = rev_vals[:n]
+    cost_vals = cost_vals[:n]
+
+    ax1.bar([y - 0.2 for y in years], rev_vals, width=0.4, color="#27ae60", alpha=0.8, label="收入")
+    ax1.bar([y + 0.2 for y in years], cost_vals, width=0.4, color="#e74c3c", alpha=0.8, label="成本")
+    ax1.set_xlabel("年份", fontsize=10)
+    ax1.set_ylabel("金额 (万元)", fontsize=10)
+    ax1.set_title("运营期收入/成本/利润趋势", fontsize=12, fontweight="bold")
+
+    # 利润折线 (右轴) — 优先用 PnL 的净利润
+    if profit_col:
+        profit_years = list(pnl_data.index)
+        profit_vals = pnl_data[profit_col].tolist()
+    else:
+        profit_years = years
+        profit_vals = [r - c for r, c in zip(rev_vals, cost_vals)]
+
+    ax2 = ax1.twinx()
+    ax2.plot(profit_years[:len(profit_vals)], profit_vals,
+             color="#2c3e50", linewidth=2, marker="o", markersize=3, label="净利润")
+    ax2.set_ylabel("净利润 (万元)", fontsize=10, color="#2c3e50")
+    ax2.tick_params(axis="y", labelcolor="#2c3e50")
+
+    # 合并图例
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper right", fontsize=8)
+
+    ax1.spines["top"].set_visible(False)
+    ax1.grid(axis="y", alpha=0.3)
+
+    # 如果年数太多，只显示部分 x tick
+    if len(years) > 20:
+        step = max(1, len(years) // 15)
+        ax1.set_xticks(years[::step])
+
+    plt.tight_layout()
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+
+def _find_col(df: "pd.DataFrame", candidates: list[str]) -> str | None:
+    """在 DataFrame 中查找第一个存在的列名"""
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
 
 
 # ══════════════════════════════════════════════════════════
@@ -476,6 +756,10 @@ with right_col:
             f"动态总投资 **{fin.dynamic_total_investment:,.0f}** 万元"
         )
 
+        # ── 收入/成本/利润趋势图 ──
+        with st.expander("📈 收入/成本/利润趋势", expanded=False):
+            _render_timeseries(results)
+
         # ── 12张报表 Tab ──
         st.divider()
         st.subheader("📋 报表详情")
@@ -558,7 +842,7 @@ if st.session_state.gm_results is None:
 
 analysis_config: ModelConfig = st.session_state.gm_config
 
-analysis_tabs = st.tabs(["🎯 敏感性分析", "📊 情景对比", "🎲 蒙特卡罗", "📥 导出"])
+analysis_tabs = st.tabs(["🎯 敏感性分析", "📊 情景对比", "🎲 蒙特卡罗", "📋 项目对比", "💬 智能问答", "📥 导出"])
 
 # ── 敏感性分析 ─────────────────────────────────────────
 with analysis_tabs[0]:
@@ -600,13 +884,18 @@ with analysis_tabs[0]:
                 sens_result.matrix_table(), use_container_width=True
             )
 
-            st.markdown("**龙卷风图数据 (按 IRR 敏感性排序)**")
+            st.markdown("**龙卷风图 (按敏感性排序)**")
             for mk in [MetricKey.IRR_TOTAL, MetricKey.NPV_TOTAL]:
                 td = sens_result.tornado_data(mk)
-                if td:
+                if td is not None and not td.empty:
                     display_name = METRIC_DISPLAY.get(mk, str(mk))
-                    st.markdown(f"指标: **{display_name}**")
-                    st.dataframe(pd.DataFrame(td), use_container_width=True)
+                    base_val = sens_result.base_metrics.get(mk)
+                    t_left, t_right = st.columns([3, 2])
+                    with t_left:
+                        _render_tornado_chart(td, display_name, base_val)
+                    with t_right:
+                        st.markdown(f"**{display_name} 数据**")
+                        st.dataframe(td, use_container_width=True, hide_index=True)
         else:
             st.info("选择参数后点击运行")
 
@@ -639,6 +928,15 @@ with analysis_tabs[1]:
     with sc_col2:
         scenario_result = st.session_state.gm_scenario
         if scenario_result is not None:
+            # 雷达图
+            if len(scenario_result.scenarios) >= 2:
+                radar_keys = [
+                    MetricKey.IRR_TOTAL, MetricKey.NPV_TOTAL,
+                    MetricKey.DSCR_MIN, MetricKey.DSCR_AVG,
+                    MetricKey.PAYBACK_STATIC, MetricKey.ROE_AVG,
+                ]
+                _render_scenario_radar(scenario_result, radar_keys)
+
             st.markdown("**情景对比表**")
             st.dataframe(
                 scenario_result.comparison_table(), use_container_width=True
@@ -711,13 +1009,95 @@ with analysis_tabs[2]:
                 pct_df = mc_result.percentile_table(mk)
                 if pct_df is not None and not pct_df.empty:
                     display_name = METRIC_DISPLAY.get(mk, str(mk))
+                    # 概率分布图
+                    _render_mc_distribution(mc_result, display_name, mk)
                     st.markdown(f"**{display_name} 分位数**")
                     st.dataframe(pct_df, use_container_width=True)
         else:
             st.info("配置参数后点击运行")
 
-# ── 导出 ───────────────────────────────────────────────
+# ── 项目对比 ───────────────────────────────────────────
 with analysis_tabs[3]:
+    st.subheader("多项目横向对比")
+
+    cmp_col1, cmp_col2 = st.columns([1, 2])
+    with cmp_col1:
+        available_presets = list_presets()
+        selected_presets = st.multiselect(
+            "选择预设模板",
+            options=available_presets,
+            default=available_presets[:2] if len(available_presets) >= 2 else available_presets,
+            key="gm_cmp_presets",
+        )
+
+        if st.button("▶️ 运行项目对比", key="gm_run_compare"):
+            if len(selected_presets) < 2:
+                st.warning("请至少选择 2 个预设模板")
+            else:
+                with st.spinner(f"对比 {len(selected_presets)} 个项目..."):
+                    engine = ComparisonEngine()
+                    st.session_state.gm_comparison = engine.compare_presets(selected_presets)
+
+    with cmp_col2:
+        cmp_result = st.session_state.get("gm_comparison")
+        if cmp_result is not None:
+            st.markdown("**投资概要对比**")
+            st.dataframe(cmp_result.investment_summary(), use_container_width=True)
+
+            st.markdown("**指标对比表**")
+            st.dataframe(cmp_result.comparison_table(), use_container_width=True)
+
+            st.markdown("**排名表**")
+            st.dataframe(cmp_result.rank_table(), use_container_width=True)
+
+            # 雷达图
+            if len(cmp_result.projects) >= 2:
+                radar_keys = [
+                    MetricKey.IRR_TOTAL, MetricKey.NPV_TOTAL,
+                    MetricKey.DSCR_MIN, MetricKey.DSCR_AVG,
+                    MetricKey.PAYBACK_STATIC, MetricKey.ROE_AVG,
+                ]
+                _render_scenario_radar(cmp_result, radar_keys)
+        else:
+            st.info("选择预设模板后点击运行")
+
+# ── 智能问答 ───────────────────────────────────────────
+with analysis_tabs[4]:
+    st.subheader("智能问答")
+
+    qa_results = st.session_state.gm_results
+    if qa_results is not None:
+        qa_config = st.session_state.gm_config
+        qa_adapter = GenericModelQAAdapter(qa_results, qa_config)
+
+        # 预设常见问题
+        st.markdown("**常见问题** (点击即问)")
+        preset_qs = qa_adapter.get_preset_questions()
+        preset_cols = st.columns(min(3, len(preset_qs)))
+        if "gm_qa_selected" not in st.session_state:
+            st.session_state.gm_qa_selected = ""
+
+        for i, q in enumerate(preset_qs[:6]):
+            col_idx = i % len(preset_cols)
+            with preset_cols[col_idx]:
+                if st.button(q, key=f"gm_qa_{i}"):
+                    st.session_state.gm_qa_selected = q
+
+        # 自由输入
+        user_q = st.text_input(
+            "或输入自定义问题:",
+            value=st.session_state.gm_qa_selected,
+            key="gm_qa_input",
+        )
+
+        if user_q.strip():
+            answer = qa_adapter.ask(user_q.strip())
+            st.markdown(answer)
+    else:
+        st.info("请先运行模型后再使用智能问答")
+
+# ── 导出 ───────────────────────────────────────────────
+with analysis_tabs[5]:
     st.subheader("导出结果")
     results = st.session_state.gm_results
 

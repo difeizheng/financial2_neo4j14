@@ -1,4 +1,4 @@
-"""分析工具 — 敏感性分析、情景分析、蒙特卡罗模拟
+"""分析工具 — 敏感性分析、情景分析、蒙特卡罗模拟、多项目对比
 
 第五层: 分析工具层
 
@@ -7,8 +7,14 @@
   - scenario: 情景分析 (悲观/基准/乐观)
   - sensitivity: 敏感性分析 (单参数扰动 → 龙卷风图)
   - monte_carlo: 蒙特卡罗模拟 (概率分布 → 统计指标)
+  - comparison: 多项目对比 (不同预设横向比较)
 """
 
+from financial_model.analysis.comparison import (
+    ComparisonEngine,
+    ProjectComparison,
+    ProjectSnapshot,
+)
 from financial_model.analysis.monte_carlo import (
     DistributionType,
     MonteCarloEngine,
@@ -39,6 +45,10 @@ from financial_model.analysis.types import (
 )
 
 __all__ = [
+    # Comparison
+    "ComparisonEngine",
+    "ProjectComparison",
+    "ProjectSnapshot",
     # Types
     "COMMON_PARAMS",
     "DEFAULT_METRICS",
